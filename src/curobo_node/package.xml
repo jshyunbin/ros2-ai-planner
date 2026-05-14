@@ -4,7 +4,7 @@
   <name>curobo_node</name>
   <version>0.1.0</version>
   <description>cuRobo motion planning node stub for the AI planner pipeline.</description>
-  <maintainer email="you@example.com">Your Name</maintainer>
+  <maintainer email="jshyunbin@gmail.com">Joshua Hyunbin Lee</maintainer>
   <license>MIT</license>
 
   <depend>rclpy</depend>
