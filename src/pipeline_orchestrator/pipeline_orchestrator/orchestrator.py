@@ -8,6 +8,7 @@ from control_msgs.action import FollowJointTrajectory
 from pipeline_orchestrator.sam2 import Sam2
 from pipeline_orchestrator.graspgen import GraspGen
 from pipeline_orchestrator.curobo import CuRobo
+from pipeline_orchestrator.moveit2 import MoveIt2
 
 
 class PipelineOrchestrator(Node):
@@ -67,6 +68,7 @@ class PipelineOrchestrator(Node):
         self._sam2 = Sam2(self.get_logger())
         self._graspgen = GraspGen(self.get_logger())
         self._curobo = CuRobo(self.get_logger())
+        self._moveit2 = MoveIt2(self)
 
         self.get_logger().info('pipeline_orchestrator ready (stub).')
 
@@ -101,6 +103,9 @@ class PipelineOrchestrator(Node):
             return
 
         trajectory = self._curobo.plan_trajectory(grasp_pose, self._latest_joints)
+        if trajectory is None:
+            self.get_logger().warn('cuRobo failed, falling back to MoveIt2.')
+            trajectory = self._moveit2.plan_trajectory(grasp_pose, self._latest_joints)
         if trajectory is None:
             return
 
