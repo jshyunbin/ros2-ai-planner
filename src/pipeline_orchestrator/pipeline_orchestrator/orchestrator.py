@@ -2,22 +2,20 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
 from sensor_msgs.msg import Image, JointState
-from std_srvs.srv import Trigger
+
+from pipeline_orchestrator.sam2 import Sam2
+from pipeline_orchestrator.graspgen import GraspGen
+from pipeline_orchestrator.curobo import CuRobo
 
 
 class PipelineOrchestrator(Node):
-    """Orchestrates the full SAM2 → GraspGen → cuRobo pipeline.
+    """Single ROS2 node running the full SAM2 → GraspGen → cuRobo pipeline.
 
-    External subscriptions (from manip_challenge / Gazebo):
-      /task_commands              std_msgs/String
-      /wrist_camera/.../color/image_raw  sensor_msgs/Image
-      /wrist_camera/.../depth/image_raw  sensor_msgs/Image
-      /joint_states               sensor_msgs/JointState
-
-    Internal service clients:
-      sam2_node/segment           std_srvs/Trigger  (TODO: custom type)
-      graspgen_node/generate_grasp std_srvs/Trigger (TODO: custom type)
-      curobo_node/plan_trajectory  std_srvs/Trigger (TODO: custom type)
+    Subscribes (from manip_challenge / Gazebo):
+      /task_commands                           std_msgs/String
+      /wrist_camera/.../color/image_raw        sensor_msgs/Image
+      /wrist_camera/.../depth/image_raw        sensor_msgs/Image
+      /joint_states                            sensor_msgs/JointState
 
     Sends planned trajectory to:
       /ur5_controller/follow_joint_trajectory  (action, control_msgs)
@@ -31,7 +29,6 @@ class PipelineOrchestrator(Node):
     def __init__(self):
         super().__init__('pipeline_orchestrator')
 
-        # External subscribers
         self.task_sub = self.create_subscription(
             String, self.TASK_COMMANDS_TOPIC, self.task_command_callback, 10)
         self.rgb_sub = self.create_subscription(
@@ -41,17 +38,13 @@ class PipelineOrchestrator(Node):
         self.joint_sub = self.create_subscription(
             JointState, self.JOINT_STATES_TOPIC, self._cache_joints, 10)
 
-        # Internal service clients
-        self.sam2_client = self.create_client(Trigger, '/sam2_node/segment')
-        self.graspgen_client = self.create_client(
-            Trigger, '/graspgen_node/generate_grasp')
-        self.curobo_client = self.create_client(
-            Trigger, '/curobo_node/plan_trajectory')
-
-        # Cached sensor data
         self._latest_rgb = None
         self._latest_depth = None
         self._latest_joints = None
+
+        self._sam2 = Sam2(self.get_logger())
+        self._graspgen = GraspGen(self.get_logger())
+        self._curobo = CuRobo(self.get_logger())
 
         self.get_logger().info('pipeline_orchestrator ready (stub).')
 
@@ -66,24 +59,23 @@ class PipelineOrchestrator(Node):
 
     def task_command_callback(self, msg):
         self.get_logger().info(f'Received task command: {msg.data}')
-        # TODO: parse task command, then run pipeline
-        self.call_sam2()
+        self._run_pipeline(msg.data)
 
-    def call_sam2(self):
-        # TODO: send cached RGB + parsed prompt to sam2_node/segment service
-        # On response: call self.call_graspgen(masks)
-        self.get_logger().warn('call_sam2 not yet implemented.')
+    def _run_pipeline(self, task: str):
+        # TODO: parse task string into a text prompt for SAM2
+        masks = self._sam2.segment(self._latest_rgb, prompt=task)
+        if masks is None:
+            return
 
-    def call_graspgen(self, masks=None):
-        # TODO: send masks + cached depth to graspgen_node/generate_grasp
-        # On response: call self.call_curobo(grasp_pose)
-        self.get_logger().warn('call_graspgen not yet implemented.')
+        grasp_pose = self._graspgen.generate_grasp(masks, self._latest_depth)
+        if grasp_pose is None:
+            return
 
-    def call_curobo(self, grasp_pose=None):
-        # TODO: send grasp_pose + cached joint states to
-        # curobo_node/plan_trajectory
-        # On response: send trajectory to /ur5_controller/follow_joint_trajectory
-        self.get_logger().warn('call_curobo not yet implemented.')
+        trajectory = self._curobo.plan_trajectory(grasp_pose, self._latest_joints)
+        if trajectory is None:
+            return
+
+        # TODO: send trajectory to /ur5_controller/follow_joint_trajectory
 
 
 def main(args=None):
