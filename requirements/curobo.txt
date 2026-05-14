@@ -1,0 +1,7 @@
+# cuRobo dependencies
+# Ref: https://curobo.org/
+# Fill in when implementing curobo_node
+# curobo requires CUDA 11.8+ (12.8 supported)
+# Install instructions: https://curobo.org/get_started/1_install_instructions.html
+# torch>=2.3.1    # already installed in Dockerfile
+# curobo (install from source per official docs)

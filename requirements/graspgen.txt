@@ -1,0 +1,6 @@
+# GraspGen dependencies
+# Ref: diffusion-based grasp pose generation model
+# Fill in when implementing graspgen_node
+# torch>=2.3.1    # already installed in Dockerfile
+# open3d
+# trimesh
