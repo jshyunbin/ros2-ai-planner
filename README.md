@@ -23,16 +23,37 @@ docker compose up
 ./scripts/run.sh
 ```
 
-The container uses `network_mode: host`, so it automatically sees all ROS2 topics from the host (Gazebo, `/joint_states`, `/wrist_camera/...`, `/task_commands`).
+The container uses `network_mode: host`, so it automatically sees all ROS2 topics from the host.
 
-## Package Structure
+## Architecture
 
-| Package | Service | Role |
+All pipeline logic lives in a single ROS2 package (`pipeline_orchestrator`). SAM2, GraspGen, and cuRobo are plain Python classes instantiated directly by the node — no inter-process ROS2 services. This avoids serialization overhead when passing tensors between pipeline stages.
+
+```
+src/pipeline_orchestrator/pipeline_orchestrator/
+├── orchestrator.py   # ROS2 node — subscribes to sensors, runs pipeline, sends commands
+├── sam2.py           # Sam2 class — segments RGB image into object masks
+├── graspgen.py       # GraspGen class — generates grasp pose from masks + depth
+└── curobo.py         # CuRobo class — plans joint trajectory to grasp pose
+```
+
+### Topics subscribed
+
+| Topic | Type | Source |
 |---|---|---|
-| `sam2_node` | `~/segment` | Segments RGB image into object masks |
-| `graspgen_node` | `~/generate_grasp` | Generates grasp pose from masks + depth |
-| `curobo_node` | `~/plan_trajectory` | Plans joint trajectory to grasp pose |
-| `pipeline_orchestrator` | — | Subscribes to `/task_commands`, chains the pipeline, sends trajectory to UR5 |
+| `/task_commands` | `std_msgs/String` | manip_challenge |
+| `/camera/camera/color/image_raw` | `sensor_msgs/Image` | overhead D435 |
+| `/camera/camera/depth/color/image_raw` | `sensor_msgs/Image` | overhead D435 |
+| `/wrist_camera/wrist_camera/color/image_raw` | `sensor_msgs/Image` | wrist D435 |
+| `/wrist_camera/wrist_camera/depth/color/image_raw` | `sensor_msgs/Image` | wrist D435 |
+| `/joint_states` | `sensor_msgs/JointState` | arm + gripper state |
+
+### Action clients
+
+| Action | Type | Target |
+|---|---|---|
+| `/ur5_controller/follow_joint_trajectory` | `control_msgs/FollowJointTrajectory` | UR5 arm |
+| `/gripper_controller/follow_joint_trajectory` | `control_msgs/FollowJointTrajectory` | Robotiq 85 gripper |
 
 ## Development
 
