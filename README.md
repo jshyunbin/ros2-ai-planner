@@ -4,6 +4,8 @@ Dockerized ROS2 AI planning node for the CS477 manipulation challenge. Runs alon
 
 ```
 SAM2 (segment) → GraspGen (grasp pose) → cuRobo (trajectory) → UR5
+                                             ↓ fallback
+                                          MoveIt2 (trajectory)
 ```
 
 ## Requirements
@@ -29,12 +31,15 @@ The container uses `network_mode: host`, so it automatically sees all ROS2 topic
 
 All pipeline logic lives in a single ROS2 package (`pipeline_orchestrator`). SAM2, GraspGen, and cuRobo are plain Python classes instantiated directly by the node — no inter-process ROS2 services. This avoids serialization overhead when passing tensors between pipeline stages.
 
+MoveIt2 is the fallback motion planner if cuRobo fails. Because MoveIt2 is ROS2-native (it communicates with the `move_group` node via action/service clients), its module receives the full ROS2 node handle rather than just a logger.
+
 ```
 src/pipeline_orchestrator/pipeline_orchestrator/
 ├── orchestrator.py   # ROS2 node — subscribes to sensors, runs pipeline, sends commands
 ├── sam2.py           # Sam2 class — segments RGB image into object masks
 ├── graspgen.py       # GraspGen class — generates grasp pose from masks + depth
-└── curobo.py         # CuRobo class — plans joint trajectory to grasp pose
+├── curobo.py         # CuRobo class — plans joint trajectory to grasp pose
+└── moveit2.py        # MoveIt2 class — fallback planner via move_group (ROS2-native)
 ```
 
 ### Topics subscribed
