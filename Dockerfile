@@ -26,6 +26,7 @@ RUN apt-get update && apt-get install -y \
     ros-humble-cv-bridge \
     ros-humble-vision-msgs \
     python3-colcon-common-extensions \
+    python3-numpy \
     python3-rosdep \
     python3-pip && \
     rm -rf /var/lib/apt/lists/*
@@ -34,6 +35,12 @@ RUN apt-get update && apt-get install -y \
 RUN pip3 install --no-cache-dir \
     torch torchvision torchaudio \
     --index-url https://download.pytorch.org/whl/cu128
+
+# Lightweight GraspGen client dependencies for remote inference
+RUN pip3 install --no-cache-dir \
+    msgpack \
+    msgpack-numpy \
+    pyzmq
 
 # Workspace
 WORKDIR /ros2_ws

@@ -21,6 +21,7 @@ setup(
     entry_points={
         'console_scripts': [
             'orchestrator = pipeline_orchestrator.orchestrator:main',
+            'graspgen_probe = pipeline_orchestrator.graspgen_probe:main',
         ],
     },
 )
