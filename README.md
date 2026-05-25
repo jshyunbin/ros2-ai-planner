@@ -3,10 +3,21 @@
 Dockerized ROS2 AI planning node for the CS477 manipulation challenge. Runs alongside the existing `manip_challenge` system on the same machine and implements a full perception-to-action pipeline:
 
 ```
-SAM2 (segment) → GraspGen (grasp pose) → cuRobo (trajectory) → UR5
-                                             ↓ fallback
-                                          MoveIt2 (trajectory)
+[parallel] Gemini Vision (task prompt → object bbox)
+           nvblox (depth streams → persistent TSDF/ESDF)
+                │
+           SAM2 (overhead RGB + bbox → object mask)
+                │
+           nvblox.extract_object_cloud (mask → point cloud)
+                │
+           GraspGen (point cloud → grasp candidates)
+                │
+           cuRobo (grasp + ESDF → collision-free trajectory) → UR5
+                │ fallback
+           MoveIt2 (trajectory) → UR5
 ```
+
+nvblox maintains a persistent scene map across pick-and-place cycles. After each grasp, the map automatically reflects the updated scene without a manual reset.
 
 ## Requirements
 
@@ -29,20 +40,22 @@ The container uses `network_mode: host`, so it automatically sees all ROS2 topic
 
 ## Architecture
 
-All pipeline logic lives in a single ROS2 package (`pipeline_orchestrator`). SAM2, GraspGen, and cuRobo are plain Python classes instantiated directly by the node — no inter-process ROS2 services. This avoids serialization overhead when passing tensors between pipeline stages.
+All pipeline logic lives in a single ROS2 package (`pipeline_orchestrator`). All modules are plain Python classes instantiated directly by the orchestrator node — no inter-process ROS2 services. This avoids serialization overhead when passing tensors between pipeline stages.
 
-MoveIt2 is the fallback motion planner if cuRobo fails. Because MoveIt2 is ROS2-native (it communicates with the `move_group` node via action/service clients), its module receives the full ROS2 node handle rather than just a logger.
+The Isaac ROS nvblox node runs as a separate process inside the same container, subscribing to both camera depth streams and publishing an ESDF over ROS2 topics. The `NvBlox` Python class wraps it.
 
 ```
 src/pipeline_orchestrator/pipeline_orchestrator/
-├── orchestrator.py   # ROS2 node — subscribes to sensors, runs pipeline, sends commands
-├── sam2.py           # Sam2 class — segments RGB image into object masks
-├── graspgen.py       # GraspGen class — generates grasp pose from masks + depth
-├── curobo.py         # CuRobo class — plans joint trajectory to grasp pose
-└── moveit2.py        # MoveIt2 class — fallback planner via move_group (ROS2-native)
+├── orchestrator.py   # ROS2 node — runs pipeline, dispatches all modules
+├── nvblox.py         # NvBlox — subscribes to nvblox ESDF + extracts object point clouds
+├── gemini.py         # GeminiLocalizer — Gemini Vision API → object bounding box (stub)
+├── sam2.py           # Sam2 — segments overhead RGB using Gemini bbox
+├── graspgen.py       # GraspGen — grasp pose from (N,3) point cloud
+├── curobo.py         # CuRobo — collision-free trajectory via WorldNvbloxCollision
+└── moveit2.py        # MoveIt2 — fallback planner via move_group (ROS2-native)
 ```
 
-### Topics subscribed
+### Topics subscribed (orchestrator)
 
 | Topic | Type | Source |
 |---|---|---|
@@ -51,7 +64,15 @@ src/pipeline_orchestrator/pipeline_orchestrator/
 | `/camera/camera/depth/color/image_raw` | `sensor_msgs/Image` | overhead D435 |
 | `/wrist_camera/wrist_camera/color/image_raw` | `sensor_msgs/Image` | wrist D435 |
 | `/wrist_camera/wrist_camera/depth/color/image_raw` | `sensor_msgs/Image` | wrist D435 |
-| `/joint_states` | `sensor_msgs/JointState` | arm + gripper state |
+| `/joint_states` | `sensor_msgs/JointState` | arm + gripper |
+
+The Isaac ROS nvblox node (inside container) additionally subscribes to both depth topics and `/tf` to build the scene map.
+
+### Topics subscribed (nvblox → orchestrator)
+
+| Topic | Type | Published by |
+|---|---|---|
+| `/nvblox_node/static_esdf_pointcloud` | `sensor_msgs/PointCloud2` | Isaac ROS nvblox |
 
 ### Action clients
 
@@ -85,3 +106,16 @@ Fill in the relevant file under `requirements/` and add a `pip3 install` step to
 | `requirements/sam2.txt` | SAM2 |
 | `requirements/graspgen.txt` | GraspGen |
 | `requirements/curobo.txt` | cuRobo |
+| `requirements/nvblox.txt` | nvblox Python bindings |
+
+## Implementation Status
+
+| Module | Status |
+|---|---|
+| `nvblox.py` — ESDF subscription | ✅ done |
+| `nvblox.py` — `extract_object_cloud` | 🔧 stub |
+| `gemini.py` — `locate_object` | 🔧 stub (teammate) |
+| `sam2.py` — `segment` | 🔧 stub |
+| `graspgen.py` — `generate_grasp` | 🔧 stub |
+| `curobo.py` — `plan_trajectory` | 🔧 stub |
+| `moveit2.py` — `plan_trajectory` | 🔧 stub |
