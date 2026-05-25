@@ -15,7 +15,14 @@ Current reality is narrower than that intended architecture. The repo is still m
 ## Requirements
 
 - Docker with [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)
+- host ROS2 Humble installation for `manip_challenge`
 - `manip_challenge` running on the host (Gazebo + ROS2 Humble)
+
+Important environment split:
+
+- the host runs `manip_challenge`, Gazebo, and the base ROS2 graph
+- the `ros2-ai-planner` container also includes ROS2, because it runs its own ROS2 nodes
+- the two communicate over DDS using `network_mode: host`
 
 ## Usage
 
@@ -33,7 +40,7 @@ The container uses `network_mode: host`, so it automatically sees all ROS2 topic
 
 ## Current Status
 
-GraspGen work is now split into four practical layers:
+GraspGen work is now split into five practical layers:
 
 1. Docker-only GraspGen inference check: done
    Result: local `GraspGen` Docker build works, the pretrained `robotiq_2f_140` checkpoint loads, and sample inference returns grasps.
@@ -41,15 +48,19 @@ GraspGen work is now split into four practical layers:
    Result: the sample object-centric point clouds under `segmented_objects/` produce plausible grasp candidates through the standalone GraspGen server.
 3. ROS2 raw-point-cloud probe: implemented
    Result: `graspgen_probe` exists and can send raw wrist point clouds to the standalone server.
-4. Full live object pipeline: not implemented
-   Missing pieces: real 2D segmentation, mask-to-point-cloud conversion, in-container GraspGen integration, Gazebo grasp-success check.
+4. In-container GraspGen integration: done at image level
+   Result: the `ros2-ai-planner` Docker image now includes ROS2 plus the forked `pianojay/GraspGen` `jaeuk` branch and mounted `GraspGenModels`.
+5. Full live object pipeline: not implemented
+   Missing pieces: real 2D segmentation, mask-to-point-cloud conversion, calling GraspGen from planner code, and Gazebo grasp-success check.
 
 The old NVIDIA driver mismatch was resolved by reboot. `nvidia-smi` is now healthy on driver `535.309.01`.
 
 Important current reality:
 
-- `GraspGen` is currently running in its own standalone GPU Docker container.
-- `ros2-ai-planner` currently contains only a lightweight remote GraspGen client and a raw-point-cloud probe node.
+- `ros2-ai-planner` now has two possible GraspGen development paths:
+  - standalone GraspGen server in a separate container
+  - embedded GraspGen inside the planner image
+- the currently implemented ROS2-side node is still the lightweight remote client path via `graspgen_probe`
 - the in-repo `SAM2` and `GraspGen` pipeline modules are still stubs
 - `segmented_objects/` contains offline sample point clouds, not outputs of a live segmentation pipeline inside this repo
 
@@ -68,6 +79,27 @@ Observed current single-object GraspGen numbers after model load:
 - GPU memory: about `546 MiB`
 
 These numbers are only for standalone GraspGen inference. They do not include segmentation, collision filtering, ROS2 transport overhead, or planning.
+
+## Planner Image Status
+
+The planner image is no longer just a lightweight ROS2 client image.
+
+Current Docker image behavior:
+
+- base image: local `graspgen:latest`
+- adds ROS2 Humble runtime and Python tooling
+- clones `https://github.com/pianojay/GraspGen.git` on branch `jaeuk` into `/opt/GraspGen`
+- mounts local model assets from `../GraspGenModels` into `/opt/GraspGenModels`
+- keeps the existing `pipeline_orchestrator` package and `graspgen_probe` entrypoint
+
+Verified image-level checks:
+
+- `docker compose build` succeeds
+- `grasp_gen` imports successfully inside the planner container
+- `/start_graspgen_server.sh` resolves the embedded repo and mounted model checkpoint
+- model load succeeds inside the planner container
+
+The only failed startup check was binding port `5556` when the standalone server was already using it. That is expected, not a model or dependency failure.
 
 ## Standalone GraspGen Baseline
 
@@ -143,6 +175,39 @@ If healthy, the node should log:
 
 This probe still does not do segmentation, retargeting, collision filtering, or execution. It only verifies that ROS2 point cloud data can reach the GPU-side model and produce grasp candidates.
 
+## Embedded GraspGen Path
+
+The planner image can also launch GraspGen internally instead of depending on a separate GraspGen container.
+
+From this repo root:
+
+```bash
+docker compose build
+docker compose run --rm ai_planner bash
+```
+
+Inside the container:
+
+```bash
+/start_graspgen_server.sh
+```
+
+Defaults:
+
+- repo path: `/opt/GraspGen`
+- models path: `/opt/GraspGenModels`
+- gripper config: `/opt/GraspGenModels/checkpoints/graspgen_robotiq_2f_140.yml`
+- port: `5556`
+
+Useful overrides:
+
+```bash
+GRASPGEN_PORT=5557 /start_graspgen_server.sh
+GRIPPER_CONFIG=/opt/GraspGenModels/checkpoints/graspgen_franka_panda.yml /start_graspgen_server.sh
+```
+
+At the moment this only proves that the planner image can host GraspGen. The planner code itself is not yet calling the embedded model path.
+
 ## Architecture
 
 Intended package layout:
@@ -217,12 +282,11 @@ Fill in the relevant file under `requirements/` and add a `pip3 install` step to
 
 The next milestone is:
 
-1. integrate the working local `GraspGen` repository into the `ros2-ai-planner` Docker image
-2. preserve the currently required local GraspGen patches
-3. decide a development layout:
-   - local checked-out or forked Git repository mounted during development, or
-   - vendored repository copied into the image build context
-4. implement and test the first real challenge-side vertical slice:
+1. choose the first runtime integration path inside planner code:
+   - keep using the internal ZMQ server/client boundary inside one container, or
+   - call GraspGen Python APIs directly
+2. connect one segmented object sample to the embedded planner-side GraspGen path
+3. implement and test the first real challenge-side vertical slice:
    - 2D segmentation
    - mask-to-point-cloud conversion
    - GraspGen inference

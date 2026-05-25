@@ -1,8 +1,13 @@
-FROM nvidia/cuda:12.8.0-cudnn9-devel-ubuntu22.04
+FROM graspgen:latest
+
+ARG GRASPGEN_REPO_URL=https://github.com/pianojay/GraspGen.git
+ARG GRASPGEN_BRANCH=jaeuk
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV LANG=en_US.UTF-8
 ENV LC_ALL=en_US.UTF-8
+ENV GRASPGEN_REPO_DIR=/opt/GraspGen
+ENV GRASPGEN_MODELS_DIR=/opt/GraspGenModels
 
 # Locale
 RUN apt-get update && apt-get install -y locales && \
@@ -12,7 +17,7 @@ RUN apt-get update && apt-get install -y locales && \
 
 # ROS2 Humble apt source
 RUN apt-get update && apt-get install -y \
-    software-properties-common curl gnupg2 lsb-release && \
+    software-properties-common curl git gnupg2 lsb-release && \
     curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
         -o /usr/share/keyrings/ros-archive-keyring.gpg && \
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] \
@@ -31,15 +36,20 @@ RUN apt-get update && apt-get install -y \
     python3-pip && \
     rm -rf /var/lib/apt/lists/*
 
-# PyTorch with CUDA 12.8
-RUN pip3 install --no-cache-dir \
-    torch torchvision torchaudio \
-    --index-url https://download.pytorch.org/whl/cu128
+# GraspGen source for in-container inference
+RUN git clone --recursive --branch ${GRASPGEN_BRANCH} ${GRASPGEN_REPO_URL} ${GRASPGEN_REPO_DIR} && \
+    pip3 install --no-cache-dir --no-build-isolation ${GRASPGEN_REPO_DIR}/pointnet2_ops && \
+    pip3 install --no-cache-dir \
+        PyOpenGL==3.1.0 \
+        msgpack-numpy==0.4.8 \
+        tensordict==0.12.4 \
+        transformers==4.48.3 \
+        viser==1.0.29 && \
+    pip3 install --no-cache-dir --no-deps -e ${GRASPGEN_REPO_DIR}
 
-# Lightweight GraspGen client dependencies for remote inference
+# GraspGen ZMQ client/server dependencies
 RUN pip3 install --no-cache-dir \
     msgpack \
-    msgpack-numpy \
     pyzmq
 
 # Workspace
@@ -49,6 +59,8 @@ RUN . /opt/ros/humble/setup.sh && \
     colcon build --symlink-install
 
 COPY scripts/entrypoint.sh /entrypoint.sh
+COPY scripts/start_graspgen_server.sh /start_graspgen_server.sh
 RUN chmod +x /entrypoint.sh
+RUN chmod +x /start_graspgen_server.sh
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["bash"]
