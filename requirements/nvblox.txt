@@ -1,0 +1,3 @@
+# Python-side nvblox dependencies
+# nvblox Python bindings are installed via the ros-humble-isaac-ros-nvblox apt package.
+# Add pip packages here when implementing NvBlox.extract_object_cloud.
