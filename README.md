@@ -1,12 +1,16 @@
 # ros2-ai-planner
 
-Dockerized ROS2 AI planning node for the CS477 manipulation challenge. Runs alongside the existing `manip_challenge` system on the same machine and implements a full perception-to-action pipeline:
+Dockerized ROS2 AI planning workspace for the CS477 manipulation challenge.
 
+Intended long-term pipeline:
+
+```text
+SAM2 (segment) -> pointcloud masking -> GraspGen (grasp pose) -> cuRobo (trajectory) -> UR5
+                                                                  fallback
+                                                                  MoveIt2
 ```
-SAM2 (segment) → GraspGen (grasp pose) → cuRobo (trajectory) → UR5
-                                             ↓ fallback
-                                          MoveIt2 (trajectory)
-```
+
+Current reality is narrower than that intended architecture. The repo is still mainly an integration scaffold plus a working raw-point-cloud GraspGen probe.
 
 ## Requirements
 
@@ -16,7 +20,7 @@ SAM2 (segment) → GraspGen (grasp pose) → cuRobo (trajectory) → UR5
 ## Usage
 
 ```bash
-# Build the image (first run takes ~20 min — downloads PyTorch CUDA wheels)
+# Build the image
 docker compose build
 
 # Start the container
@@ -29,69 +33,79 @@ The container uses `network_mode: host`, so it automatically sees all ROS2 topic
 
 ## Current Status
 
-GraspGen work is currently split into two experiments:
+GraspGen work is now split into four practical layers:
 
-1. Docker-only inference check
-   Goal: confirm pretrained `GraspGen` inference works inside Docker on this machine at all.
-2. Challenge-side feasibility check
-   Goal: confirm pretrained `robotiq_2f_140` inference is usable when fed challenge point-cloud input.
+1. Docker-only GraspGen inference check: done
+   Result: local `GraspGen` Docker build works, the pretrained `robotiq_2f_140` checkpoint loads, and sample inference returns grasps.
+2. Offline segmented-object feasibility check: done
+   Result: the sample object-centric point clouds under `segmented_objects/` produce plausible grasp candidates through the standalone GraspGen server.
+3. ROS2 raw-point-cloud probe: implemented
+   Result: `graspgen_probe` exists and can send raw wrist point clouds to the standalone server.
+4. Full live object pipeline: not implemented
+   Missing pieces: real 2D segmentation, mask-to-point-cloud conversion, in-container GraspGen integration, Gazebo grasp-success check.
 
-At the moment, both are blocked by the local NVIDIA driver mismatch:
+The old NVIDIA driver mismatch was resolved by reboot. `nvidia-smi` is now healthy on driver `535.309.01`.
 
-- loaded kernel module: `535.288.01`
-- installed user-space NVIDIA libraries: `535.309.01`
+Important current reality:
 
-The newer `535.309.01` DKMS module is already built for the running kernel, so a clean reboot is the most likely fix. After reboot, the first check should be:
+- `GraspGen` is currently running in its own standalone GPU Docker container.
+- `ros2-ai-planner` currently contains only a lightweight remote GraspGen client and a raw-point-cloud probe node.
+- the in-repo `SAM2` and `GraspGen` pipeline modules are still stubs
+- `segmented_objects/` contains offline sample point clouds, not outputs of a live segmentation pipeline inside this repo
+
+Known working offline samples:
+
+- `segmented_object_banana.npy`
+- `segmented_object_coke_can.npy`
+- `segmented_object_hammer.npy`
+- `segmented_object_meat_can.npy`
+- `segmented_object_strawberry.npy`
+
+Observed current single-object GraspGen numbers after model load:
+
+- round-trip inference time: roughly `90-180 ms`
+- GraspGen server process RAM: about `1.4 GiB`
+- GPU memory: about `546 MiB`
+
+These numbers are only for standalone GraspGen inference. They do not include segmentation, collision filtering, ROS2 transport overhead, or planning.
+
+## Standalone GraspGen Baseline
+
+This is the current known-good inference path.
+
+From the local `GraspGen` repo root:
 
 ```bash
-nvidia-smi
-```
-
-Do not spend time on ROS2-side GraspGen testing until `nvidia-smi` is healthy.
-
-## Experiment 1: Docker-Only Inference Check
-
-This is the first real technical gate. It does not require ROS2 yet.
-
-Target:
-- build `GraspGen` Docker image
-- load pretrained `robotiq_2f_140`
-- run sample inference and verify grasps are returned
-
-If this fails, stop there and debug Docker/GPU/model issues before touching the challenge pipeline.
-
-### 1. Start the GraspGen server
-
-From the `GraspGen` repo root:
-
-```bash
+cd /home/user/JW/iir/GraspGen
 bash docker/build.sh
-MODELS_DIR=/absolute/path/to/GraspGenModels \
+MODELS_DIR=/home/user/JW/iir/GraspGenModels \
 docker compose -f docker/compose.serve.yml up --build
 ```
 
 The default server uses the pretrained `robotiq_2f_140` checkpoint and listens on `localhost:5556`.
 
-You will also need a valid `GraspGenModels` directory containing the released checkpoints and sample data.
+The local `GraspGen` checkout required three fixes before this worked:
 
-## Experiment 2: Challenge-Side Feasibility Check
+- `docker/graspgen_cuda121.dockerfile`
+  - changed `pip install ./pointnet2_ops` to `pip install --no-build-isolation ./pointnet2_ops`
+- `docker/serve.dockerfile`
+  - corrected stale entrypoint path to `client-server/graspgen_server.py`
+- `docker/run_server.sh`
+  - corrected the same stale entrypoint path
 
-This uses a split development setup:
+## ROS2 Challenge-Side Probe
+
+This uses the split development setup:
+
 - `manip_challenge` runs on the host
 - `GraspGen` runs in its own GPU container
-- `ros2-ai-planner` runs this lightweight ROS2 probe client
+- `ros2-ai-planner` runs the lightweight ROS2 probe client
 
-This is only worth running after Experiment 1 succeeds.
-
-### 1. Start the challenge environment
-
-Launch the normal `manip_challenge` Gazebo/ROS2 stack on the host. The probe expects the wrist point cloud topic:
+Launch the normal `manip_challenge` Gazebo/ROS2 stack on the host. The probe expects:
 
 ```text
 /wrist_camera/wrist_camera/depth/color/points
 ```
-
-### 2. Start the planner container
 
 From this repo root:
 
@@ -100,20 +114,13 @@ docker compose build
 docker compose run --rm ai_planner bash
 ```
 
-Inside the container, rebuild once if needed:
+Inside the container:
 
 ```bash
 . /opt/ros/humble/setup.bash
 cd /ros2_ws
 colcon build --symlink-install
 source install/setup.bash
-```
-
-### 3. Run the probe node
-
-Inside the planner container:
-
-```bash
 ros2 run pipeline_orchestrator graspgen_probe
 ```
 
@@ -128,28 +135,38 @@ ros2 run pipeline_orchestrator graspgen_probe --ros-args \
   -p request_period_sec:=3.0
 ```
 
-If the setup is healthy, the node should log:
+If healthy, the node should log:
+
 - successful connection to the GraspGen server
 - point cloud reception from the wrist camera
 - number of returned grasps and the best grasp translation/confidence
 
-This probe does not do segmentation, retargeting, collision filtering, or execution. It only verifies that ROS2 point cloud data can reach the GPU-side model and produce grasp candidates.
+This probe still does not do segmentation, retargeting, collision filtering, or execution. It only verifies that ROS2 point cloud data can reach the GPU-side model and produce grasp candidates.
 
 ## Architecture
 
-All pipeline logic lives in a single ROS2 package (`pipeline_orchestrator`). SAM2, GraspGen, and cuRobo are plain Python classes instantiated directly by the node — no inter-process ROS2 services. This avoids serialization overhead when passing tensors between pipeline stages.
+Intended package layout:
 
-MoveIt2 is the fallback motion planner if cuRobo fails. Because MoveIt2 is ROS2-native (it communicates with the `move_group` node via action/service clients), its module receives the full ROS2 node handle rather than just a logger.
-
-```
+```text
 src/pipeline_orchestrator/pipeline_orchestrator/
-├── orchestrator.py   # ROS2 node — subscribes to sensors, runs pipeline, sends commands
-├── graspgen_probe.py # ROS2 node — sends raw wrist point cloud to standalone GraspGen server
-├── sam2.py           # Sam2 class — segments RGB image into object masks
-├── graspgen.py       # GraspGen class — generates grasp pose from masks + depth
-├── curobo.py         # CuRobo class — plans joint trajectory to grasp pose
-└── moveit2.py        # MoveIt2 class — fallback planner via move_group (ROS2-native)
+├── orchestrator.py   # ROS2 node scaffold
+├── graspgen_probe.py # ROS2 node: raw PointCloud2 -> standalone GraspGen server
+├── sam2.py           # intended SAM2 segmentation module
+├── graspgen.py       # intended GraspGen wrapper from masks + depth
+├── curobo.py         # intended planner
+└── moveit2.py        # intended fallback planner
 ```
+
+Current implementation status:
+
+- `orchestrator.py`: scaffold only
+- `sam2.py`: stub, returns `None`
+- `graspgen.py`: stub, returns `None`
+- `curobo.py`: stub
+- `moveit2.py`: stub
+- `graspgen_probe.py`: implemented
+
+This means there is not yet a proper runtime segmentation pipeline inside `ros2-ai-planner`.
 
 ### Topics subscribed
 
@@ -172,7 +189,7 @@ src/pipeline_orchestrator/pipeline_orchestrator/
 
 ## Development
 
-Source edits in `src/` take effect immediately inside the container — no rebuild needed (volume mount + `--symlink-install`).
+Source edits in `src/` take effect immediately inside the container because of the volume mount plus `--symlink-install`.
 
 To rebuild the ROS2 workspace inside the container:
 
@@ -195,3 +212,20 @@ Fill in the relevant file under `requirements/` and add a `pip3 install` step to
 | `requirements/sam2.txt` | SAM2 |
 | `requirements/graspgen.txt` | GraspGen |
 | `requirements/curobo.txt` | cuRobo |
+
+## Immediate Next Step
+
+The next milestone is:
+
+1. integrate the working local `GraspGen` repository into the `ros2-ai-planner` Docker image
+2. preserve the currently required local GraspGen patches
+3. decide a development layout:
+   - local checked-out or forked Git repository mounted during development, or
+   - vendored repository copied into the image build context
+4. implement and test the first real challenge-side vertical slice:
+   - 2D segmentation
+   - mask-to-point-cloud conversion
+   - GraspGen inference
+   - grasp success check in Gazebo
+
+The final competition target still remains a single Docker image even though current debugging uses a split-container setup.
