@@ -1,3 +1,4 @@
+import concurrent.futures
 import rclpy
 from rclpy.action import ActionClient
 from rclpy.node import Node
@@ -9,32 +10,39 @@ from pipeline_orchestrator.sam2 import Sam2
 from pipeline_orchestrator.graspgen import GraspGen
 from pipeline_orchestrator.curobo import CuRobo
 from pipeline_orchestrator.moveit2 import MoveIt2
+from pipeline_orchestrator.nvblox import NvBlox
+from pipeline_orchestrator.gemini import GeminiLocalizer
 
 
 class PipelineOrchestrator(Node):
-    """Single ROS2 node running the full SAM2 → GraspGen → cuRobo pipeline.
+    """Single ROS2 node running the full pipeline.
+
+    Pipeline per task command:
+      [parallel] GeminiLocalizer (overhead RGB + prompt → bbox)
+                 NvBlox.get_esdf() (ensure map ready)
+      SAM2 (overhead RGB + Gemini bbox → object mask)
+      NvBlox.extract_object_cloud (mask → object point cloud in robot frame)
+      GraspGen (point cloud → grasp candidates)
+      cuRobo (grasp candidates + ESDF → collision-free trajectory)
+      [fallback] MoveIt2 if cuRobo fails
 
     Subscribes (from manip_challenge / Gazebo):
-      /task_commands                                std_msgs/String
-      /camera/camera/color/image_raw               sensor_msgs/Image  (overhead)
-      /camera/camera/depth/color/image_raw         sensor_msgs/Image  (overhead)
-      /wrist_camera/wrist_camera/color/image_raw   sensor_msgs/Image  (wrist)
-      /wrist_camera/wrist_camera/depth/color/image_raw sensor_msgs/Image (wrist)
-      /joint_states                                sensor_msgs/JointState
+      /task_commands                                    std_msgs/String
+      /camera/camera/color/image_raw                   sensor_msgs/Image  (overhead)
+      /camera/camera/depth/color/image_raw             sensor_msgs/Image  (overhead)
+      /wrist_camera/wrist_camera/color/image_raw       sensor_msgs/Image  (wrist)
+      /wrist_camera/wrist_camera/depth/color/image_raw sensor_msgs/Image  (wrist)
+      /joint_states                                     sensor_msgs/JointState
 
     Action clients:
-      /ur5_controller/follow_joint_trajectory      control_msgs/FollowJointTrajectory
-      /gripper_controller/follow_joint_trajectory  control_msgs/FollowJointTrajectory
+      /ur5_controller/follow_joint_trajectory       control_msgs/FollowJointTrajectory
+      /gripper_controller/follow_joint_trajectory   control_msgs/FollowJointTrajectory
     """
 
-    # Overhead (3rd-view) camera
     OVERHEAD_RGB_TOPIC = '/camera/camera/color/image_raw'
     OVERHEAD_DEPTH_TOPIC = '/camera/camera/depth/color/image_raw'
-
-    # Wrist camera
     WRIST_RGB_TOPIC = '/wrist_camera/wrist_camera/color/image_raw'
     WRIST_DEPTH_TOPIC = '/wrist_camera/wrist_camera/depth/color/image_raw'
-
     JOINT_STATES_TOPIC = '/joint_states'
     TASK_COMMANDS_TOPIC = '/task_commands'
 
@@ -69,40 +77,47 @@ class PipelineOrchestrator(Node):
         self._graspgen = GraspGen(self.get_logger())
         self._curobo = CuRobo(self.get_logger())
         self._moveit2 = MoveIt2(self)
+        self._nvblox = NvBlox(self)
+        self._gemini = GeminiLocalizer(self.get_logger())
 
-        self.get_logger().info('pipeline_orchestrator ready (stub).')
+        self.get_logger().info('pipeline_orchestrator ready.')
 
-    def _cache_overhead_rgb(self, msg):
-        self._latest_overhead_rgb = msg
-
-    def _cache_overhead_depth(self, msg):
-        self._latest_overhead_depth = msg
-
-    def _cache_wrist_rgb(self, msg):
-        self._latest_wrist_rgb = msg
-
-    def _cache_wrist_depth(self, msg):
-        self._latest_wrist_depth = msg
-
-    def _cache_joints(self, msg):
-        self._latest_joints = msg
+    def _cache_overhead_rgb(self, msg): self._latest_overhead_rgb = msg
+    def _cache_overhead_depth(self, msg): self._latest_overhead_depth = msg
+    def _cache_wrist_rgb(self, msg): self._latest_wrist_rgb = msg
+    def _cache_wrist_depth(self, msg): self._latest_wrist_depth = msg
+    def _cache_joints(self, msg): self._latest_joints = msg
 
     def task_command_callback(self, msg):
         self.get_logger().info(f'Received task command: {msg.data}')
         self._run_pipeline(msg.data)
 
     def _run_pipeline(self, task: str):
-        # TODO: parse task string into a text prompt for SAM2
-        # Overhead camera used for initial scene understanding; wrist camera for close-up
-        masks = self._sam2.segment(self._latest_overhead_rgb, prompt=task)
+        # Gemini API call and nvblox map readiness run in parallel — both are
+        # I/O-bound on first call (~1-2s each); subsequent calls are instant.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            future_esdf = executor.submit(self._nvblox.get_esdf)
+            future_bbox = executor.submit(
+                self._gemini.locate_object, self._latest_overhead_rgb, task)
+
+        esdf = future_esdf.result()
+        bbox = future_bbox.result()
+
+        masks = self._sam2.segment(
+            self._latest_overhead_rgb, prompt=task, bbox=bbox)
         if masks is None:
             return
 
-        grasp_pose = self._graspgen.generate_grasp(masks, self._latest_overhead_depth)
+        point_cloud = self._nvblox.extract_object_cloud(masks)
+        if point_cloud is None:
+            return
+
+        grasp_pose = self._graspgen.generate_grasp(point_cloud)
         if grasp_pose is None:
             return
 
-        trajectory = self._curobo.plan_trajectory(grasp_pose, self._latest_joints)
+        trajectory = self._curobo.plan_trajectory(
+            grasp_pose, self._latest_joints, esdf=esdf)
         if trajectory is None:
             self.get_logger().warn('cuRobo failed, falling back to MoveIt2.')
             trajectory = self._moveit2.plan_trajectory(grasp_pose, self._latest_joints)
