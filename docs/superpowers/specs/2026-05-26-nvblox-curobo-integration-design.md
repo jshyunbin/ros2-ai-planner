@@ -49,7 +49,7 @@ optimization — all in one cohesive module.
 | `requirements/nvblox.txt` | nvblox placeholder comment | Cleared (no pip deps needed) |
 | `requirements/curobo.txt` | Placeholder | cuRoboV2 source install + `warp-lang` |
 | `launch/contest_run.launch.py` | (new) | Launches orchestrator only |
-| `config/nvblox.yaml` | (new) | Mapper + CuRobo tuning params |
+| `config/curobo.yaml` | (new) | Mapper + CuRobo tuning params |
 
 ---
 
