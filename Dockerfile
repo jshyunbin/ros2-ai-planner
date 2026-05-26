@@ -50,7 +50,7 @@ RUN bash -c "source /opt/ros/humble/setup.bash && \
 RUN pip3 install --no-cache-dir "warp-lang>=0.10.0" && \
     git clone --depth 1 --branch v0.8.0 \
         https://github.com/NVlabs/curobo.git /tmp/curobo && \
-    pip3 install --no-cache-dir /tmp/curobo && \
+    SETUPTOOLS_SCM_PRETEND_VERSION=0.8.0 pip3 install --no-cache-dir /tmp/curobo && \
     rm -rf /tmp/curobo
 
 # Workspace
