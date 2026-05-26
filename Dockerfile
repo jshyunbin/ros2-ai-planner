@@ -27,7 +27,8 @@ RUN apt-get update && apt-get install -y \
     ros-humble-vision-msgs \
     python3-colcon-common-extensions \
     python3-rosdep \
-    python3-pip && \
+    python3-pip \
+    git && \
     rm -rf /var/lib/apt/lists/*
 
 # PyTorch with CUDA 12.8
@@ -46,8 +47,8 @@ RUN bash -c "source /opt/ros/humble/setup.bash && \
         ur_type:=ur5 name:=ur > /ur5.urdf"
 
 # cuRoboV2 v0.8.0 + Warp (GPU kernel runtime)
-RUN pip3 install --no-cache-dir "warp-lang>=0.10.0"
-RUN git clone --depth 1 --branch v0.8.0 \
+RUN pip3 install --no-cache-dir "warp-lang>=0.10.0" && \
+    git clone --depth 1 --branch v0.8.0 \
         https://github.com/NVlabs/curobo.git /tmp/curobo && \
     pip3 install --no-cache-dir /tmp/curobo && \
     rm -rf /tmp/curobo
