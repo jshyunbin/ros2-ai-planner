@@ -90,7 +90,7 @@ class PipelineOrchestrator(Node):
 
         trajectory = self._curobo.plan_trajectory(grasp_pose, self._latest_joints)
         if trajectory is None:
-            self.get_logger().warn('cuRobo failed, falling back to MoveIt2.')
+            self.get_logger().warning('cuRobo failed, falling back to MoveIt2.')
             trajectory = self._moveit2.plan_trajectory(grasp_pose, self._latest_joints)
         if trajectory is None:
             return

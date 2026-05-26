@@ -150,7 +150,7 @@ class CuRobo:
                 WORLD_FRAME, frame, tf_time,
                 timeout=rclpy.duration.Duration(seconds=0.1))
         except Exception as e:
-            self._logger.warn(f'CuRobo: TF lookup failed for {frame}: {e}')
+            self._logger.warning(f'CuRobo: TF lookup failed for {frame}: {e}')
             return
 
         cv_img = self._bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
@@ -206,7 +206,7 @@ class CuRobo:
             voxel_grid = self._mapper.compute_esdf()
             self._planner.update_world(SceneCfg(voxel=[voxel_grid]))
         else:
-            self._logger.warn(
+            self._logger.warning(
                 f'CuRobo: map not ready ({frame_count}/{MIN_FRAMES} frames), '
                 'planning in free space.')
 
@@ -227,7 +227,7 @@ class CuRobo:
 
         result = self._planner.plan_pose(goal, start)
         if result is None or not result.success.any():
-            self._logger.warn('CuRobo: planning failed.')
+            self._logger.warning('CuRobo: planning failed.')
             return None
 
         return self._to_ros_trajectory(result)
