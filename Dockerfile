@@ -35,17 +35,6 @@ RUN pip3 install --no-cache-dir \
     torch torchvision torchaudio \
     --index-url https://download.pytorch.org/whl/cu128
 
-# Isaac ROS apt repository + nvblox ROS2 node
-RUN curl -sSL https://isaac.download.nvidia.com/isaac-ros/repos.key \
-        | gpg --dearmor -o /usr/share/keyrings/isaac-ros.gpg && \
-    echo "deb [signed-by=/usr/share/keyrings/isaac-ros.gpg] \
-        https://isaac.download.nvidia.com/isaac-ros/release-3 \
-        $(. /etc/os-release && echo $VERSION_CODENAME) release" \
-        | tee /etc/apt/sources.list.d/isaac-ros.list > /dev/null && \
-    apt-get update && apt-get install -y \
-    ros-humble-isaac-ros-nvblox \
-    && rm -rf /var/lib/apt/lists/*
-
 # Workspace
 WORKDIR /ros2_ws
 COPY src/ src/
