@@ -35,16 +35,22 @@ RUN pip3 install --no-cache-dir \
     torch torchvision torchaudio \
     --index-url https://download.pytorch.org/whl/cu128
 
-# Isaac ROS apt repository + nvblox ROS2 node
-RUN curl -sSL https://isaac.download.nvidia.com/isaac-ros/repos.key \
-        | gpg --dearmor -o /usr/share/keyrings/isaac-ros.gpg && \
-    echo "deb [signed-by=/usr/share/keyrings/isaac-ros.gpg] \
-        https://isaac.download.nvidia.com/isaac-ros/release-3 \
-        $(. /etc/os-release && echo $VERSION_CODENAME) release-3.0" \
-        | tee /etc/apt/sources.list.d/isaac-ros.list > /dev/null && \
-    apt-get update && apt-get install -y \
-    ros-humble-isaac-ros-nvblox \
-    && rm -rf /var/lib/apt/lists/*
+# UR5 URDF (for cuRoboV2 robot config)
+RUN apt-get update && apt-get install -y \
+    ros-humble-ur-description \
+    ros-humble-xacro && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN bash -c "source /opt/ros/humble/setup.bash && \
+    xacro /opt/ros/humble/share/ur_description/urdf/ur.urdf.xacro \
+        ur_type:=ur5 name:=ur > /ur5.urdf"
+
+# cuRoboV2 v0.8.0 + Warp (GPU kernel runtime)
+RUN pip3 install --no-cache-dir "warp-lang>=0.10.0"
+RUN git clone --depth 1 --branch v0.8.0 \
+        https://github.com/NVlabs/curobo.git /tmp/curobo && \
+    pip3 install --no-cache-dir /tmp/curobo && \
+    rm -rf /tmp/curobo
 
 # Workspace
 WORKDIR /ros2_ws

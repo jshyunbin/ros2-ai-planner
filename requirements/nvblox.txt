@@ -1,3 +1,1 @@
-# Python-side nvblox dependencies
-# nvblox Python bindings are installed via the ros-humble-isaac-ros-nvblox apt package.
-# Add pip packages here when implementing NvBlox.extract_object_cloud.
+# nvblox is no longer used — cuRoboV2 Mapper handles TSDF/ESDF internally.
