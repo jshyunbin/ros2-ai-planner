@@ -93,6 +93,7 @@ class CuRobo:
 
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, node)
+        self._bridge = CvBridge()
 
         self._mapper = Mapper(MapperCfg(
             voxel_size=0.05,
