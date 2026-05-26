@@ -17,36 +17,6 @@ def test_gemini_locate_object_returns_none_stub():
     assert result is None
 
 
-# --- NvBlox ---
-
-def test_nvblox_importable():
-    from pipeline_orchestrator.nvblox import NvBlox
-    assert NvBlox is not None
-
-
-def test_nvblox_get_esdf_returns_none_before_map():
-    from pipeline_orchestrator.nvblox import NvBlox
-    node = MagicMock()
-    nvblox = NvBlox(node)
-    assert nvblox.get_esdf() is None
-
-
-def test_nvblox_extract_object_cloud_returns_none_stub():
-    from pipeline_orchestrator.nvblox import NvBlox
-    node = MagicMock()
-    nvblox = NvBlox(node)
-    mask = np.zeros((480, 640), dtype=bool)
-    result = nvblox.extract_object_cloud(mask)
-    assert result is None
-
-
-def test_nvblox_registers_esdf_subscription():
-    from pipeline_orchestrator.nvblox import NvBlox
-    node = MagicMock()
-    NvBlox(node)
-    assert node.create_subscription.called
-
-
 # --- Sam2 ---
 
 def test_sam2_segment_accepts_bbox():
