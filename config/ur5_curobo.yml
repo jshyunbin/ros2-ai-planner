@@ -60,7 +60,7 @@ robot_cfg:
           radius: 0.05
       tool0:
         - center: [0, 0, 0.1]
-          radius: -0.01
+          radius: 0.01
     self_collision_buffer:
       shoulder_link: 0.05
       upper_arm_link: 0.0
