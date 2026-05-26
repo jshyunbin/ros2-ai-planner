@@ -3,56 +3,60 @@
 Dockerized ROS2 AI planning node for the CS477 manipulation challenge. Runs alongside the existing `manip_challenge` system on the same machine and implements a full perception-to-action pipeline:
 
 ```
-[parallel] Gemini Vision (task prompt → object bbox)
-           nvblox (depth streams → persistent TSDF/ESDF)
-                │
-           SAM2 (overhead RGB + bbox → object mask)
-                │
-           nvblox.extract_object_cloud (mask → point cloud)
-                │
-           GraspGen (point cloud → grasp candidates)
-                │
-           cuRobo (grasp + ESDF → collision-free trajectory) → UR5
-                │ fallback
-           MoveIt2 (trajectory) → UR5
+Gemini Vision (task prompt → object bbox)
+      │
+SAM2 (overhead RGB + bbox → object mask)
+      │
+GraspGen (point cloud → grasp candidates)
+      │
+CuRobo (grasp + live ESDF → collision-free trajectory) → UR5
+      │ fallback
+MoveIt2 (trajectory) → UR5
 ```
 
-nvblox maintains a persistent scene map across pick-and-place cycles. After each grasp, the map automatically reflects the updated scene without a manual reset.
+**CuRobo owns the full depth pipeline.** It subscribes to both D435 depth streams internally, fuses them into a block-sparse TSDF/ESDF using cuRoboV2's built-in Mapper (GPU, no external nvblox node), and uses that map for collision-aware motion planning on every call.
 
 ## Requirements
 
 - Docker with [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)
+- NVIDIA GPU (Turing or newer, ≥ 4 GB VRAM)
+- NVIDIA driver ≥ 580 (CUDA 12 support)
 - `manip_challenge` running on the host (Gazebo + ROS2 Humble)
 
 ## Usage
 
 ```bash
-# Build the image (first run takes ~20 min — downloads PyTorch CUDA wheels)
+# Build the image (~30 min first run — downloads PyTorch + cuRoboV2)
 docker compose build
 
-# Start the container
+# Run the full pipeline (competition command)
+ros2 launch pipeline_orchestrator contest_run.launch.py
+
+# Or start the container directly
 docker compose up
-# or
-./scripts/run.sh
 ```
 
 The container uses `network_mode: host`, so it automatically sees all ROS2 topics from the host.
 
 ## Architecture
 
-All pipeline logic lives in a single ROS2 package (`pipeline_orchestrator`). All modules are plain Python classes instantiated directly by the orchestrator node — no inter-process ROS2 services. This avoids serialization overhead when passing tensors between pipeline stages.
-
-The Isaac ROS nvblox node runs as a separate process inside the same container, subscribing to both camera depth streams and publishing an ESDF over ROS2 topics. The `NvBlox` Python class wraps it.
+All pipeline logic lives in a single ROS2 package (`pipeline_orchestrator`). Modules are plain Python classes instantiated directly by the orchestrator — no inter-process ROS2 services, avoiding serialization overhead when passing tensors between stages.
 
 ```
 src/pipeline_orchestrator/pipeline_orchestrator/
-├── orchestrator.py   # ROS2 node — runs pipeline, dispatches all modules
-├── nvblox.py         # NvBlox — subscribes to nvblox ESDF + extracts object point clouds
-├── gemini.py         # GeminiLocalizer — Gemini Vision API → object bounding box (stub)
-├── sam2.py           # Sam2 — segments overhead RGB using Gemini bbox
-├── graspgen.py       # GraspGen — grasp pose from (N,3) point cloud
-├── curobo.py         # CuRobo — collision-free trajectory via WorldNvbloxCollision
-└── moveit2.py        # MoveIt2 — fallback planner via move_group (ROS2-native)
+├── orchestrator.py   # ROS2 node — subscribes to topics, runs pipeline
+├── curobo.py         # CuRobo — dual-RGBD Mapper + MotionPlanner (cuRoboV2)
+├── gemini.py         # GeminiLocalizer — Gemini Vision API → object bbox (stub)
+├── sam2.py           # Sam2 — segments overhead RGB using Gemini bbox (stub)
+├── graspgen.py       # GraspGen — grasp pose from point cloud (stub)
+└── moveit2.py        # MoveIt2 — fallback planner via move_group (stub)
+
+src/pipeline_orchestrator/config/
+├── ur5_curobo.yml    # UR5 robot config for cuRoboV2 (collision spheres, joint limits)
+└── curobo.yaml       # Mapper + MotionPlanner tuning parameters
+
+src/pipeline_orchestrator/launch/
+└── contest_run.launch.py   # Competition launch file
 ```
 
 ### Topics subscribed (orchestrator)
@@ -61,18 +65,17 @@ src/pipeline_orchestrator/pipeline_orchestrator/
 |---|---|---|
 | `/task_commands` | `std_msgs/String` | manip_challenge |
 | `/camera/camera/color/image_raw` | `sensor_msgs/Image` | overhead D435 |
-| `/camera/camera/depth/color/image_raw` | `sensor_msgs/Image` | overhead D435 |
 | `/wrist_camera/wrist_camera/color/image_raw` | `sensor_msgs/Image` | wrist D435 |
-| `/wrist_camera/wrist_camera/depth/color/image_raw` | `sensor_msgs/Image` | wrist D435 |
 | `/joint_states` | `sensor_msgs/JointState` | arm + gripper |
 
-The Isaac ROS nvblox node (inside container) additionally subscribes to both depth topics and `/tf` to build the scene map.
+### Topics subscribed (CuRobo — depth, internal)
 
-### Topics subscribed (nvblox → orchestrator)
-
-| Topic | Type | Published by |
+| Topic | Type | Source |
 |---|---|---|
-| `/nvblox_node/static_esdf_pointcloud` | `sensor_msgs/PointCloud2` | Isaac ROS nvblox |
+| `/camera/camera/depth/color/image_raw` | `sensor_msgs/Image` | overhead D435 |
+| `/camera/camera/depth/camera_info` | `sensor_msgs/CameraInfo` | overhead D435 |
+| `/wrist_camera/wrist_camera/depth/color/image_raw` | `sensor_msgs/Image` | wrist D435 |
+| `/wrist_camera/wrist_camera/depth/camera_info` | `sensor_msgs/CameraInfo` | wrist D435 |
 
 ### Action clients
 
@@ -81,9 +84,30 @@ The Isaac ROS nvblox node (inside container) additionally subscribes to both dep
 | `/ur5_controller/follow_joint_trajectory` | `control_msgs/FollowJointTrajectory` | UR5 arm |
 | `/gripper_controller/follow_joint_trajectory` | `control_msgs/FollowJointTrajectory` | Robotiq 85 gripper |
 
-## Development
+## Testing
 
-Source edits in `src/` take effect immediately inside the container — no rebuild needed (volume mount + `--symlink-install`).
+### Pipeline visualization (web-based, works over SSH)
+
+```bash
+# Forward the port if on SSH
+ssh -L 8080:localhost:8080 user@host
+
+# Run the test
+docker compose run --rm -p 8080:8080 ai_planner \
+  python3 /ros2_ws/src/pipeline_orchestrator/scripts/test_pipeline_viz.py
+```
+
+Open `http://localhost:8080`. The script runs synthetic depth frames through the full Mapper → MotionPlanner pipeline and animates the planned trajectory on the UR5 model.
+
+### Unit tests
+
+```bash
+docker compose run --rm ai_planner bash -c "
+  source /ros2_ws/install/setup.bash &&
+  python3 -m pytest src/pipeline_orchestrator/test/test_orchestrator.py -v"
+```
+
+## Development
 
 To rebuild the ROS2 workspace inside the container:
 
@@ -97,25 +121,15 @@ To open an interactive shell:
 docker compose run --rm ai_planner bash
 ```
 
-## Adding Dependencies
-
-Fill in the relevant file under `requirements/` and add a `pip3 install` step to the Dockerfile:
-
-| File | For |
-|---|---|
-| `requirements/sam2.txt` | SAM2 |
-| `requirements/graspgen.txt` | GraspGen |
-| `requirements/curobo.txt` | cuRobo |
-| `requirements/nvblox.txt` | nvblox Python bindings |
+Note: `--symlink-install` is not used in the Docker image (uv upgrades setuptools past the version that supports it). Rebuild the image after editing `setup.py` or `package.xml`.
 
 ## Implementation Status
 
 | Module | Status |
 |---|---|
-| `nvblox.py` — ESDF subscription | ✅ done |
-| `nvblox.py` — `extract_object_cloud` | 🔧 stub |
+| `curobo.py` — dual-RGBD Mapper (TSDF/ESDF fusion) | ✅ done |
+| `curobo.py` — MotionPlanner (collision-aware planning) | ✅ done |
 | `gemini.py` — `locate_object` | 🔧 stub (teammate) |
 | `sam2.py` — `segment` | 🔧 stub |
 | `graspgen.py` — `generate_grasp` | 🔧 stub |
-| `curobo.py` — `plan_trajectory` | 🔧 stub |
-| `moveit2.py` — `plan_trajectory` | 🔧 stub |
+| `moveit2.py` — `plan_trajectory` | 🔧 stub (fallback) |
