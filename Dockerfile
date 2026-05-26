@@ -47,13 +47,18 @@ RUN bash -c "source /opt/ros/humble/setup.bash && \
         ur_type:=ur5 name:=ur > /ur5.urdf"
 
 # cuRoboV2 v0.8.0 + Warp (GPU kernel runtime)
-# setuptools_scm must be pre-installed before curobo so --no-build-isolation
-# can resolve the dynamic version from the shallow clone.
-RUN pip3 install --no-cache-dir "warp-lang>=0.10.0" "setuptools_scm>=6.2" && \
+# Patch pyproject.toml to pin a static version, bypassing setuptools_scm
+# which cannot resolve tags from a shallow clone.
+RUN pip3 install --no-cache-dir "warp-lang>=0.10.0" && \
     git clone --depth 1 --branch v0.8.0 \
         https://github.com/NVlabs/curobo.git /tmp/curobo && \
-    SETUPTOOLS_SCM_PRETEND_VERSION=0.8.0 \
-        pip3 install --no-cache-dir --no-build-isolation /tmp/curobo && \
+    sed -i \
+        's/dynamic = \["version"\]/version = "0.8.0"/' \
+        /tmp/curobo/pyproject.toml && \
+    sed -i \
+        '/setuptools_scm/d' \
+        /tmp/curobo/pyproject.toml && \
+    pip3 install --no-cache-dir /tmp/curobo && \
     rm -rf /tmp/curobo
 
 # Workspace
