@@ -24,6 +24,7 @@ setup(
             'graspgen_probe = pipeline_orchestrator.graspgen_probe:main',
             'graspgen_service = pipeline_orchestrator.graspgen_service:main',
             'graspgen_service_caller = pipeline_orchestrator.graspgen_service_caller:main',
+            'segmentation_service = pipeline_orchestrator.segmentation_service:main',
         ],
     },
 )

@@ -1,120 +1,182 @@
-import rclpy
-from rclpy.action import ActionClient
-from rclpy.node import Node
-from std_msgs.msg import String
-from sensor_msgs.msg import Image, JointState
-from control_msgs.action import FollowJointTrajectory
+import json
 
-from pipeline_orchestrator.sam2 import Sam2
-from pipeline_orchestrator.graspgen import GraspGen
-from pipeline_orchestrator.curobo import CuRobo
-from pipeline_orchestrator.moveit2 import MoveIt2
+try:  # pragma: no cover - runtime dependency
+    import rclpy
+    from rclpy.node import Node
+    from std_msgs.msg import String
+    from std_srvs.srv import Trigger
+except ImportError:  # pragma: no cover - import-only test fallback
+    rclpy = None
+
+    class Node:  # type: ignore[override]
+        pass
+
+    class String:  # type: ignore[override]
+        pass
+
+    class Trigger:  # type: ignore[override]
+        class Request:
+            pass
+
+try:  # pragma: no cover - runtime dependency
+    from riro_srvs.srv import StringString
+except ImportError:  # pragma: no cover - runtime dependency
+    StringString = None
 
 
 class PipelineOrchestrator(Node):
-    """Single ROS2 node running the full SAM2 → GraspGen → cuRobo pipeline.
+    """ROS2 orchestrator that chains segmentation and GraspGen service calls."""
 
-    Subscribes (from manip_challenge / Gazebo):
-      /task_commands                                std_msgs/String
-      /camera/camera/color/image_raw               sensor_msgs/Image  (overhead)
-      /camera/camera/depth/color/image_raw         sensor_msgs/Image  (overhead)
-      /wrist_camera/wrist_camera/color/image_raw   sensor_msgs/Image  (wrist)
-      /wrist_camera/wrist_camera/depth/color/image_raw sensor_msgs/Image (wrist)
-      /joint_states                                sensor_msgs/JointState
-
-    Action clients:
-      /ur5_controller/follow_joint_trajectory      control_msgs/FollowJointTrajectory
-      /gripper_controller/follow_joint_trajectory  control_msgs/FollowJointTrajectory
-    """
-
-    # Overhead (3rd-view) camera
-    OVERHEAD_RGB_TOPIC = '/camera/camera/color/image_raw'
-    OVERHEAD_DEPTH_TOPIC = '/camera/camera/depth/color/image_raw'
-
-    # Wrist camera
-    WRIST_RGB_TOPIC = '/wrist_camera/wrist_camera/color/image_raw'
-    WRIST_DEPTH_TOPIC = '/wrist_camera/wrist_camera/depth/color/image_raw'
-
-    JOINT_STATES_TOPIC = '/joint_states'
-    TASK_COMMANDS_TOPIC = '/task_commands'
+    TASK_COMMANDS_TOPIC = "/task_commands"
 
     def __init__(self):
-        super().__init__('pipeline_orchestrator')
+        if rclpy is None:
+            raise ImportError("rclpy is required for pipeline_orchestrator runtime.")
+        if StringString is None:
+            raise ImportError("riro_srvs is required for pipeline_orchestrator.")
 
-        self.task_sub = self.create_subscription(
-            String, self.TASK_COMMANDS_TOPIC, self.task_command_callback, 10)
-        self.overhead_rgb_sub = self.create_subscription(
-            Image, self.OVERHEAD_RGB_TOPIC, self._cache_overhead_rgb, 10)
-        self.overhead_depth_sub = self.create_subscription(
-            Image, self.OVERHEAD_DEPTH_TOPIC, self._cache_overhead_depth, 10)
-        self.wrist_rgb_sub = self.create_subscription(
-            Image, self.WRIST_RGB_TOPIC, self._cache_wrist_rgb, 10)
-        self.wrist_depth_sub = self.create_subscription(
-            Image, self.WRIST_DEPTH_TOPIC, self._cache_wrist_depth, 10)
-        self.joint_sub = self.create_subscription(
-            JointState, self.JOINT_STATES_TOPIC, self._cache_joints, 10)
+        super().__init__("pipeline_orchestrator")
 
-        self._latest_overhead_rgb = None
-        self._latest_overhead_depth = None
-        self._latest_wrist_rgb = None
-        self._latest_wrist_depth = None
-        self._latest_joints = None
+        self.declare_parameter("segmentation_service_name", "/segmentation/segment_prompt")
+        self.declare_parameter("graspgen_service_name", "/graspgen/infer")
+        self.declare_parameter("auto_run_on_task_command", True)
 
-        self._arm_client = ActionClient(
-            self, FollowJointTrajectory, '/ur5_controller/follow_joint_trajectory')
-        self._gripper_client = ActionClient(
-            self, FollowJointTrajectory, '/gripper_controller/follow_joint_trajectory')
+        self._segmentation_service_name = str(
+            self.get_parameter("segmentation_service_name").value
+        )
+        self._graspgen_service_name = str(self.get_parameter("graspgen_service_name").value)
+        self._auto_run_on_task_command = bool(
+            self.get_parameter("auto_run_on_task_command").value
+        )
 
-        self._sam2 = Sam2(self.get_logger())
-        self._graspgen = GraspGen(self.get_logger())
-        self._curobo = CuRobo(self.get_logger())
-        self._moveit2 = MoveIt2(self)
+        self._task_sub = self.create_subscription(
+            String, self.TASK_COMMANDS_TOPIC, self.task_command_callback, 10
+        )
+        self._segmentation_client = self.create_client(
+            StringString, self._segmentation_service_name
+        )
+        self._graspgen_client = self.create_client(Trigger, self._graspgen_service_name)
 
-        self.get_logger().info('pipeline_orchestrator ready (stub).')
+        self._pipeline_busy = False
+        self._active_task = ""
+        self._latest_segmentation = None
+        self._latest_graspgen = None
 
-    def _cache_overhead_rgb(self, msg):
-        self._latest_overhead_rgb = msg
+        self.get_logger().info(
+            "pipeline_orchestrator ready "
+            f"segmentation={self._segmentation_service_name} "
+            f"graspgen={self._graspgen_service_name}"
+        )
 
-    def _cache_overhead_depth(self, msg):
-        self._latest_overhead_depth = msg
+    def task_command_callback(self, msg: String) -> None:
+        self.get_logger().info(f"Received task command: {msg.data}")
+        if self._auto_run_on_task_command:
+            self._run_pipeline(msg.data)
 
-    def _cache_wrist_rgb(self, msg):
-        self._latest_wrist_rgb = msg
-
-    def _cache_wrist_depth(self, msg):
-        self._latest_wrist_depth = msg
-
-    def _cache_joints(self, msg):
-        self._latest_joints = msg
-
-    def task_command_callback(self, msg):
-        self.get_logger().info(f'Received task command: {msg.data}')
-        self._run_pipeline(msg.data)
-
-    def _run_pipeline(self, task: str):
-        # TODO: parse task string into a text prompt for SAM2
-        # Overhead camera used for initial scene understanding; wrist camera for close-up
-        masks = self._sam2.segment(self._latest_overhead_rgb, prompt=task)
-        if masks is None:
+    def _run_pipeline(self, task: str) -> None:
+        task = task.strip()
+        if not task:
+            self.get_logger().warn("Ignoring empty task command.")
+            return
+        if self._pipeline_busy:
+            self.get_logger().warn(
+                f"Pipeline busy with '{self._active_task}'. Ignoring new task '{task}'."
+            )
+            return
+        if not self._segmentation_client.wait_for_service(timeout_sec=0.5):
+            self.get_logger().warn(
+                f"Segmentation service unavailable: {self._segmentation_service_name}"
+            )
             return
 
-        grasp_pose = self._graspgen.generate_grasp(masks, self._latest_overhead_depth)
-        if grasp_pose is None:
+        self._pipeline_busy = True
+        self._active_task = task
+
+        request = StringString.Request()
+        request.data = task
+        future = self._segmentation_client.call_async(request)
+        future.add_done_callback(self._on_segmentation_done)
+        self.get_logger().info(f"Started segmentation for task: {task}")
+
+    def _on_segmentation_done(self, future) -> None:
+        try:
+            result = future.result()
+            payload = json.loads(result.data)
+        except Exception as exc:
+            self.get_logger().error(f"Segmentation service call failed: {exc}")
+            self._reset_pipeline_state()
             return
 
-        trajectory = self._curobo.plan_trajectory(grasp_pose, self._latest_joints)
-        if trajectory is None:
-            self.get_logger().warn('cuRobo failed, falling back to MoveIt2.')
-            trajectory = self._moveit2.plan_trajectory(grasp_pose, self._latest_joints)
-        if trajectory is None:
+        if not payload.get("success"):
+            self.get_logger().warn(f"Segmentation failed: {payload}")
+            self._reset_pipeline_state()
             return
 
-        # TODO: send trajectory via self._arm_client
-        # TODO: send gripper command via self._gripper_client
+        self._latest_segmentation = payload
+        label = payload.get("label", "target")
+        point_count = payload.get("object_point_count", 0)
+        self.get_logger().info(
+            f"Segmentation ready label={label} points={point_count}; requesting GraspGen."
+        )
+
+        if not self._graspgen_client.wait_for_service(timeout_sec=0.5):
+            self.get_logger().warn(f"GraspGen service unavailable: {self._graspgen_service_name}")
+            self._reset_pipeline_state()
+            return
+
+        future = self._graspgen_client.call_async(Trigger.Request())
+        future.add_done_callback(self._on_graspgen_done)
+
+    def _on_graspgen_done(self, future) -> None:
+        try:
+            result = future.result()
+        except Exception as exc:
+            self.get_logger().error(f"GraspGen service call failed: {exc}")
+            self._reset_pipeline_state()
+            return
+
+        if not result.success:
+            self.get_logger().warn(f"GraspGen failed: {result.message}")
+            self._reset_pipeline_state()
+            return
+
+        try:
+            payload = json.loads(result.message)
+        except json.JSONDecodeError:
+            self.get_logger().warn(f"GraspGen returned non-JSON payload: {result.message}")
+            self._reset_pipeline_state()
+            return
+
+        self._latest_graspgen = payload
+        top_grasps = payload.get("top_grasps") or []
+        if top_grasps:
+            top = top_grasps[0]
+            self.get_logger().info(
+                "Pipeline result "
+                f"label={self._latest_segmentation.get('label', 'target')} "
+                f"centroid={self._latest_segmentation.get('centroid')} "
+                f"best_translation={top.get('translation')} "
+                f"confidence={top.get('confidence')}"
+            )
+        else:
+            self.get_logger().warn("GraspGen returned success but no ranked grasps.")
+
+        # Motion execution stays separate until cuRobo / MoveIt2 integration is ready.
+        self._reset_pipeline_state()
+
+    def _reset_pipeline_state(self) -> None:
+        self._pipeline_busy = False
+        self._active_task = ""
 
 
-def main(args=None):
+def main(args=None) -> None:
+    if rclpy is None:
+        raise ImportError("rclpy is required for pipeline_orchestrator runtime.")
     rclpy.init(args=args)
     node = PipelineOrchestrator()
-    rclpy.spin(node)
-    rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()

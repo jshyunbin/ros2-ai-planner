@@ -1,56 +1,5 @@
-FROM graspgen:latest
-
-ARG GRASPGEN_REPO_URL=https://github.com/pianojay/GraspGen.git
-ARG GRASPGEN_BRANCH=jaeuk
-
-ENV DEBIAN_FRONTEND=noninteractive
-ENV LANG=en_US.UTF-8
-ENV LC_ALL=en_US.UTF-8
-ENV GRASPGEN_REPO_DIR=/opt/GraspGen
-ENV GRASPGEN_MODELS_DIR=/opt/GraspGenModels
-
-# Locale
-RUN apt-get update && apt-get install -y locales && \
-    locale-gen en_US en_US.UTF-8 && \
-    update-locale LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8 && \
-    rm -rf /var/lib/apt/lists/*
-
-# ROS2 Humble apt source
-RUN apt-get update && apt-get install -y \
-    software-properties-common curl git gnupg2 lsb-release && \
-    curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
-        -o /usr/share/keyrings/ros-archive-keyring.gpg && \
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] \
-        http://packages.ros.org/ros2/ubuntu $(. /etc/os-release && echo $UBUNTU_CODENAME) main" | \
-        tee /etc/apt/sources.list.d/ros2.list > /dev/null && \
-    rm -rf /var/lib/apt/lists/*
-
-# ROS2 Humble + Python tools
-RUN apt-get update && apt-get install -y \
-    ros-humble-ros-base \
-    ros-humble-cv-bridge \
-    ros-humble-vision-msgs \
-    python3-colcon-common-extensions \
-    python3-numpy \
-    python3-rosdep \
-    python3-pip && \
-    rm -rf /var/lib/apt/lists/*
-
-# GraspGen source for in-container inference
-RUN git clone --recursive --branch ${GRASPGEN_BRANCH} ${GRASPGEN_REPO_URL} ${GRASPGEN_REPO_DIR} && \
-    pip3 install --no-cache-dir --no-build-isolation ${GRASPGEN_REPO_DIR}/pointnet2_ops && \
-    pip3 install --no-cache-dir \
-        PyOpenGL==3.1.0 \
-        msgpack-numpy==0.4.8 \
-        tensordict==0.12.4 \
-        transformers==4.48.3 \
-        viser==1.0.29 && \
-    pip3 install --no-cache-dir --no-deps -e ${GRASPGEN_REPO_DIR}
-
-# GraspGen ZMQ client/server dependencies
-RUN pip3 install --no-cache-dir \
-    msgpack \
-    pyzmq
+ARG PLANNER_BASE_IMAGE=ros2-ai-planner-base:latest
+FROM ${PLANNER_BASE_IMAGE}
 
 # Workspace
 WORKDIR /ros2_ws

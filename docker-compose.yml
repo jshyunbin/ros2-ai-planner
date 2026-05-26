@@ -3,6 +3,7 @@ services:
     build:
       context: .
       args:
+        PLANNER_BASE_IMAGE: ${PLANNER_BASE_IMAGE:-ros2-ai-planner-base:latest}
         GRASPGEN_REPO_URL: https://github.com/pianojay/GraspGen.git
         GRASPGEN_BRANCH: jaeuk
     network_mode: host

@@ -23,12 +23,16 @@ Important environment split:
 - the host runs `manip_challenge`, Gazebo, and the base ROS2 graph
 - the `ros2-ai-planner` container also includes ROS2, because it runs its own ROS2 nodes
 - the two communicate over DDS using `network_mode: host`
+- planner service nodes use the vendored `riro_srvs/StringString` package under `src/utils/riro_srvs`
 
 ## Usage
 
 ```bash
-# Build the image
-docker compose build
+# Build the reusable ROS2/GraspGen base image once
+./scripts/build_base_image.sh
+
+# Build the planner image on top of that base
+./scripts/build_image.sh
 
 # Start the container
 docker compose up
@@ -50,8 +54,10 @@ GraspGen work is now split into five practical layers:
    Result: `graspgen_probe` exists and can send raw wrist point clouds to the standalone server.
 4. In-container GraspGen integration: done at image level
    Result: the `ros2-ai-planner` Docker image now includes ROS2 plus the forked `pianojay/GraspGen` `jaeuk` branch and mounted `GraspGenModels`.
-5. Full live object pipeline: not implemented
-   Missing pieces: real 2D segmentation, mask-to-point-cloud conversion, calling GraspGen from planner code, and Gazebo grasp-success check.
+5. Prompted segmentation service path: implemented
+   Result: `segmentation_service` now performs `prompt -> Gemini point prompts -> SAM3 mask -> organized point-cloud masking`, publishes segmented/background clouds for GraspGen, and returns centroid/status to a ROS2 service caller.
+6. Full live object pipeline: partially implemented
+   Missing pieces: motion execution after grasp selection, Gazebo grasp-success check, and replacing the remaining planner stubs (`curobo.py`, `moveit2.py`).
 
 The old NVIDIA driver mismatch was resolved by reboot. `nvidia-smi` is now healthy on driver `535.309.01`.
 
@@ -60,8 +66,11 @@ Important current reality:
 - `ros2-ai-planner` now has two possible GraspGen development paths:
   - standalone GraspGen server in a separate container
   - embedded GraspGen inside the planner image
-- the currently implemented ROS2-side node is still the lightweight remote client path via `graspgen_probe`
-- the in-repo `SAM2` and `GraspGen` pipeline modules are still stubs
+- the ROS2 side now has both:
+  - `graspgen_probe` for raw point-cloud probing
+  - `segmentation_service` for prompted segmentation and masked cloud publication
+- `orchestrator.py` now acts as a ROS2 service caller for segmentation and GraspGen
+- the older in-repo `SAM2` and `GraspGen` wrapper modules are still stubs and are no longer the primary integration path
 - `segmented_objects/` contains offline sample point clouds, not outputs of a live segmentation pipeline inside this repo
 
 Known working offline samples:
@@ -86,15 +95,16 @@ The planner image is no longer just a lightweight ROS2 client image.
 
 Current Docker image behavior:
 
-- base image: local `graspgen:latest`
-- adds ROS2 Humble runtime and Python tooling
-- clones `https://github.com/pianojay/GraspGen.git` on branch `jaeuk` into `/opt/GraspGen`
-- mounts local model assets from `../GraspGenModels` into `/opt/GraspGenModels`
-- keeps the existing `pipeline_orchestrator` package and `graspgen_probe` entrypoint
+- reusable heavy base image: `ros2-ai-planner-base:latest`
+- base image itself starts from local `graspgen:latest`
+- base image adds ROS2 Humble runtime, OpenCV, GraspGen source, and Python tooling
+- planner image then only copies `src/`, builds the ROS2 workspace, and installs entrypoint scripts
+- local model assets are still mounted from `../GraspGenModels` into `/opt/GraspGenModels`
 
 Verified image-level checks:
 
-- `docker compose build` succeeds
+- `./scripts/build_base_image.sh` creates the reusable base image
+- `./scripts/build_image.sh` builds the thin planner image on top of it
 - `grasp_gen` imports successfully inside the planner container
 - `/start_graspgen_server.sh` resolves the embedded repo and mounted model checkpoint
 - model load succeeds inside the planner container
@@ -142,7 +152,7 @@ Launch the normal `manip_challenge` Gazebo/ROS2 stack on the host. The probe exp
 From this repo root:
 
 ```bash
-docker compose build
+./scripts/build_image.sh
 docker compose run --rm ai_planner bash
 ```
 
@@ -182,7 +192,7 @@ The planner image can also launch GraspGen internally instead of depending on a 
 From this repo root:
 
 ```bash
-docker compose build
+./scripts/build_image.sh
 docker compose run --rm ai_planner bash
 ```
 
@@ -214,7 +224,9 @@ Intended package layout:
 
 ```text
 src/pipeline_orchestrator/pipeline_orchestrator/
-├── orchestrator.py   # ROS2 node scaffold
+├── orchestrator.py   # ROS2 node: task command -> segmentation service -> GraspGen service
+├── segmentation_service.py # ROS2 node: Gemini point prompts + SAM3 + point-cloud masking
+├── segmentation_utils.py   # helpers for mask parsing / rasterization / cloud extraction
 ├── graspgen_probe.py # ROS2 node: raw PointCloud2 -> standalone GraspGen server
 ├── sam2.py           # intended SAM2 segmentation module
 ├── graspgen.py       # intended GraspGen wrapper from masks + depth
@@ -224,14 +236,16 @@ src/pipeline_orchestrator/pipeline_orchestrator/
 
 Current implementation status:
 
-- `orchestrator.py`: scaffold only
+- `orchestrator.py`: implemented as a segmentation + GraspGen service caller
+- `segmentation_service.py`: implemented
+- `segmentation_utils.py`: implemented
 - `sam2.py`: stub, returns `None`
 - `graspgen.py`: stub, returns `None`
 - `curobo.py`: stub
 - `moveit2.py`: stub
 - `graspgen_probe.py`: implemented
 
-This means there is not yet a proper runtime segmentation pipeline inside `ros2-ai-planner`.
+This means `ros2-ai-planner` now has a runtime prompted-segmentation path, but the final motion-planning and execution path is still incomplete.
 
 ### Topics subscribed
 
@@ -267,6 +281,17 @@ To open an interactive shell:
 ```bash
 docker compose run --rm ai_planner bash
 ```
+
+## Build Speed Mitigation
+
+The slowest rebuild layer is installing ROS2 Humble and related apt packages. That layer is now split out into a reusable base image:
+
+- `./scripts/build_base_image.sh`
+  - rebuild only when ROS2/system Python/GraspGen base dependencies change
+- `./scripts/build_image.sh`
+  - reuses the base image and rebuilds only the planner workspace image
+
+If the base image already exists locally, `build_image.sh` skips rebuilding it.
 
 ## Adding Dependencies
 
