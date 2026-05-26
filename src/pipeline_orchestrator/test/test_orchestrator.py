@@ -1,6 +1,6 @@
 import numpy as np
 import pytest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 
 # --- GeminiLocalizer ---
@@ -75,18 +75,56 @@ def test_graspgen_accepts_point_cloud():
 
 # --- CuRobo ---
 
-def test_curobo_accepts_esdf():
+def make_curobo():
+    """Return a CuRobo instance with all heavy deps mocked."""
     from pipeline_orchestrator.curobo import CuRobo
-    curobo = CuRobo(MagicMock())
-    result = curobo.plan_trajectory(MagicMock(), MagicMock(), esdf=None)
-    assert result is None  # stub
+    node = MagicMock()
+    with patch.multiple('pipeline_orchestrator.curobo',
+                        Mapper=MagicMock(), FilterDepth=MagicMock(),
+                        MotionPlanner=MagicMock(), Buffer=MagicMock(),
+                        TransformListener=MagicMock()):
+        return CuRobo(node), node
 
 
-def test_curobo_esdf_optional():
+def test_curobo_subscribes_to_four_topics():
+    curobo, node = make_curobo()
+    topics = [c.args[1] for c in node.create_subscription.call_args_list]
+    assert '/camera/camera/depth/color/image_raw' in topics
+    assert '/camera/camera/depth/camera_info' in topics
+    assert '/wrist_camera/wrist_camera/depth/color/image_raw' in topics
+    assert '/wrist_camera/wrist_camera/depth/camera_info' in topics
+
+
+def test_curobo_skips_depth_without_camera_info():
     from pipeline_orchestrator.curobo import CuRobo
-    curobo = CuRobo(MagicMock())
-    result = curobo.plan_trajectory(MagicMock(), MagicMock())
-    assert result is None  # stub
+    node = MagicMock()
+    mock_mapper = MagicMock()
+    with patch.multiple('pipeline_orchestrator.curobo',
+                        Mapper=MagicMock(return_value=mock_mapper),
+                        FilterDepth=MagicMock(),
+                        MotionPlanner=MagicMock(), Buffer=MagicMock(),
+                        TransformListener=MagicMock()):
+        curobo = CuRobo(node)
+        curobo._on_depth(MagicMock(), 'overhead', 'camera_color_optical_frame')
+        mock_mapper.integrate.assert_not_called()
+
+
+def test_curobo_plan_trajectory_calls_update_world_after_min_frames():
+    from pipeline_orchestrator.curobo import CuRobo, MIN_FRAMES
+    node = MagicMock()
+    mock_mapper = MagicMock()
+    mock_planner = MagicMock()
+    mock_planner.plan_pose.return_value = None
+    with patch.multiple('pipeline_orchestrator.curobo',
+                        Mapper=MagicMock(return_value=mock_mapper),
+                        FilterDepth=MagicMock(),
+                        MotionPlanner=MagicMock(return_value=mock_planner),
+                        Buffer=MagicMock(), TransformListener=MagicMock()):
+        curobo = CuRobo(node)
+        curobo._frame_count = MIN_FRAMES
+        curobo.plan_trajectory(MagicMock(), MagicMock())
+        mock_mapper.compute_esdf.assert_called_once()
+        mock_planner.update_world.assert_called_once()
 
 
 # --- Orchestrator ---
