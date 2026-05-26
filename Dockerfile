@@ -55,9 +55,6 @@ RUN pip3 install --no-cache-dir "warp-lang>=0.10.0" && \
     sed -i \
         's/dynamic = \["version"\]/version = "0.8.0"/' \
         /tmp/curobo/pyproject.toml && \
-    sed -i \
-        '/setuptools_scm/d' \
-        /tmp/curobo/pyproject.toml && \
     pip3 install --no-cache-dir /tmp/curobo && \
     rm -rf /tmp/curobo
 
