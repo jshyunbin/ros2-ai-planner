@@ -46,13 +46,13 @@ RUN bash -c "source /opt/ros/humble/setup.bash && \
     xacro /opt/ros/humble/share/ur_description/urdf/ur.urdf.xacro \
         ur_type:=ur5 name:=ur > /ur5.urdf"
 
-# cuRoboV2 v0.8.0 + Warp (GPU kernel runtime)
-# Full clone required — setuptools_scm needs tag history to resolve version.
-# [cu12] extra installs CUDA 12.x-specific components (PyTorch already present).
-RUN git clone --branch v0.8.0 \
+# cuRoboV2 v0.8.0 — use uv (official install method) to handle setuptools_scm
+RUN pip3 install --no-cache-dir uv && \
+    git clone --branch v0.8.0 \
         https://github.com/NVlabs/curobo.git /tmp/curobo && \
-    pip3 install --no-cache-dir "/tmp/curobo[cu12]" && \
-    rm -rf /tmp/curobo
+    cd /tmp/curobo && \
+    uv pip install --system ".[cu12]" && \
+    cd / && rm -rf /tmp/curobo
 
 # Workspace
 WORKDIR /ros2_ws
