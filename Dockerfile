@@ -58,7 +58,7 @@ RUN pip3 install --no-cache-dir uv && \
 WORKDIR /ros2_ws
 COPY src/ src/
 RUN . /opt/ros/humble/setup.sh && \
-    colcon build --symlink-install
+    colcon build
 
 COPY scripts/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
