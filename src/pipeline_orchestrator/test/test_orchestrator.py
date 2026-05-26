@@ -142,3 +142,16 @@ def test_orchestrator_has_task_command_callback():
 def test_orchestrator_has_run_pipeline():
     from pipeline_orchestrator.orchestrator import PipelineOrchestrator
     assert callable(PipelineOrchestrator._run_pipeline)
+
+
+def test_orchestrator_does_not_import_nvblox():
+    import ast, pathlib
+    src = pathlib.Path(
+        'src/pipeline_orchestrator/pipeline_orchestrator/orchestrator.py'
+    ).read_text()
+    tree = ast.parse(src)
+    imports = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.names:
+            imports.extend([n.name for n in node.names])
+    assert not any('nvblox' in i.lower() for i in imports), f"Found nvblox import: {imports}"
