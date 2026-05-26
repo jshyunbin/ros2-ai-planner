@@ -47,15 +47,11 @@ RUN bash -c "source /opt/ros/humble/setup.bash && \
         ur_type:=ur5 name:=ur > /ur5.urdf"
 
 # cuRoboV2 v0.8.0 + Warp (GPU kernel runtime)
-# Patch pyproject.toml to pin a static version, bypassing setuptools_scm
-# which cannot resolve tags from a shallow clone.
-RUN pip3 install --no-cache-dir "warp-lang>=0.10.0" && \
-    git clone --depth 1 --branch v0.8.0 \
+# Full clone required — setuptools_scm needs tag history to resolve version.
+# [cu12] extra installs CUDA 12.x-specific components (PyTorch already present).
+RUN git clone --branch v0.8.0 \
         https://github.com/NVlabs/curobo.git /tmp/curobo && \
-    sed -i \
-        's/dynamic = \["version"\]/version = "0.8.0"/' \
-        /tmp/curobo/pyproject.toml && \
-    pip3 install --no-cache-dir /tmp/curobo && \
+    pip3 install --no-cache-dir "/tmp/curobo[cu12]" && \
     rm -rf /tmp/curobo
 
 # Workspace
