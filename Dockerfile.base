@@ -1,7 +1,12 @@
-FROM graspgen:latest
+FROM nvcr.io/nvidia/pytorch:23.07-py3
 
 ARG GRASPGEN_REPO_URL=https://github.com/pianojay/GraspGen.git
 ARG GRASPGEN_BRANCH=jaeuk
+ARG GRASPGEN_COMMIT=beddd216a62781670a9b0938e7624b1ea10925f6
+ARG GRASPGEN_MODELS_REPO_URL=https://huggingface.co/adithyamurali/GraspGenModels
+ARG GRASPGEN_MODELS_COMMIT=ec1ccbb5eec0680db669246ac312a3636f16ee43
+ARG GRIPPER_CONFIG_NAME=graspgen_robotiq_2f_140.yml
+ARG GRASPGEN_MODEL_FILES=checkpoints/graspgen_robotiq_2f_140.yml,checkpoints/graspgen_robotiq_2f_140_gen.pth,checkpoints/graspgen_robotiq_2f_140_dis.pth
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV LANG=en_US.UTF-8
@@ -15,17 +20,26 @@ RUN apt-get update && apt-get install -y locales && \
     update-locale LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8 && \
     rm -rf /var/lib/apt/lists/*
 
-# ROS2 Humble apt source
+# Base system packages, ROS2 apt source, and git-lfs for Hugging Face model pulls.
 RUN apt-get update && apt-get install -y \
-    software-properties-common curl git gnupg2 lsb-release && \
+    curl \
+    git \
+    git-lfs \
+    gnupg2 \
+    lsb-release \
+    locales \
+    software-properties-common \
+    tmux \
+    libosmesa6-dev && \
     curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
         -o /usr/share/keyrings/ros-archive-keyring.gpg && \
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] \
         http://packages.ros.org/ros2/ubuntu $(. /etc/os-release && echo $UBUNTU_CODENAME) main" | \
         tee /etc/apt/sources.list.d/ros2.list > /dev/null && \
+    git lfs install --system && \
     rm -rf /var/lib/apt/lists/*
 
-# ROS2 Humble + Python tools
+# ROS2 Humble + Python tools for planner-side nodes.
 RUN apt-get update && apt-get install -y \
     ros-humble-ros-base \
     ros-humble-control-msgs \
@@ -39,20 +53,61 @@ RUN apt-get update && apt-get install -y \
     python3-pip && \
     rm -rf /var/lib/apt/lists/*
 
-# GraspGen source for in-container inference
+# GraspGen runtime dependencies based on the upstream GraspGen Docker environment.
+RUN pip install --upgrade pip && \
+    pip install \
+        h5py \
+        hydra-core \
+        matplotlib \
+        meshcat \
+        scikit-learn \
+        scipy \
+        tensorboard \
+        trimesh==4.5.3 && \
+    pip install scene-synthesizer[recommend] && \
+    pip install torch==2.1.0 torchvision && \
+    pip install torch-cluster -f https://data.pyg.org/whl/torch-2.1.0+cu121.html && \
+    pip install imageio pickle5 opencv-python python-fcl && \
+    pip install pyrender==0.1.45 pyglet==2.1.6 && \
+    pip install PyOpenGL==3.1.5 && \
+    pip install diffusers==0.11.1 timm==1.0.15 huggingface-hub==0.25.2 && \
+    pip install addict yapf==0.40.1 tensorboardx sharedarray torch-geometric && \
+    pip install torch-scatter -f https://data.pyg.org/whl/torch-2.1.2+cu121.html && \
+    pip install spconv-cu120 && \
+    pip install qpsolvers[clarabel] yourdfpy==0.0.56 webdataset objaverse==0.1.7 && \
+    pip install google-genai msgpack msgpack-numpy pyzmq viser==1.0.29 tensordict==0.12.4 transformers==4.48.3
+
+# Optional geometry tooling used by the upstream environment.
+RUN mkdir -p /install && \
+    cd /install && \
+    git clone --recursive -j8 https://github.com/hjwdzh/Manifold.git && \
+    mkdir -p /install/Manifold/build && \
+    cd /install/Manifold/build && \
+    cmake .. -DCMAKE_BUILD_TYPE=Release && \
+    make
+
+ENV PATH="${PATH}:/install/Manifold/build/"
+
+# GraspGen source and editable install live inside the image.
 RUN git clone --recursive --branch ${GRASPGEN_BRANCH} ${GRASPGEN_REPO_URL} ${GRASPGEN_REPO_DIR} && \
+    cd ${GRASPGEN_REPO_DIR} && \
+    git checkout ${GRASPGEN_COMMIT} && \
+    git submodule update --init --recursive && \
     pip3 uninstall -y opencv-python || true && \
     pip3 install --no-cache-dir --no-build-isolation ${GRASPGEN_REPO_DIR}/pointnet2_ops && \
-    pip3 install --no-cache-dir \
-        PyOpenGL==3.1.0 \
-        google-genai \
-        msgpack-numpy==0.4.8 \
-        tensordict==0.12.4 \
-        transformers==4.48.3 \
-        viser==1.0.29 && \
     pip3 install --no-cache-dir --no-deps -e ${GRASPGEN_REPO_DIR}
 
-# GraspGen ZMQ client/server dependencies
-RUN pip3 install --no-cache-dir \
-    msgpack \
-    pyzmq
+# Download only the pinned GraspGen model assets required by the planner.
+RUN export GIT_LFS_SKIP_SMUDGE=1 && \
+    git clone ${GRASPGEN_MODELS_REPO_URL} /tmp/GraspGenModels && \
+    cd /tmp/GraspGenModels && \
+    git checkout ${GRASPGEN_MODELS_COMMIT} && \
+    git lfs pull --include="${GRASPGEN_MODEL_FILES}" && \
+    mkdir -p ${GRASPGEN_MODELS_DIR}/checkpoints && \
+    cp checkpoints/graspgen_robotiq_2f_140.yml ${GRASPGEN_MODELS_DIR}/checkpoints/ && \
+    cp checkpoints/graspgen_robotiq_2f_140_gen.pth ${GRASPGEN_MODELS_DIR}/checkpoints/ && \
+    cp checkpoints/graspgen_robotiq_2f_140_dis.pth ${GRASPGEN_MODELS_DIR}/checkpoints/ && \
+    rm -rf /tmp/GraspGenModels && \
+    test -f "${GRASPGEN_MODELS_DIR}/checkpoints/${GRIPPER_CONFIG_NAME}" && \
+    test -f "${GRASPGEN_MODELS_DIR}/checkpoints/graspgen_robotiq_2f_140_gen.pth" && \
+    test -f "${GRASPGEN_MODELS_DIR}/checkpoints/graspgen_robotiq_2f_140_dis.pth"

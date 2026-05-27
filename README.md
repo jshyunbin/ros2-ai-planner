@@ -24,6 +24,7 @@ Important environment split:
 - the `ros2-ai-planner` container also includes ROS2, because it runs its own ROS2 nodes
 - the two communicate over DDS using `network_mode: host`
 - planner service nodes use the vendored `riro_srvs/StringString` package under `src/utils/riro_srvs`
+- the competition image must be self-contained; host bind mounts are now treated as development-only
 
 ## Usage
 
@@ -34,13 +35,16 @@ Important environment split:
 # Build the planner image on top of that base
 ./scripts/build_image.sh
 
-# Start the container
+# Start the self-contained container
 docker compose up
-# or
-./scripts/run.sh
 ```
 
-The container uses `network_mode: host`, so it automatically sees all ROS2 topics from the host.
+The default `docker-compose.yml` is now the competition-oriented path: no source or model bind mounts.
+For local hot-reload development with bind mounts, use:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+```
 
 ## Current Status
 
@@ -53,7 +57,7 @@ GraspGen work is now split into five practical layers:
 3. ROS2 raw-point-cloud probe: implemented
    Result: `graspgen_probe` exists and can send raw wrist point clouds to the standalone server.
 4. In-container GraspGen integration: done at image level
-   Result: the `ros2-ai-planner` Docker image now includes ROS2 plus the forked `pianojay/GraspGen` `jaeuk` branch and mounted `GraspGenModels`.
+   Result: the `ros2-ai-planner` Docker image now includes ROS2 plus the forked `pianojay/GraspGen` `jaeuk` branch and a pinned GraspGen checkpoint set downloaded during image build.
 5. Prompted segmentation service path: implemented
    Result: `segmentation_service` now performs `prompt -> Gemini point prompts -> SAM3 mask -> organized point-cloud masking`, publishes segmented/background clouds for GraspGen, and returns centroid/status to a ROS2 service caller.
 6. Full live object pipeline: partially implemented
@@ -96,18 +100,25 @@ The planner image is no longer just a lightweight ROS2 client image.
 Current Docker image behavior:
 
 - reusable heavy base image: `ros2-ai-planner-base:latest`
-- base image itself starts from local `graspgen:latest`
+- base image starts from public `nvcr.io/nvidia/pytorch:23.07-py3`
 - base image adds ROS2 Humble runtime, OpenCV, GraspGen source, and Python tooling
 - planner image then only copies `src/`, builds the ROS2 workspace, and installs entrypoint scripts
-- local model assets are still mounted from `../GraspGenModels` into `/opt/GraspGenModels`
+- required GraspGen model assets are downloaded from Hugging Face during image build and copied into the image
 
 Verified image-level checks:
 
 - `./scripts/build_base_image.sh` creates the reusable base image
 - `./scripts/build_image.sh` builds the thin planner image on top of it
 - `grasp_gen` imports successfully inside the planner container
-- `/start_graspgen_server.sh` resolves the embedded repo and mounted model checkpoint
+- `/start_graspgen_server.sh` resolves the embedded repo and the checkpoint downloaded into the image at build time
 - model load succeeds inside the planner container
+
+Pinned external sources used by the image build:
+
+- GraspGen code: `https://github.com/pianojay/GraspGen.git` branch `jaeuk` at commit `beddd216a62781670a9b0938e7624b1ea10925f6`
+- GraspGen model repo: `https://huggingface.co/adithyamurali/GraspGenModels` at commit `ec1ccbb5eec0680db669246ac312a3636f16ee43`
+
+This means directory mounts are no longer required for GraspGen assets, but internet access is required when building the base image unless you prebuild and distribute the image itself.
 
 The only failed startup check was binding port `5556` when the standalone server was already using it. That is expected, not a model or dependency failure.
 
@@ -312,7 +323,7 @@ This means `ros2-ai-planner` now has a runtime prompted-segmentation path, but t
 
 ## Development
 
-Source edits in `src/` take effect immediately inside the container because of the volume mount plus `--symlink-install`.
+With the development override compose file, source edits in `src/` take effect immediately inside the container because of the volume mount plus `--symlink-install`.
 
 To rebuild the ROS2 workspace inside the container:
 

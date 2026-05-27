@@ -14,10 +14,6 @@ services:
       - ROS_DOMAIN_ID=0
       - GRASPGEN_REPO_DIR=/opt/GraspGen
       - GRASPGEN_MODELS_DIR=/opt/GraspGenModels
-    volumes:
-      - ./src:/ros2_ws/src
-      - ./segmented_objects:/ros2_ws/segmented_objects:ro
-      - ../GraspGenModels:/opt/GraspGenModels:ro
     ipc: host
     stdin_open: true
     tty: true

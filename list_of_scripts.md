@@ -36,10 +36,16 @@ Build images from `ros2-ai-planner/`:
 ./scripts/build_image.sh
 ```
 
-Start one persistent planner container:
+Start one persistent planner container from the self-contained image:
 
 ```bash
 docker compose run --name ai_planner_dev --service-ports ai_planner bash
+```
+
+For host bind mounts during development only:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dev.yml run --name ai_planner_dev --service-ports ai_planner bash
 ```
 
 Open more shells into the same container:

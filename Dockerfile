@@ -4,6 +4,8 @@ FROM ${PLANNER_BASE_IMAGE}
 # Workspace
 WORKDIR /ros2_ws
 COPY src/ src/
+COPY scripts/ scripts/
+COPY segmented_objects/ segmented_objects/
 RUN . /opt/ros/humble/setup.sh && \
     colcon build --symlink-install
 
