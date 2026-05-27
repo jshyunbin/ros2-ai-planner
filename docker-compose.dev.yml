@@ -3,4 +3,3 @@ services:
     volumes:
       - ./src:/ros2_ws/src
       - ./scripts:/ros2_ws/scripts
-      - ./segmented_objects:/ros2_ws/segmented_objects

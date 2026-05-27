@@ -172,7 +172,7 @@ export ROS_LOCALHOST_ONLY=0
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 export FASTDDS_BUILTIN_TRANSPORTS=UDPv4
 ros2 service call /unpause_physics std_srvs/srv/Empty "{}"
-ros2 topic pub /task_commands std_msgs/msg/String "{data: 'pick banana'}" -r 1
+ros2 topic pub --once /task_commands std_msgs/msg/String "{data: 'banana'}"
 ```
 
 Container:

@@ -13,6 +13,8 @@ ENV LANG=en_US.UTF-8
 ENV LC_ALL=en_US.UTF-8
 ENV GRASPGEN_REPO_DIR=/opt/GraspGen
 ENV GRASPGEN_MODELS_DIR=/opt/GraspGenModels
+ENV SAM2_MODEL_DIR=/opt/models/sam2
+ENV SAM2_MODEL_PATH=/opt/models/sam2/sam2_t.pt
 
 COPY requirements/ /tmp/requirements/
 
@@ -79,6 +81,13 @@ RUN pip install --upgrade pip && \
     pip install qpsolvers[clarabel] yourdfpy==0.0.56 webdataset objaverse==0.1.7 && \
     pip install google-genai msgpack msgpack-numpy pyzmq viser==1.0.29 tensordict==0.12.4 transformers==4.48.3 && \
     pip install --no-deps -r /tmp/requirements/sam2.txt
+
+# Bake the Ultralytics SAM2 checkpoint into the image so runtime does not depend on
+# the per-user Ultralytics cache or a first-run download.
+RUN mkdir -p ${SAM2_MODEL_DIR} && \
+    curl -L https://github.com/ultralytics/assets/releases/download/v8.4.0/sam2_t.pt \
+      -o ${SAM2_MODEL_PATH} && \
+    test -s ${SAM2_MODEL_PATH}
 
 # Optional geometry tooling used by the upstream environment.
 RUN mkdir -p /install && \

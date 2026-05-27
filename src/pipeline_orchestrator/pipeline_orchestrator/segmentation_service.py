@@ -1,10 +1,7 @@
-import hashlib
 import json
 import os
 from pathlib import Path
 import time
-import urllib.error
-import urllib.request
 
 import cv2
 import numpy as np
@@ -17,17 +14,11 @@ from sensor_msgs.msg import Image, PointCloud2, PointField
 from std_msgs.msg import Header
 
 from pipeline_orchestrator.segmentation_utils import (
-    PromptPoint,
     build_overlay_image,
     compute_centroid,
     compute_mask_roi,
     depth_to_masked_points,
-    encode_image_to_base64,
-    parse_sam3_polygons,
-    prompt_points_from_box,
-    rasterize_polygons,
     resize_for_api,
-    scale_polygons,
     stable_downsample,
 )
 
@@ -37,6 +28,11 @@ try:  # pragma: no cover - runtime dependency
 except ImportError:  # pragma: no cover - runtime dependency
     genai = None
     types = None
+
+try:  # pragma: no cover - runtime dependency
+    from ultralytics import SAM
+except ImportError:  # pragma: no cover - runtime dependency
+    SAM = None
 
 try:  # pragma: no cover - runtime dependency
     from riro_srvs.srv import StringString
@@ -100,8 +96,7 @@ class SegmentationService(Node):
         self.declare_parameter("overlay_topic", "/segmentation/overlay")
         self.declare_parameter("mask_topic", "/segmentation/mask")
         self.declare_parameter("gemini_model", "gemini-2.5-flash")
-        self.declare_parameter("sam3_endpoint", "https://sam3.ai/api/v1/pvs")
-        self.declare_parameter("api_timeout_sec", 120.0)
+        self.declare_parameter("sam2_model", "/opt/models/sam2/sam2_t.pt")
         self.declare_parameter("max_api_image_dim", 1024)
         self.declare_parameter("min_depth_m", 0.05)
         self.declare_parameter("max_depth_m", 2.5)
@@ -126,18 +121,17 @@ class SegmentationService(Node):
         self._debug_dir.mkdir(parents=True, exist_ok=True)
 
         gemini_api_key = os.getenv("GEMINI_API_KEY")
-        sam3_api_key = os.getenv("SAM3_API_KEY")
         if not gemini_api_key:
             raise ValueError("GEMINI_API_KEY is not set.")
-        if not sam3_api_key:
-            raise ValueError("SAM3_API_KEY is not set.")
         if genai is None or types is None:
             raise ImportError("google-genai is required for segmentation_service.")
+        if SAM is None:
+            raise ImportError("ultralytics is required for segmentation_service.")
 
         self._gemini = genai.Client(api_key=gemini_api_key)
         self._gemini_model = str(self.get_parameter("gemini_model").value)
-        self._sam3_api_key = sam3_api_key
-        self._sam3_endpoint = str(self.get_parameter("sam3_endpoint").value)
+        self._sam2_model_name = str(self.get_parameter("sam2_model").value)
+        self._sam2 = SAM(self._sam2_model_name)
 
         qos = QoSProfile(depth=10)
         qos.reliability = ReliabilityPolicy.BEST_EFFORT
@@ -236,19 +230,13 @@ class SegmentationService(Node):
             api_height = int(api_image_bgr.shape[0])
 
             prompt_result = self._localize_prompt(api_image_bgr, prompt)
-            prompt_bbox = self._sanitize_detection_box(
+            prompt_bbox_api = self._sanitize_detection_box(
                 prompt_result["box_2d"], api_width, api_height
             )
-            prompt_points = prompt_points_from_box(*prompt_bbox, api_width, api_height)
-            polygons_api = self._segment_with_sam3(api_image_bgr, prompt_points)
-            if not polygons_api:
-                raise RuntimeError("SAM3 returned no polygons.")
-
-            polygons_full = scale_polygons(polygons_api, scale_x, scale_y)
-            full_height, full_width = rgb_bgr.shape[:2]
-            mask = rasterize_polygons(polygons_full, full_width, full_height)
+            prompt_bbox = self._scale_bbox(prompt_bbox_api, scale_x, scale_y, rgb_bgr.shape[1], rgb_bgr.shape[0])
+            mask = self._segment_with_sam2(rgb_bgr, prompt_bbox)
             if not mask.any():
-                raise RuntimeError("Rasterized mask is empty.")
+                raise RuntimeError("SAM2 returned an empty mask.")
 
             object_points, background_points = depth_to_masked_points(
                 depth_image,
@@ -283,18 +271,10 @@ class SegmentationService(Node):
             if len(background_points) > 0:
                 self._background_pub.publish(make_xyz_cloud(background_points, self._latest_frame_id))
 
-            prompt_points_full = [
-                PromptPoint(
-                    x=int(round(point.x * scale_x)),
-                    y=int(round(point.y * scale_y)),
-                    positive=point.positive,
-                )
-                for point in prompt_points
-            ]
             overlay = build_overlay_image(
                 rgb_bgr,
                 mask,
-                prompt_points_full,
+                [],
                 prompt_result["label"],
             )
             self._overlay_pub.publish(self._bridge.cv2_to_imgmsg(overlay, encoding="bgr8"))
@@ -316,10 +296,7 @@ class SegmentationService(Node):
                 "mask_area_ratio": round(float(mask.mean()), 6),
                 "processing_time_ms": elapsed_ms,
                 "gemini_bbox_xyxy": list(prompt_bbox),
-                "prompt_points": [
-                    {"x": int(p.x), "y": int(p.y), "positive": bool(p.positive)}
-                    for p in prompt_points_full
-                ],
+                "sam2_model": self._sam2_model_name,
                 "debug_dir": str(debug_path),
             }
             response.data = json.dumps(response_payload)
@@ -333,8 +310,6 @@ class SegmentationService(Node):
                 overlay=overlay,
                 prompt_result=prompt_result,
                 prompt_bbox=prompt_bbox,
-                prompt_points_full=prompt_points_full,
-                polygons_full=polygons_full,
                 object_points=object_points,
                 background_points=background_points,
                 response_payload=response_payload,
@@ -395,6 +370,23 @@ class SegmentationService(Node):
         box_2d = detection.get("box_2d", [])
         return {"label": label, "box_2d": box_2d, "image_size": [width, height]}
 
+    def _scale_bbox(
+        self,
+        bbox: tuple[int, int, int, int],
+        scale_x: float,
+        scale_y: float,
+        width: int,
+        height: int,
+    ) -> tuple[int, int, int, int]:
+        x_min, y_min, x_max, y_max = bbox
+        scaled = (
+            int(round(x_min * scale_x)),
+            int(round(y_min * scale_y)),
+            int(round(x_max * scale_x)),
+            int(round(y_max * scale_y)),
+        )
+        return self._sanitize_pixel_box(scaled, width, height)
+
     def _sanitize_detection_box(
         self, raw_box: list[int], width: int, height: int
     ) -> tuple[int, int, int, int]:
@@ -426,60 +418,41 @@ class SegmentationService(Node):
             )
         return x_min, y_min, x_max, y_max
 
-    def _segment_with_sam3(self, image_bgr: np.ndarray, prompt_points: list[PromptPoint]) -> list[np.ndarray]:
-        image_base64 = encode_image_to_base64(image_bgr)
-        image_id = hashlib.sha1(image_base64[-512:].encode("ascii")).hexdigest()[:16]
-        payload = {
-            "image": image_base64,
-            "imageId": image_id,
-            "multimaskOutput": False,
-            "points": [
-                {"x": point.x, "y": point.y, "positive": point.positive}
-                for point in prompt_points
-            ],
-        }
-        timeout = float(self.get_parameter("api_timeout_sec").value)
-        raw = self._http_post_json(
-            self._sam3_endpoint,
-            payload,
-            headers={"Authorization": f"Bearer {self._sam3_api_key}"},
-            timeout=timeout,
-        )
-        polygons = parse_sam3_polygons(raw)
-        if not polygons:
-            raise RuntimeError(f"SAM3 returned no valid polygons: {json.dumps(raw)[:400]}")
-        return polygons
-
-    def _http_post_json(
+    def _sanitize_pixel_box(
         self,
-        url: str,
-        payload: dict,
-        *,
-        headers: dict[str, str] | None = None,
-        timeout: float,
-    ) -> dict:
-        request_headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": "ros2-ai-planner/0.1 (+https://sam3.ai/docs/api-reference)",
-        }
-        if headers:
-            request_headers.update(headers)
+        bbox: tuple[int, int, int, int],
+        width: int,
+        height: int,
+    ) -> tuple[int, int, int, int]:
+        x_min, y_min, x_max, y_max = bbox
+        x_min = int(np.clip(x_min, 0, width - 1))
+        y_min = int(np.clip(y_min, 0, height - 1))
+        x_max = int(np.clip(x_max, 0, width - 1))
+        y_max = int(np.clip(y_max, 0, height - 1))
+        if x_max <= x_min or y_max <= y_min:
+            raise RuntimeError(f"Degenerate pixel bbox: {[x_min, y_min, x_max, y_max]}")
+        return x_min, y_min, x_max, y_max
 
-        request = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers=request_headers,
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"HTTP {exc.code} from {url}: {body[:400]}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"Failed to reach {url}: {exc.reason}") from exc
+    def _segment_with_sam2(
+        self, image_bgr: np.ndarray, bbox: tuple[int, int, int, int]
+    ) -> np.ndarray:
+        x_min, y_min, x_max, y_max = bbox
+        results = self._sam2(image_bgr, bboxes=[x_min, y_min, x_max, y_max], verbose=False)
+        if not results:
+            raise RuntimeError("SAM2 returned no results.")
+
+        masks = results[0].masks
+        if masks is None or masks.data is None or len(masks.data) == 0:
+            raise RuntimeError("SAM2 returned no masks.")
+
+        mask_data = masks.data.detach().cpu().numpy()
+        best_index = int(np.argmax(mask_data.reshape(mask_data.shape[0], -1).sum(axis=1)))
+        mask = mask_data[best_index] > 0
+        if mask.shape != image_bgr.shape[:2]:
+            raise RuntimeError(
+                f"SAM2 mask shape {mask.shape} does not match image shape {image_bgr.shape[:2]}"
+            )
+        return mask.astype(bool)
 
     def _save_debug_artifacts(
         self,
@@ -493,8 +466,6 @@ class SegmentationService(Node):
         overlay: np.ndarray,
         prompt_result: dict,
         prompt_bbox: tuple[int, int, int, int],
-        prompt_points_full: list[PromptPoint],
-        polygons_full: list[np.ndarray],
         object_points: np.ndarray,
         background_points: np.ndarray,
         response_payload: dict,
@@ -506,17 +477,12 @@ class SegmentationService(Node):
         np.save(debug_path / "depth_m.npy", depth_image.astype(np.float32))
         np.save(debug_path / "object_points.npy", object_points.astype(np.float32))
         np.save(debug_path / "background_points.npy", background_points.astype(np.float32))
-        with open(debug_path / "polygons.json", "w", encoding="utf-8") as handle:
-            json.dump([polygon.tolist() for polygon in polygons_full], handle)
         with open(debug_path / "result.json", "w", encoding="utf-8") as handle:
             json.dump(
                 {
                     "prompt": prompt,
                     "prompt_result": prompt_result,
                     "prompt_bbox_xyxy": list(prompt_bbox),
-                    "prompt_points_full": [
-                        {"x": p.x, "y": p.y, "positive": p.positive} for p in prompt_points_full
-                    ],
                     "response": response_payload,
                 },
                 handle,

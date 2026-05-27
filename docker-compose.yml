@@ -16,7 +16,6 @@ services:
       RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
       FASTDDS_BUILTIN_TRANSPORTS: ${FASTDDS_BUILTIN_TRANSPORTS:-UDPv4}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
-      SAM3_API_KEY: ${SAM3_API_KEY:-}
       GRASPGEN_REPO_DIR: /opt/GraspGen
       GRASPGEN_MODELS_DIR: /opt/GraspGenModels
     volumes:

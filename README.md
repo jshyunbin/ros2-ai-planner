@@ -55,7 +55,7 @@ Container-side runtime environment expected by the planner:
 - `ROS_LOCALHOST_ONLY=0`
 - `RMW_IMPLEMENTATION=rmw_fastrtps_cpp`
 - `FASTDDS_BUILTIN_TRANSPORTS=UDPv4`
-- `GEMINI_API_KEY` and `SAM3_API_KEY` when running the current `segmentation_service`
+- `GEMINI_API_KEY` when running `segmentation_service`
 
 ## Current Status
 
@@ -70,7 +70,7 @@ GraspGen work is now split into five practical layers:
 4. In-container GraspGen integration: done at image level
    Result: the `ros2-ai-planner` Docker image now includes ROS2 plus the forked `pianojay/GraspGen` `jaeuk` branch and a pinned GraspGen checkpoint set downloaded during image build.
 5. Prompted segmentation service path: implemented
-   Result: `segmentation_service` now performs `prompt -> Gemini point prompts -> SAM3 mask -> organized point-cloud masking`, publishes segmented/background clouds for GraspGen, and returns centroid/status to a ROS2 service caller.
+   Result: `segmentation_service` now performs `prompt -> Gemini bbox -> local Ultralytics SAM2 mask -> organized point-cloud masking`, publishes segmented/background clouds for GraspGen, and returns centroid/status to a ROS2 service caller.
 6. Full live object pipeline: partially implemented
    Missing pieces: motion execution after grasp selection, Gazebo grasp-success check, and replacing the remaining planner stubs (`curobo.py`, `moveit2.py`).
 
@@ -251,7 +251,6 @@ source /opt/ros/humble/setup.bash
 cd /ros2_ws
 source install/setup.bash
 export GEMINI_API_KEY=...
-export SAM3_API_KEY=...
 ros2 launch pipeline_orchestrator planner_pipeline.launch.py \
   start_graspgen_server:=true \
   auto_run_on_task_command:=true
@@ -265,6 +264,7 @@ existing torch/CUDA stack.
 - install path used in this repo: `pip install --no-deps "ultralytics>=8.2.70"`
 - rationale: the base image already contains a working runtime set, and allowing pip
   to resolve dependencies would risk replacing pinned GPU packages used elsewhere
+- baked checkpoint path in the image: `/opt/models/sam2/sam2_t.pt`
 - practical status: local testing in the container succeeded with Ultralytics SAM2
   checkpoint download and image inference
 
@@ -305,7 +305,7 @@ Intended package layout:
 ```text
 src/pipeline_orchestrator/pipeline_orchestrator/
 ├── orchestrator.py   # ROS2 node: task command -> segmentation service -> GraspGen service
-├── segmentation_service.py # ROS2 node: Gemini point prompts + SAM3 + point-cloud masking
+├── segmentation_service.py # ROS2 node: Gemini bbox + local SAM2 + point-cloud masking
 ├── segmentation_utils.py   # helpers for mask parsing / rasterization / cloud extraction
 ├── graspgen_probe.py # ROS2 node: raw PointCloud2 -> standalone GraspGen server
 ├── sam2.py           # intended SAM2 segmentation module
