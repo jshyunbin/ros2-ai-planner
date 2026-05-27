@@ -40,14 +40,13 @@ def build_map():
     from curobo.types import CameraObservation, Pose
 
     mapper = Mapper(MapperCfg(
-        voxel_size=0.05,
         extent_meters_xyz=(2.0, 2.0, 1.5),
-        truncation_distance=0.15,
+        voxel_size=0.02,
+        esdf_voxel_size=0.05,
+        truncation_distance=0.1,
         depth_minimum_distance=0.15,
         depth_maximum_distance=2.0,
         num_cameras=1,
-        image_height=480,
-        image_width=640,
     ))
 
     K = torch.tensor(

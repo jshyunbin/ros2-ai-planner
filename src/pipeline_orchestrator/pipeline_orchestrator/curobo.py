@@ -96,17 +96,16 @@ class CuRobo:
         self._bridge = CvBridge()
 
         self._mapper = Mapper(MapperCfg(
-            voxel_size=0.05,
             extent_meters_xyz=(2.0, 2.0, 1.5),
-            truncation_distance=0.15,
+            voxel_size=0.02,
+            esdf_voxel_size=0.05,
+            truncation_distance=0.1,
             depth_minimum_distance=0.15,
             depth_maximum_distance=2.0,
             decay_factor=1.0,
             frustum_decay_factor=1.0,
             enable_static=False,
             num_cameras=2,
-            image_height=480,
-            image_width=640,
         ))
         self._depth_filter = FilterDepth(
             image_shape=(480, 640),
