@@ -97,5 +97,5 @@ def resolve_urdf(urdf_path: str) -> Path:
         'package://ur_description', f'{pkg_root}/ur_description')
     tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.urdf', delete=False)
     tmp.write(content)
-    tmp.flush()
+    tmp.close()
     return Path(tmp.name)
