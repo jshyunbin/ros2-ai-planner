@@ -76,12 +76,13 @@ def build_map():
 
 def build_planner(voxel_grid):
     from curobo.motion_planner import MotionPlanner, MotionPlannerCfg
-    from curobo._src.geom.types import SceneCfg
 
     print('  Loading MotionPlanner (warmup ~30 s)...')
-    planner = MotionPlanner(MotionPlannerCfg.create(robot=UR5_CONFIG))
+    planner = MotionPlanner(MotionPlannerCfg.create(
+        robot=UR5_CONFIG,
+        scene_model='scene/collision_test.yml',
+    ))
     planner.warmup(enable_graph=True, num_warmup_iterations=3)
-    planner.update_world(SceneCfg(voxel=[voxel_grid]))
     print('  MotionPlanner ready.')
     return planner
 
