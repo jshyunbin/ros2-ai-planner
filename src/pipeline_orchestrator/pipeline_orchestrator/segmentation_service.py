@@ -10,8 +10,10 @@ from cv_bridge import CvBridge
 from PIL import Image as PILImage
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.time import Time
 from sensor_msgs.msg import Image, PointCloud2, PointField
 from std_msgs.msg import Header
+from tf2_ros import Buffer, TransformException, TransformListener
 
 from pipeline_orchestrator.segmentation_utils import (
     build_overlay_image,
@@ -79,6 +81,24 @@ def make_xyz_cloud(points: np.ndarray, frame_id: str) -> PointCloud2:
     return msg
 
 
+def transform_to_matrix(msg) -> np.ndarray:
+    t = msg.transform.translation
+    q = msg.transform.rotation
+    x, y, z, w = q.x, q.y, q.z, q.w
+    r = np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ],
+        dtype=np.float32,
+    )
+    out = np.eye(4, dtype=np.float32)
+    out[:3, :3] = r
+    out[:3, 3] = [t.x, t.y, t.z]
+    return out
+
+
 class SegmentationService(Node):
     """Prompted 2D segmentation service that publishes masked point clouds for GraspGen."""
 
@@ -97,6 +117,7 @@ class SegmentationService(Node):
         self.declare_parameter("mask_topic", "/segmentation/mask")
         self.declare_parameter("gemini_model", "gemini-2.5-flash")
         self.declare_parameter("sam2_model", "/opt/models/sam2/sam2_t.pt")
+        self.declare_parameter("output_frame", "world")
         self.declare_parameter("max_api_image_dim", 1024)
         self.declare_parameter("min_depth_m", 0.05)
         self.declare_parameter("max_depth_m", 2.5)
@@ -113,6 +134,7 @@ class SegmentationService(Node):
         self._latest_rgb = None
         self._latest_rgb_stamp_ns = 0
         self._latest_depth = None
+        self._latest_depth_stamp = None
         self._latest_depth_stamp_ns = 0
         self._latest_frame_id = ""
         self._logged_first_rgb = False
@@ -132,6 +154,9 @@ class SegmentationService(Node):
         self._gemini_model = str(self.get_parameter("gemini_model").value)
         self._sam2_model_name = str(self.get_parameter("sam2_model").value)
         self._sam2 = SAM(self._sam2_model_name)
+        self._output_frame = str(self.get_parameter("output_frame").value)
+        self._tf_buffer = Buffer()
+        self._tf_listener = TransformListener(self._tf_buffer, self)
 
         qos = QoSProfile(depth=10)
         qos.reliability = ReliabilityPolicy.BEST_EFFORT
@@ -186,6 +211,7 @@ class SegmentationService(Node):
             depth = self._bridge.imgmsg_to_cv2(msg, desired_encoding="32FC1").astype(np.float32)
 
         self._latest_depth = depth
+        self._latest_depth_stamp = msg.header.stamp
         self._latest_depth_stamp_ns = self._stamp_to_ns(msg.header.stamp)
         self._latest_frame_id = msg.header.frame_id
         if not self._logged_first_depth:
@@ -251,6 +277,21 @@ class SegmentationService(Node):
             if len(object_points) == 0:
                 raise RuntimeError("Masked point cloud is empty after depth filtering.")
 
+            output_frame = self._output_frame
+            source_frame = self._latest_frame_id
+            object_points = self._transform_points_to_output_frame(
+                object_points,
+                source_frame=source_frame,
+                target_frame=output_frame,
+                stamp=self._latest_depth_stamp,
+            )
+            background_points = self._transform_points_to_output_frame(
+                background_points,
+                source_frame=source_frame,
+                target_frame=output_frame,
+                stamp=self._latest_depth_stamp,
+            )
+
             object_points = stable_downsample(
                 object_points, int(self.get_parameter("max_object_points").value)
             )
@@ -267,9 +308,9 @@ class SegmentationService(Node):
             assert roi is not None
             x_min, y_min, x_max, y_max = roi
 
-            self._segmented_pub.publish(make_xyz_cloud(object_points, self._latest_frame_id))
+            self._segmented_pub.publish(make_xyz_cloud(object_points, output_frame))
             if len(background_points) > 0:
-                self._background_pub.publish(make_xyz_cloud(background_points, self._latest_frame_id))
+                self._background_pub.publish(make_xyz_cloud(background_points, output_frame))
 
             overlay = build_overlay_image(
                 rgb_bgr,
@@ -287,7 +328,8 @@ class SegmentationService(Node):
                 "success": True,
                 "prompt": prompt,
                 "label": prompt_result["label"],
-                "frame_id": self._latest_frame_id,
+                "frame_id": output_frame,
+                "source_frame_id": source_frame,
                 "centroid": [round(float(v), 5) for v in centroid],
                 "roi_xyxy": [x_min, y_min, x_max, y_max],
                 "mask_pixel_count": int(mask.sum()),
@@ -316,7 +358,7 @@ class SegmentationService(Node):
             )
             self.get_logger().info(
                 f"Segmented '{prompt_result['label']}' "
-                f"points={len(object_points)} centroid={centroid.tolist()} "
+                f"frame={output_frame} points={len(object_points)} centroid={centroid.tolist()} "
                 f"time_ms={elapsed_ms}"
             )
             return response
@@ -453,6 +495,29 @@ class SegmentationService(Node):
                 f"SAM2 mask shape {mask.shape} does not match image shape {image_bgr.shape[:2]}"
             )
         return mask.astype(bool)
+
+    def _transform_points_to_output_frame(
+        self,
+        points: np.ndarray,
+        *,
+        source_frame: str,
+        target_frame: str,
+        stamp,
+    ) -> np.ndarray:
+        points = np.asarray(points, dtype=np.float32)
+        if len(points) == 0 or source_frame == target_frame:
+            return points
+
+        try:
+            lookup_time = Time.from_msg(stamp) if stamp is not None else Time()
+            tf = self._tf_buffer.lookup_transform(target_frame, source_frame, lookup_time)
+        except TransformException:
+            tf = self._tf_buffer.lookup_transform(target_frame, source_frame, Time())
+
+        matrix = transform_to_matrix(tf)
+        rotated = points @ matrix[:3, :3].T
+        translated = rotated + matrix[:3, 3]
+        return translated.astype(np.float32)
 
     def _save_debug_artifacts(
         self,

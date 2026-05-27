@@ -42,7 +42,7 @@ Build images from `ros2-ai-planner/`:
 
 ```bash
 cp .env.example .env
-# Fill in GEMINI_API_KEY and SAM3_API_KEY in .env if using segmentation.
+# Fill in GEMINI_API_KEY in .env if using segmentation.
 ./scripts/build_base_image.sh
 ./scripts/build_image.sh
 ```
@@ -74,7 +74,7 @@ docker rm -f ai_planner_dev
 Verify the container sees the expected ROS2 and API environment:
 
 ```bash
-docker compose run --rm ai_planner env | rg 'ROS_DOMAIN_ID|ROS_LOCALHOST_ONLY|RMW_IMPLEMENTATION|FASTDDS_BUILTIN_TRANSPORTS|GEMINI_API_KEY|SAM3_API_KEY'
+docker compose run --rm ai_planner env | rg 'ROS_DOMAIN_ID|ROS_LOCALHOST_ONLY|RMW_IMPLEMENTATION|FASTDDS_BUILTIN_TRANSPORTS|GEMINI_API_KEY'
 ```
 
 Artifacts are saved on the host under:
@@ -150,10 +150,13 @@ source install/setup.bash
 - `scripts/start_graspgen_server.sh`
   - starts embedded GraspGen manually if needed
 
+- `misc/visualize_graspgen_artifact.py`
+  - opens one `artifacts/graspgen_service/<run>/` directory in the GraspGen viser web viewer
+
 ## Essential Nodes
 
 - `segmentation_service`
-  - Gemini point prompts + SAM3 + pointcloud masking
+  - Gemini bbox + local SAM2 + world-frame pointcloud masking
 
 - `graspgen_service`
   - subscribes to masked clouds and serves `/graspgen/infer`
@@ -208,12 +211,9 @@ Working:
 - embedded GraspGen server startup
 - host-to-container ROS transport
 - RGB and organized pointcloud ingestion
-- Gemini prompt generation
-- SAM3 request path
-- segmented pointcloud publication
+- Gemini bbox localization
+- local SAM2 mask generation
+- world-frame segmented pointcloud publication
 
 Current blocker:
-
-- external API reliability / authorization
-  - Gemini may return `503 UNAVAILABLE`
-  - SAM3 access may fail depending on account / edge policy
+- grasp filtering still needs better world-frame vertical ranking and scene-specific cleanup

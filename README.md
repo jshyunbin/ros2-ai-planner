@@ -10,7 +10,7 @@ SAM2 (segment) -> pointcloud masking -> GraspGen (grasp pose) -> cuRobo (traject
                                                                   MoveIt2
 ```
 
-Current reality is narrower than that intended architecture. The repo is still mainly an integration scaffold plus a working raw-point-cloud GraspGen probe.
+Current reality is still narrower than the final target architecture, but the prompted segmentation to GraspGen inference path is now working end-to-end inside the planner stack.
 
 ## Requirements
 
@@ -59,7 +59,7 @@ Container-side runtime environment expected by the planner:
 
 ## Current Status
 
-GraspGen work is now split into five practical layers:
+Current work is now split into seven practical layers:
 
 1. Docker-only GraspGen inference check: done
    Result: local `GraspGen` Docker build works, the pretrained `robotiq_2f_140` checkpoint loads, and sample inference returns grasps.
@@ -70,9 +70,11 @@ GraspGen work is now split into five practical layers:
 4. In-container GraspGen integration: done at image level
    Result: the `ros2-ai-planner` Docker image now includes ROS2 plus the forked `pianojay/GraspGen` `jaeuk` branch and a pinned GraspGen checkpoint set downloaded during image build.
 5. Prompted segmentation service path: implemented
-   Result: `segmentation_service` now performs `prompt -> Gemini bbox -> local Ultralytics SAM2 mask -> organized point-cloud masking`, publishes segmented/background clouds for GraspGen, and returns centroid/status to a ROS2 service caller.
-6. Full live object pipeline: partially implemented
-   Missing pieces: motion execution after grasp selection, Gazebo grasp-success check, and replacing the remaining planner stubs (`curobo.py`, `moveit2.py`).
+   Result: `segmentation_service` now performs `prompt -> Gemini bbox -> local Ultralytics SAM2 mask -> world-frame point-cloud masking`, publishes segmented/background clouds for GraspGen, and returns centroid/status to a ROS2 service caller.
+6. GraspGen service path: implemented
+   Result: `graspgen_service` now consumes segmented/background clouds, runs GraspGen inference, and returns ranked grasp candidates plus debug artifacts.
+7. Full live object pipeline: partially implemented
+   Missing pieces: better best-grasp filtering, actual arm/gripper execution, Gazebo grasp-success check, and replacing the remaining planner stubs (`curobo.py`, `moveit2.py`).
 
 The old NVIDIA driver mismatch was resolved by reboot. `nvidia-smi` is now healthy on driver `535.309.01`.
 
@@ -84,6 +86,7 @@ Important current reality:
 - the ROS2 side now has both:
   - `graspgen_probe` for raw point-cloud probing
   - `segmentation_service` for prompted segmentation and masked cloud publication
+- `graspgen_service` for ranked grasp inference on segmented object clouds
 - `orchestrator.py` now acts as a ROS2 service caller for segmentation and GraspGen
 - the older in-repo `SAM2` and `GraspGen` wrapper modules are still stubs and are no longer the primary integration path
 - `segmented_objects/` contains offline sample point clouds, not outputs of a live segmentation pipeline inside this repo
@@ -238,7 +241,7 @@ GRASPGEN_PORT=5557 /start_graspgen_server.sh
 GRIPPER_CONFIG=/opt/GraspGenModels/checkpoints/graspgen_franka_panda.yml /start_graspgen_server.sh
 ```
 
-At the moment this only proves that the planner image can host GraspGen. The planner code itself is not yet calling the embedded model path.
+This embedded path is now used by the planner-side segmentation and grasp service flow.
 
 ## Single Launcher
 
@@ -325,7 +328,7 @@ Current implementation status:
 - `moveit2.py`: stub
 - `graspgen_probe.py`: implemented
 
-This means `ros2-ai-planner` now has a runtime prompted-segmentation path, but the final motion-planning and execution path is still incomplete.
+This means `ros2-ai-planner` now has a runtime segmentation-to-GraspGen path, but best-grasp filtering and physical execution are still incomplete.
 
 ### Topics subscribed
 
@@ -385,16 +388,11 @@ Fill in the relevant file under `requirements/` and add a `pip3 install` step to
 
 ## Immediate Next Step
 
-The next milestone is:
+The next milestone is grasp selection and execution:
 
-1. choose the first runtime integration path inside planner code:
-   - keep using the internal ZMQ server/client boundary inside one container, or
-   - call GraspGen Python APIs directly
-2. connect one segmented object sample to the embedded planner-side GraspGen path
-3. implement and test the first real challenge-side vertical slice:
-   - 2D segmentation
-   - mask-to-point-cloud conversion
-   - GraspGen inference
-   - grasp success check in Gazebo
+1. improve best-grasp filtering for vertical pickup in a world-frame interpretation
+2. reject obvious bad grasps using scene-specific geometric filters such as basket height
+3. connect the top-ranked grasp to actual arm and gripper execution
+4. verify grasp success in Gazebo
 
-The final competition target still remains a single Docker image even though current debugging uses a split-container setup.
+The final competition target remains a single Docker image that can segment, choose a grasp, and execute the pickup without relying on split-container debugging paths.

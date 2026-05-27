@@ -16,6 +16,7 @@ def generate_launch_description() -> LaunchDescription:
     depth_topic = LaunchConfiguration("depth_topic")
     segmented_point_cloud_topic = LaunchConfiguration("segmented_point_cloud_topic")
     background_point_cloud_topic = LaunchConfiguration("background_point_cloud_topic")
+    segmentation_output_frame = LaunchConfiguration("segmentation_output_frame")
     overlay_topic = LaunchConfiguration("overlay_topic")
     mask_topic = LaunchConfiguration("mask_topic")
     auto_run_on_task_command = LaunchConfiguration("auto_run_on_task_command")
@@ -43,6 +44,7 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument(
                 "background_point_cloud_topic", default_value="/graspgen/background"
             ),
+            DeclareLaunchArgument("segmentation_output_frame", default_value="world"),
             DeclareLaunchArgument("overlay_topic", default_value="/segmentation/overlay"),
             DeclareLaunchArgument("mask_topic", default_value="/segmentation/mask"),
             DeclareLaunchArgument("auto_run_on_task_command", default_value="true"),
@@ -78,6 +80,7 @@ def generate_launch_description() -> LaunchDescription:
                         "depth_topic": depth_topic,
                         "segmented_point_cloud_topic": segmented_point_cloud_topic,
                         "background_point_cloud_topic": background_point_cloud_topic,
+                        "output_frame": segmentation_output_frame,
                         "overlay_topic": overlay_topic,
                         "mask_topic": mask_topic,
                         "debug_dir": segmentation_debug_dir,
