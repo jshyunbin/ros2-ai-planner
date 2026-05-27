@@ -10,6 +10,8 @@ SSH users — forward the port first:
   ssh -L 8080:localhost:8080 user@host
 """
 import time
+import tempfile
+from pathlib import Path
 import numpy as np
 import torch
 import viser
@@ -98,20 +100,38 @@ def plan(planner):
     )
     goal = GoalToolPose(
         tool_frames=planner.tool_frames,
-        position=torch.tensor(
-            [[[[[0.3, 0.0, 0.4]]]]], device='cuda', dtype=torch.float32),
-        quaternion=torch.tensor(
-            [[[[[1.0, 0.0, 0.0, 0.0]]]]], device='cuda', dtype=torch.float32),
+        position=torch.tensor([[[[[0.3, 0.0, 0.4]]]]], device='cuda', dtype=torch.float32),
+        quaternion=torch.tensor([[[[[1.0, 0.0, 0.0, 0.0]]]]], device='cuda', dtype=torch.float32),
     )
 
     result = planner.plan_pose(goal, start)
     if result is None or not result.success.any():
         print('  Planning failed — visualizing home pose only.')
-        return [HOME_CFG]
+        return np.array([HOME_CFG])
 
-    traj = result.get_interpolated_plan().position[0].cpu().numpy().tolist()
+    pos = result.get_interpolated_plan().position
+    # position may be (B, H, L, G, J) or (B, T, J); reduce to (T, J)
+    pos = pos[0]
+    while pos.dim() > 2:
+        pos = pos[0]
+    traj = pos.cpu().numpy()  # keep as numpy so values are np scalars with .item()
     print(f'  Planned {len(traj)}-waypoint trajectory.')
     return traj
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def resolve_urdf(urdf_path: str) -> Path:
+    """Return a path to a URDF with package:// URIs replaced by absolute paths."""
+    pkg_root = '/opt/ros/humble/share'
+    with open(urdf_path) as f:
+        content = f.read()
+    content = content.replace('package://ur_description',
+                              f'{pkg_root}/ur_description')
+    tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.urdf', delete=False)
+    tmp.write(content)
+    tmp.flush()
+    return Path(tmp.name)
 
 
 # ── stage 4: viser visualization ─────────────────────────────────────────────
@@ -122,7 +142,7 @@ def visualize(traj):
 
     try:
         from viser.extras import ViserUrdf
-        robot = ViserUrdf(server, urdf_or_path=URDF_PATH, root_node_name='/ur5')
+        robot = ViserUrdf(server, urdf_or_path=resolve_urdf(URDF_PATH), root_node_name='/ur5')
         has_robot = True
         print('  Robot model loaded.')
     except Exception as e:

@@ -36,6 +36,9 @@ RUN pip3 install --no-cache-dir \
     torch torchvision torchaudio \
     --index-url https://download.pytorch.org/whl/cu128
 
+# ros-humble-cv-bridge is compiled against NumPy 1.x; pin before anything pulls 2.x
+RUN pip3 install --no-cache-dir "numpy<2"
+
 # UR5 URDF (for cuRoboV2 robot config)
 RUN apt-get update && apt-get install -y \
     ros-humble-ur-description \

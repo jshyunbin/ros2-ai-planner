@@ -1,6 +1,7 @@
 import rclpy
 from rclpy.action import ActionClient
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 from std_msgs.msg import String
 from sensor_msgs.msg import Image, JointState
 from control_msgs.action import FollowJointTrajectory
@@ -43,12 +44,19 @@ class PipelineOrchestrator(Node):
     def __init__(self):
         super().__init__('pipeline_orchestrator')
 
+        # Gazebo camera plugins publish BEST_EFFORT/VOLATILE.
+        sensor_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            durability=QoSDurabilityPolicy.VOLATILE,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=10,
+        )
         self.task_sub = self.create_subscription(
             String, self.TASK_COMMANDS_TOPIC, self.task_command_callback, 10)
         self.overhead_rgb_sub = self.create_subscription(
-            Image, self.OVERHEAD_RGB_TOPIC, self._cache_overhead_rgb, 10)
+            Image, self.OVERHEAD_RGB_TOPIC, self._cache_overhead_rgb, sensor_qos)
         self.wrist_rgb_sub = self.create_subscription(
-            Image, self.WRIST_RGB_TOPIC, self._cache_wrist_rgb, 10)
+            Image, self.WRIST_RGB_TOPIC, self._cache_wrist_rgb, sensor_qos)
         self.joint_sub = self.create_subscription(
             JointState, self.JOINT_STATES_TOPIC, self._cache_joints, 10)
 

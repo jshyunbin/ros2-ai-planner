@@ -115,14 +115,27 @@ class CuRobo:
             bilateral_kernel_size=3,
         )
 
+        try:
+            from rclpy.qos import (QoSProfile, QoSReliabilityPolicy,
+                                   QoSHistoryPolicy, QoSDurabilityPolicy)
+            # Gazebo camera plugins publish BEST_EFFORT/VOLATILE.
+            sensor_qos = QoSProfile(
+                reliability=QoSReliabilityPolicy.BEST_EFFORT,
+                durability=QoSDurabilityPolicy.VOLATILE,
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=1,
+            )
+        except ImportError:
+            sensor_qos = 10
+
         node.create_subscription(Image, OVERHEAD_DEPTH_TOPIC,
-                                  lambda msg: self._on_depth(msg, 'overhead', OVERHEAD_FRAME), 10)
+                                  lambda msg: self._on_depth(msg, 'overhead', OVERHEAD_FRAME), sensor_qos)
         node.create_subscription(CameraInfo, OVERHEAD_INFO_TOPIC,
-                                  lambda msg: self._on_info(msg, 'overhead'), 1)
+                                  lambda msg: self._on_info(msg, 'overhead'), sensor_qos)
         node.create_subscription(Image, WRIST_DEPTH_TOPIC,
-                                  lambda msg: self._on_depth(msg, 'wrist', WRIST_FRAME), 10)
+                                  lambda msg: self._on_depth(msg, 'wrist', WRIST_FRAME), sensor_qos)
         node.create_subscription(CameraInfo, WRIST_INFO_TOPIC,
-                                  lambda msg: self._on_info(msg, 'wrist'), 1)
+                                  lambda msg: self._on_info(msg, 'wrist'), sensor_qos)
 
         self._planner = self._build_planner()
         self._logger.info('CuRobo: ready.')
@@ -218,10 +231,8 @@ class CuRobo:
         o = grasp_pose.orientation
         goal = GoalToolPose(
             tool_frames=self._planner.tool_frames,
-            position=torch.tensor(
-                [[[[[p.x, p.y, p.z]]]]], device='cuda', dtype=torch.float32),
-            quaternion=torch.tensor(
-                [[[[[o.w, o.x, o.y, o.z]]]]], device='cuda', dtype=torch.float32),
+            position=torch.tensor([[[[[p.x, p.y, p.z]]]]], device='cuda', dtype=torch.float32),
+            quaternion=torch.tensor([[[[[o.w, o.x, o.y, o.z]]]]], device='cuda', dtype=torch.float32),
         )
 
         result = self._planner.plan_pose(goal, start)

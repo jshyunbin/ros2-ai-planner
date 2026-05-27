@@ -99,6 +99,20 @@ docker compose run --rm -p 8080:8080 ai_planner \
 
 Open `http://localhost:8080`. The script runs synthetic depth frames through the full Mapper → MotionPlanner pipeline and animates the planned trajectory on the UR5 model.
 
+### Live perception visualization (requires Gazebo running on host)
+
+```bash
+# Forward the port if on SSH
+ssh -L 8080:localhost:8080 user@host
+
+# Run the live visualizer (optionally mark a target position)
+docker compose run --rm -p 8080:8080 ai_planner \
+  python3 /ros2_ws/src/pipeline_orchestrator/scripts/live_perception_viz.py \
+  --target 0.5 0.0 0.3
+```
+
+Open `http://localhost:8080`. The script subscribes to both D435 depth cameras and `/joint_states`, back-projects each depth frame into world-frame point clouds (cyan = overhead camera, orange = wrist camera), and animates the UR5 model from the live joint state stream. The `--target` flag places a red sphere at the specified world-frame XYZ position.
+
 ### Unit tests
 
 ```bash
