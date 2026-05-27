@@ -80,7 +80,7 @@ def build_planner(voxel_grid):
     print('  Loading MotionPlanner (warmup ~30 s)...')
     planner = MotionPlanner(MotionPlannerCfg.create(
         robot=UR5_CONFIG,
-        scene_model='scene/collision_test.yml',
+        scene_model='collision_test.yml',
     ))
     planner.warmup(enable_graph=True, num_warmup_iterations=3)
     print('  MotionPlanner ready.')
