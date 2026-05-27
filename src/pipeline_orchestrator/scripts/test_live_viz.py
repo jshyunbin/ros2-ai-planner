@@ -24,6 +24,7 @@ from sensor_msgs.msg import JointState
 from tf2_ros import Buffer, TransformListener
 import rclpy.duration
 from rclpy.time import Time
+from rclpy.qos import qos_profile_sensor_data
 from cv_bridge import CvBridge
 import viser
 
@@ -113,18 +114,22 @@ class LiveVizNode(Node):
         )
         self._plan_thread: Optional[threading.Thread] = None
 
+        # Gazebo realsense plugin publishes camera streams with BEST_EFFORT
+        # reliability; subscribers must match or no data arrives.
         self.create_subscription(
             CameraInfo, OVERHEAD_INFO_TOPIC,
-            lambda m: self._on_info(m, 'overhead'), 1)
+            lambda m: self._on_info(m, 'overhead'), qos_profile_sensor_data)
         self.create_subscription(
             Image, OVERHEAD_DEPTH_TOPIC,
-            lambda m: self._on_depth(m, 'overhead', OVERHEAD_FRAME), 10)
+            lambda m: self._on_depth(m, 'overhead', OVERHEAD_FRAME),
+            qos_profile_sensor_data)
         self.create_subscription(
             CameraInfo, WRIST_INFO_TOPIC,
-            lambda m: self._on_info(m, 'wrist'), 1)
+            lambda m: self._on_info(m, 'wrist'), qos_profile_sensor_data)
         self.create_subscription(
             Image, WRIST_DEPTH_TOPIC,
-            lambda m: self._on_depth(m, 'wrist', WRIST_FRAME), 10)
+            lambda m: self._on_depth(m, 'wrist', WRIST_FRAME),
+            qos_profile_sensor_data)
         self.create_subscription(
             JointState, '/joint_states', self._on_joints, 10)
 
