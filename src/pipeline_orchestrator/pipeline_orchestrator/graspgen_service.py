@@ -36,8 +36,8 @@ class GraspGenService(Node):
         self.declare_parameter("min_grasps", 20)
         self.declare_parameter("max_tries", 4)
         self.declare_parameter("remove_outliers", False)
-        self.declare_parameter("rank_mode", "horizontal_grasp")
-        self.declare_parameter("target_approach_dir", [0.0, 0.0, 1.0])
+        self.declare_parameter("rank_mode", "approach_alignment")
+        self.declare_parameter("target_approach_dir", [0.0, 0.0, -1.0])
         self.declare_parameter("max_returned_grasps", 5)
         self.declare_parameter("enable_collision_check", False)
         self.declare_parameter("collision_threshold", 0.002)
@@ -170,8 +170,8 @@ class GraspGenService(Node):
             segmented_cloud=segmented_cloud,
             background_cloud=self._latest_background_cloud,
             response_payload=payload,
-            grasps=np.asarray(grasps, dtype=np.float32),
-            confidences=np.asarray(confidences, dtype=np.float32),
+            grasps=self._rows_to_grasps(top_rows),
+            confidences=self._rows_to_confidences(top_rows),
         )
         self.get_logger().info(
             f"Returned {len(top_rows)} filtered grasps from {len(grasps)} raw grasps "
@@ -295,6 +295,25 @@ class GraspGenService(Node):
         row["finger_flatness"] = round(finger_flatness, 4)
         row["horizontal_score"] = round(approach_flatness * finger_flatness, 4)
         return row
+
+    @staticmethod
+    def _rows_to_grasps(rows: list[dict]) -> np.ndarray:
+        if not rows:
+            return np.empty((0, 4, 4), dtype=np.float32)
+
+        grasps = []
+        for row in rows:
+            grasp = np.eye(4, dtype=np.float32)
+            grasp[:3, :3] = np.asarray(row["rotation_matrix"], dtype=np.float32)
+            grasp[:3, 3] = np.asarray(row["translation"], dtype=np.float32)
+            grasps.append(grasp)
+        return np.asarray(grasps, dtype=np.float32)
+
+    @staticmethod
+    def _rows_to_confidences(rows: list[dict]) -> np.ndarray:
+        if not rows:
+            return np.empty((0,), dtype=np.float32)
+        return np.asarray([row["confidence"] for row in rows], dtype=np.float32)
 
     def _save_debug_artifacts(
         self,

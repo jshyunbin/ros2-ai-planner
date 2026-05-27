@@ -21,6 +21,8 @@ def generate_launch_description() -> LaunchDescription:
     mask_topic = LaunchConfiguration("mask_topic")
     auto_run_on_task_command = LaunchConfiguration("auto_run_on_task_command")
     graspgen_remove_outliers = LaunchConfiguration("graspgen_remove_outliers")
+    graspgen_rank_mode = LaunchConfiguration("graspgen_rank_mode")
+    graspgen_target_approach_dir = LaunchConfiguration("graspgen_target_approach_dir")
     segmentation_debug_dir = LaunchConfiguration("segmentation_debug_dir")
     graspgen_debug_dir = LaunchConfiguration("graspgen_debug_dir")
 
@@ -49,6 +51,8 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("mask_topic", default_value="/segmentation/mask"),
             DeclareLaunchArgument("auto_run_on_task_command", default_value="true"),
             DeclareLaunchArgument("graspgen_remove_outliers", default_value="false"),
+            DeclareLaunchArgument("graspgen_rank_mode", default_value="approach_alignment"),
+            DeclareLaunchArgument("graspgen_target_approach_dir", default_value="[0.0, 0.0, -1.0]"),
             DeclareLaunchArgument(
                 "segmentation_debug_dir",
                 default_value="/artifacts/segmentation_service",
@@ -101,6 +105,8 @@ def generate_launch_description() -> LaunchDescription:
                         "server_host": graspgen_host,
                         "server_port": graspgen_port,
                         "remove_outliers": graspgen_remove_outliers,
+                        "rank_mode": graspgen_rank_mode,
+                        "target_approach_dir": graspgen_target_approach_dir,
                         "debug_dir": graspgen_debug_dir,
                     }
                 ],

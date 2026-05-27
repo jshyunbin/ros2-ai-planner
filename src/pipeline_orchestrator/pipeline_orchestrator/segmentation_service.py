@@ -261,6 +261,7 @@ class SegmentationService(Node):
             )
             prompt_bbox = self._scale_bbox(prompt_bbox_api, scale_x, scale_y, rgb_bgr.shape[1], rgb_bgr.shape[0])
             mask = self._segment_with_sam2(rgb_bgr, prompt_bbox)
+            mask = self._clip_mask_to_bbox(mask, prompt_bbox)
             if not mask.any():
                 raise RuntimeError("SAM2 returned an empty mask.")
 
@@ -495,6 +496,15 @@ class SegmentationService(Node):
                 f"SAM2 mask shape {mask.shape} does not match image shape {image_bgr.shape[:2]}"
             )
         return mask.astype(bool)
+
+    @staticmethod
+    def _clip_mask_to_bbox(
+        mask: np.ndarray, bbox: tuple[int, int, int, int]
+    ) -> np.ndarray:
+        x_min, y_min, x_max, y_max = bbox
+        clipped = np.zeros_like(mask, dtype=bool)
+        clipped[y_min : y_max + 1, x_min : x_max + 1] = mask[y_min : y_max + 1, x_min : x_max + 1]
+        return clipped
 
     def _transform_points_to_output_frame(
         self,
