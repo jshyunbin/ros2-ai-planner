@@ -191,8 +191,19 @@ class LiveVizNode(Node):
             np.array([r.w, r.x, r.y, r.z], dtype=np.float32),
         )
 
-        # Unproject depth to XYZ (camera frame) for viser display
-        xyz = depth_to_xyz(depth, K)
+        # Unproject depth to XYZ in camera frame, then transform to world
+        # frame for viser display. (Mapper does its own transform internally
+        # using the pose we pass, so its ESDF is independent of this.)
+        xyz_cam = depth_to_xyz(depth, K)
+        qw, qx, qy, qz = float(r.w), float(r.x), float(r.y), float(r.z)
+        R = torch.tensor([
+            [1 - 2*(qy*qy + qz*qz), 2*(qx*qy - qw*qz),     2*(qx*qz + qw*qy)],
+            [2*(qx*qy + qw*qz),     1 - 2*(qx*qx + qz*qz), 2*(qy*qz - qw*qx)],
+            [2*(qx*qz - qw*qy),     2*(qy*qz + qw*qx),     1 - 2*(qx*qx + qy*qy)],
+        ], dtype=torch.float32, device=xyz_cam.device)
+        t_vec = torch.tensor(
+            [t.x, t.y, t.z], dtype=torch.float32, device=xyz_cam.device)
+        xyz = xyz_cam @ R.T + t_vec
 
         # Cache per-camera data
         self._cam_depth[cam_id]      = depth
@@ -381,9 +392,20 @@ def update_loop(
 def build_planner() -> MotionPlanner:
     """Construct and warm up the cuRobo MotionPlanner (~30 s on first run)."""
     print('  Loading MotionPlanner (warmup ~30 s)…')
+    # Pre-allocate a voxel cache so update_world() can accept the ESDF
+    # produced by Mapper.compute_esdf(). Dims/voxel_size must match the
+    # MapperCfg used in LiveVizNode (extent 2x2x1.5 m, esdf_voxel_size 0.05).
+    collision_cache = {
+        'voxel': {
+            'layers': 1,
+            'dims': [2.0, 2.0, 1.5],
+            'voxel_size': 0.05,
+        }
+    }
     planner = MotionPlanner(MotionPlannerCfg.create(
         robot=UR5_CONFIG,
         scene_model='collision_test.yml',
+        collision_cache=collision_cache,
     ))
     planner.warmup(enable_graph=True, num_warmup_iterations=3)
     print('  MotionPlanner ready.')
