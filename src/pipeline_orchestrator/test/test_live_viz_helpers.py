@@ -110,3 +110,36 @@ def test_esdf_to_points_malformed_object():
     pts = esdf_to_points(vg)
 
     assert pts.shape == (0, 3)
+
+
+def test_live_viz_script_constants(monkeypatch):
+    """test_live_viz.py must be importable and expose required constants."""
+    from pathlib import Path
+    import importlib.util
+    import sys
+    import unittest.mock as mock
+
+    # Stub every heavy dep so we don't need a live ROS2/CUDA context
+    stubs = [
+        'rclpy', 'rclpy.node', 'rclpy.duration', 'rclpy.time',
+        'sensor_msgs', 'sensor_msgs.msg',
+        'tf2_ros', 'cv_bridge', 'viser', 'viser.extras', 'warp',
+        'curobo', 'curobo.perception', 'curobo.motion_planner',
+        'curobo.types', 'curobo._src', 'curobo._src.geom',
+        'curobo._src.geom.types',
+    ]
+    for name in stubs:
+        if name not in sys.modules:
+            monkeypatch.setitem(sys.modules, name, mock.MagicMock())
+
+    script_path = Path(__file__).parent.parent / 'scripts' / 'test_live_viz.py'
+    spec = importlib.util.spec_from_file_location('test_live_viz', script_path)
+    mod  = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    assert mod.MIN_FRAMES   == 5
+    assert mod.REPLAN_EVERY == 10
+    assert mod.VIZ_HZ       == 10
+    assert mod.GOAL_XYZ     == (0.3, 0.0, 0.4)
+    assert mod.GOAL_QUAT    == (1.0, 0.0, 0.0, 0.0)
+    assert mod.WORLD_FRAME  == 'world'
