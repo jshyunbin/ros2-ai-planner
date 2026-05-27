@@ -113,6 +113,7 @@ class LiveVizNode(Node):
             flying_pixel_threshold=0.5,
             bilateral_kernel_size=3,
         )
+        self._plan_thread: Optional[threading.Thread] = None
 
         self.create_subscription(
             CameraInfo, OVERHEAD_INFO_TOPIC,
@@ -151,12 +152,10 @@ class LiveVizNode(Node):
 
         K = self._cam_intrinsics[cam_id]
 
-        # TF lookup: world ← camera_optical_frame at message timestamp
+        # TF lookup: world ← camera_optical_frame (latest available transform)
         try:
-            tf_time   = Time(seconds=msg.header.stamp.sec,
-                             nanoseconds=msg.header.stamp.nanosec)
             transform = self._tf_buffer.lookup_transform(
-                WORLD_FRAME, frame, tf_time,
+                WORLD_FRAME, frame, rclpy.time.Time(),
                 timeout=rclpy.duration.Duration(seconds=0.1))
         except Exception as exc:
             self.get_logger().warning(
@@ -164,9 +163,12 @@ class LiveVizNode(Node):
                 throttle_duration_sec=2.0)
             return
 
-        # Decode depth: uint16 mm → float32 m
+        # Decode depth — handle both uint16 (mm) and float32 (m) encodings
         cv_img = self._bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
-        depth  = torch.from_numpy(cv_img.astype(np.float32) / 1000.0).cuda()
+        if msg.encoding in ('32FC1', '32FC3'):
+            depth = torch.from_numpy(cv_img.astype(np.float32)).cuda()
+        else:   # default: 16UC1 (uint16, millimetres)
+            depth = torch.from_numpy(cv_img.astype(np.float32) / 1000.0).cuda()
         depth  = torch.nan_to_num(depth, nan=0.0)
         filtered, _ = self._depth_filter(depth.unsqueeze(0))
         depth  = filtered[0]
@@ -226,7 +228,9 @@ class LiveVizNode(Node):
     # ── planning ──────────────────────────────────────────────────────────────
 
     def _replan(self) -> None:
-        """Compute a fresh ESDF and plan a new trajectory to GOAL_XYZ."""
+        """Compute a fresh ESDF synchronously, then plan in a background thread."""
+        # ESDF update is fast — run on the callback thread so the mapper
+        # doesn't race with integrate() from the same thread.
         voxel_grid = self._mapper.compute_esdf()
         self._planner.update_world(SceneCfg(voxel=[voxel_grid]))
 
@@ -234,7 +238,16 @@ class LiveVizNode(Node):
             self._state.voxel_grid = voxel_grid
             js = self._state.latest_joints
 
-        # Start configuration: live joints or home pose fallback
+        # Slow GPU planning runs in a daemon thread so this callback returns fast.
+        if self._plan_thread is not None and self._plan_thread.is_alive():
+            return   # previous plan still running — skip this trigger
+
+        self._plan_thread = threading.Thread(
+            target=self._run_plan, args=(js,), daemon=True)
+        self._plan_thread.start()
+
+    def _run_plan(self, js) -> None:
+        """Background thread: plan trajectory and store result in SharedState."""
         if js is not None:
             start = CuRoboJointState.from_position(
                 torch.tensor(
