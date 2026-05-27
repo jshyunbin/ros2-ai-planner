@@ -393,12 +393,14 @@ def build_planner() -> MotionPlanner:
     """Construct and warm up the cuRobo MotionPlanner (~30 s on first run)."""
     print('  Loading MotionPlanner (warmup ~30 s)…')
     # Pre-allocate a voxel cache so update_world() can accept the ESDF
-    # produced by Mapper.compute_esdf(). Dims/voxel_size must match the
-    # MapperCfg used in LiveVizNode (extent 2x2x1.5 m, esdf_voxel_size 0.05).
+    # produced by Mapper.compute_esdf(). Observed empirically: cuRobo
+    # allocates a 128**3 = 2,097,152-voxel tensor for the ESDF regardless
+    # of MapperCfg.extent_meters_xyz, so the cache buffer must be at least
+    # that many slots. Size to 140**3 = 2,744,000 for headroom.
     collision_cache = {
         'voxel': {
             'layers': 1,
-            'dims': [2.0, 2.0, 1.5],
+            'dims': [7.0, 7.0, 7.0],
             'voxel_size': 0.05,
         }
     }
