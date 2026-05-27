@@ -50,8 +50,8 @@ def depth_to_xyz(depth_m: torch.Tensor, K: torch.Tensor) -> torch.Tensor:
 def esdf_to_points(voxel_grid: object) -> np.ndarray:
     """Extract occupied voxel centres from a cuRobo ESDF VoxelGrid.
 
-    A voxel is "occupied" when its ESDF value is ≤ 0 (inside or on the
-    surface of an obstacle).
+    A voxel is "occupied" when its ESDF value is < 0 (strictly inside
+    an obstacle; the zero surface is treated as free to avoid noise).
 
     Args:
         voxel_grid: cuRobo VoxelGrid, or any duck-typed object with
@@ -64,7 +64,7 @@ def esdf_to_points(voxel_grid: object) -> np.ndarray:
     """
     try:
         esdf: torch.Tensor = voxel_grid.esdf_tensor   # (X, Y, Z)
-        occupied = esdf <= 0.0
+        occupied = esdf < 0.0
         if not occupied.any():
             return np.zeros((0, 3), dtype=np.float32)
 

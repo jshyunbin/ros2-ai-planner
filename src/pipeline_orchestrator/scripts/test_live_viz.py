@@ -10,8 +10,6 @@ Then open http://localhost:8080 in your browser.
 SSH users — forward the port first:
   ssh -L 8080:localhost:8080 user@host
 """
-from __future__ import annotations
-
 import threading
 import time
 from dataclasses import dataclass, field
@@ -282,3 +280,146 @@ class LiveVizNode(Node):
 
         with self._state.lock:
             self._state.traj = traj
+
+
+# ── viser update loop ─────────────────────────────────────────────────────────
+
+def update_loop(
+    server: viser.ViserServer,
+    state: SharedState,
+    robot,   # ViserUrdf instance or None
+) -> None:
+    """Main-thread loop: refresh the viser scene at VIZ_HZ from shared state.
+
+    Reads lock-protected SharedState and updates:
+      - /depth/overhead, /depth/wrist   — live point clouds
+      - /esdf/voxels                    — occupied ESDF voxels
+      - /ur5 robot joints               — animated trajectory
+      - /status label                   — frame count and status text
+
+    Loops forever; raise KeyboardInterrupt to exit.
+    """
+    home_array = np.array([HOME_CFG])
+    traj_idx   = 0
+    period     = 1.0 / VIZ_HZ
+
+    while True:
+        t0 = time.time()
+
+        with state.lock:
+            clouds   = dict(state.point_clouds)   # shallow copy of dict
+            vg       = state.voxel_grid
+            traj     = state.traj if state.traj is not None else home_array
+            n_frames = state.frame_count
+
+        # ── status label ──────────────────────────────────────────────────────
+        if n_frames < MIN_FRAMES:
+            status_text = f'Waiting for depth frames ({n_frames}/{MIN_FRAMES})…'
+        else:
+            status_text = f'Frames: {n_frames}  |  Traj waypoints: {len(traj)}'
+        server.scene.add_label('/status', status_text, position=(0.0, 0.0, 1.6))
+
+        # ── point clouds ──────────────────────────────────────────────────────
+        for cam_id, xyz in clouds.items():
+            if xyz is None or len(xyz) == 0:
+                continue
+            pts   = xyz.cpu().numpy()
+            color = (200, 200, 200) if cam_id == 'overhead' else (100, 150, 255)
+            server.scene.add_point_cloud(
+                f'/depth/{cam_id}',
+                points=pts,
+                colors=np.tile(color, (len(pts), 1)).astype(np.uint8),
+                point_size=0.005,
+            )
+
+        # ── ESDF voxels ───────────────────────────────────────────────────────
+        if vg is not None:
+            occ_pts = esdf_to_points(vg)
+            if len(occ_pts) > 0:
+                server.scene.add_point_cloud(
+                    '/esdf/voxels',
+                    points=occ_pts,
+                    colors=np.tile((220, 60, 60), (len(occ_pts), 1)).astype(np.uint8),
+                    point_size=0.02,
+                )
+
+        # ── robot animation ───────────────────────────────────────────────────
+        if len(traj) > 0:
+            waypoint = traj[traj_idx % len(traj)]
+            if robot is not None:
+                robot.update_cfg(dict(zip(JOINT_NAMES, waypoint.tolist())))
+            traj_idx += 1
+            if traj_idx >= len(traj):
+                traj_idx = 0
+                time.sleep(1.0)   # brief pause before replaying
+
+        elapsed = time.time() - t0
+        time.sleep(max(0.0, period - elapsed))
+
+
+# ── motion planner setup ──────────────────────────────────────────────────────
+
+def build_planner() -> MotionPlanner:
+    """Construct and warm up the cuRobo MotionPlanner (~30 s on first run)."""
+    print('  Loading MotionPlanner (warmup ~30 s)…')
+    planner = MotionPlanner(MotionPlannerCfg.create(
+        robot=UR5_CONFIG,
+        scene_model='collision_test.yml',
+    ))
+    planner.warmup(enable_graph=True, num_warmup_iterations=3)
+    print('  MotionPlanner ready.')
+    return planner
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    print('=== Live Pipeline Visualization Test ===\n')
+
+    print('[1/4] Initializing CUDA / Warp…')
+    import warp as wp
+    wp.init()
+    print('  Warp OK.\n')
+
+    print('[2/4] Setting up motion planner…')
+    planner = build_planner()
+
+    print('[3/4] Starting ROS2 node…')
+    rclpy.init()
+    state = SharedState()
+    node  = LiveVizNode(state, planner)
+    spin_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
+    spin_thread.start()
+    print('  ROS2 node spinning in background.\n')
+
+    print('[4/4] Starting viser…')
+    server = viser.ViserServer(port=8080, verbose=False)
+    print('  Viser running — open http://localhost:8080\n')
+
+    server.scene.add_frame('/world', axes_length=0.3, axes_radius=0.01)
+    server.scene.add_icosphere(
+        '/target', radius=0.03, color=(255, 80, 80), position=GOAL_XYZ)
+
+    try:
+        from viser.extras import ViserUrdf
+        robot = ViserUrdf(
+            server,
+            urdf_or_path=resolve_urdf(URDF_PATH),
+            root_node_name='/ur5',
+        )
+        print('  Robot model loaded.')
+    except Exception as exc:
+        print(f'  Robot model unavailable ({exc}), skipping URDF.')
+        robot = None
+
+    print('Entering update loop. Ctrl+C to stop.')
+    try:
+        update_loop(server, state, robot)
+    except KeyboardInterrupt:
+        print('\nStopped.')
+    finally:
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
