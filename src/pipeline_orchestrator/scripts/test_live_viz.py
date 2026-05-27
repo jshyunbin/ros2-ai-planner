@@ -55,9 +55,9 @@ REPLAN_EVERY = 10
 VIZ_HZ       = 10
 
 OVERHEAD_DEPTH_TOPIC = '/camera/camera/depth/color/image_raw'
-OVERHEAD_INFO_TOPIC  = '/camera/camera/depth/camera_info'
+OVERHEAD_INFO_TOPIC  = '/camera/camera/depth/color/camera_info'
 WRIST_DEPTH_TOPIC    = '/wrist_camera/wrist_camera/depth/color/image_raw'
-WRIST_INFO_TOPIC     = '/wrist_camera/wrist_camera/depth/camera_info'
+WRIST_INFO_TOPIC     = '/wrist_camera/wrist_camera/depth/color/camera_info'
 OVERHEAD_FRAME       = 'camera_color_optical_frame'
 WRIST_FRAME          = 'wrist_camera_color_optical_frame'
 WORLD_FRAME          = 'world'
@@ -154,6 +154,9 @@ class LiveVizNode(Node):
         self._cam_intrinsics[cam_id] = K
 
     def _on_depth(self, msg: Image, cam_id: str, frame: str) -> None:
+        self.get_logger().info(
+            f'[depth] {cam_id} arrived (intrinsics={cam_id in self._cam_intrinsics})',
+            throttle_duration_sec=2.0)
         if cam_id not in self._cam_intrinsics:
             return   # wait for CameraInfo first
 
@@ -224,7 +227,13 @@ class LiveVizNode(Node):
                 ]),
             ),
         )
-        self._mapper.integrate(batched)
+        try:
+            self._mapper.integrate(batched)
+        except Exception as exc:
+            self.get_logger().error(
+                f'Mapper.integrate failed: {type(exc).__name__}: {exc}',
+                throttle_duration_sec=2.0)
+            return
 
         with self._state.lock:
             self._state.frame_count += 1
