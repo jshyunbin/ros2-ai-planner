@@ -30,14 +30,14 @@ def resize_for_api(image_bgr: np.ndarray, max_dimension: int) -> tuple[np.ndarra
     return resized, scale_x, scale_y
 
 
-def encode_image_to_data_uri(image_bgr: np.ndarray, max_bytes: int = 2_000_000) -> str:
+def encode_image_to_base64(image_bgr: np.ndarray, max_bytes: int = 2_000_000) -> str:
     for quality in (95, 90, 85, 80, 75, 70, 65, 60):
         ok, encoded = cv2.imencode(".jpg", image_bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
         if not ok:
             continue
         if encoded.nbytes <= max_bytes:
             payload = base64.b64encode(encoded.tobytes()).decode("ascii")
-            return f"data:image/jpeg;base64,{payload}"
+            return payload
     raise ValueError("Unable to encode image under SAM3 size limit.")
 
 
@@ -97,6 +97,44 @@ def select_masked_points(
     object_points = xyz_image[np.logical_and(mask, valid)]
     background_points = xyz_image[np.logical_and(~mask, valid)]
     return object_points.astype(np.float32), background_points.astype(np.float32)
+
+
+def depth_to_masked_points(
+    depth_image: np.ndarray,
+    mask: np.ndarray,
+    *,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+    min_depth_m: float,
+    max_depth_m: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    depth = np.asarray(depth_image, dtype=np.float32)
+    if depth.ndim != 2:
+        raise ValueError(f"depth_image must be HxW, got shape {depth.shape}")
+
+    if depth.shape != mask.shape:
+        raise ValueError(
+            f"mask shape {mask.shape} does not match depth image shape {depth.shape}"
+        )
+
+    if fx <= 0.0 or fy <= 0.0:
+        raise ValueError("Camera intrinsics fx and fy must be positive.")
+
+    ys, xs = np.indices(depth.shape, dtype=np.float32)
+    valid = np.isfinite(depth)
+    valid &= depth >= min_depth_m
+    valid &= depth <= max_depth_m
+
+    z = depth[valid]
+    x = (xs[valid] - float(cx)) * z / float(fx)
+    y = (ys[valid] - float(cy)) * z / float(fy)
+    xyz = np.stack([x, y, z], axis=1).astype(np.float32)
+
+    object_points = xyz[mask[valid]]
+    background_points = xyz[~mask[valid]]
+    return object_points, background_points
 
 
 def stable_downsample(points: np.ndarray, max_points: int) -> np.ndarray:
@@ -159,9 +197,12 @@ def parse_sam3_polygons(payload: dict) -> list[np.ndarray]:
     candidates: list[tuple[float, float, np.ndarray]] = []
 
     for prediction in _iter_prediction_dicts(payload):
-        confidence = float(prediction.get("confidence", prediction.get("score", 0.0)) or 0.0)
+        confidence = _coerce_float(prediction.get("confidence", prediction.get("score", 0.0)))
         for polygon in _extract_prediction_polygons(prediction):
-            area = abs(float(cv2.contourArea(polygon.astype(np.float32))))
+            try:
+                area = abs(float(cv2.contourArea(polygon.astype(np.float32))))
+            except (TypeError, ValueError):
+                continue
             if area > 0.0:
                 candidates.append((area, confidence, polygon))
 
@@ -214,13 +255,19 @@ def _coerce_polygon(value: object) -> np.ndarray | None:
     for item in value:
         if isinstance(item, dict):
             if "x" in item and "y" in item:
-                points.append((float(item["x"]), float(item["y"])))
+                x = _coerce_float(item["x"])
+                y = _coerce_float(item["y"])
+                points.append((x, y))
             elif "X" in item and "Y" in item:
-                points.append((float(item["X"]), float(item["Y"])))
+                x = _coerce_float(item["X"])
+                y = _coerce_float(item["Y"])
+                points.append((x, y))
             else:
                 return None
         elif isinstance(item, (list, tuple)) and len(item) >= 2:
-            points.append((float(item[0]), float(item[1])))
+            x = _coerce_float(item[0])
+            y = _coerce_float(item[1])
+            points.append((x, y))
         else:
             return None
 
@@ -228,3 +275,11 @@ def _coerce_polygon(value: object) -> np.ndarray | None:
     if polygon.ndim != 2 or polygon.shape[1] != 2 or len(polygon) < 3:
         return None
     return polygon
+
+
+def _coerce_float(value: object) -> float:
+    while isinstance(value, (list, tuple)):
+        if not value:
+            raise ValueError("Empty sequence cannot be converted to float.")
+        value = value[0]
+    return float(value)

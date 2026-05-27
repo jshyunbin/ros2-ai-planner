@@ -40,6 +40,8 @@ class PipelineOrchestrator(Node):
         self.declare_parameter("segmentation_service_name", "/segmentation/segment_prompt")
         self.declare_parameter("graspgen_service_name", "/graspgen/infer")
         self.declare_parameter("auto_run_on_task_command", True)
+        self.declare_parameter("segmentation_service_wait_sec", 10.0)
+        self.declare_parameter("graspgen_service_wait_sec", 10.0)
 
         self._segmentation_service_name = str(
             self.get_parameter("segmentation_service_name").value
@@ -47,6 +49,12 @@ class PipelineOrchestrator(Node):
         self._graspgen_service_name = str(self.get_parameter("graspgen_service_name").value)
         self._auto_run_on_task_command = bool(
             self.get_parameter("auto_run_on_task_command").value
+        )
+        self._segmentation_service_wait_sec = float(
+            self.get_parameter("segmentation_service_wait_sec").value
+        )
+        self._graspgen_service_wait_sec = float(
+            self.get_parameter("graspgen_service_wait_sec").value
         )
 
         self._task_sub = self.create_subscription(
@@ -83,9 +91,13 @@ class PipelineOrchestrator(Node):
                 f"Pipeline busy with '{self._active_task}'. Ignoring new task '{task}'."
             )
             return
-        if not self._segmentation_client.wait_for_service(timeout_sec=0.5):
+        if not self._segmentation_client.wait_for_service(
+            timeout_sec=self._segmentation_service_wait_sec
+        ):
             self.get_logger().warn(
-                f"Segmentation service unavailable: {self._segmentation_service_name}"
+                "Segmentation service unavailable: "
+                f"{self._segmentation_service_name} "
+                f"(waited {self._segmentation_service_wait_sec:.1f}s)"
             )
             return
 
@@ -119,8 +131,12 @@ class PipelineOrchestrator(Node):
             f"Segmentation ready label={label} points={point_count}; requesting GraspGen."
         )
 
-        if not self._graspgen_client.wait_for_service(timeout_sec=0.5):
-            self.get_logger().warn(f"GraspGen service unavailable: {self._graspgen_service_name}")
+        if not self._graspgen_client.wait_for_service(timeout_sec=self._graspgen_service_wait_sec):
+            self.get_logger().warn(
+                "GraspGen service unavailable: "
+                f"{self._graspgen_service_name} "
+                f"(waited {self._graspgen_service_wait_sec:.1f}s)"
+            )
             self._reset_pipeline_state()
             return
 

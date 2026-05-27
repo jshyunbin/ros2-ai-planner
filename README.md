@@ -218,6 +218,50 @@ GRIPPER_CONFIG=/opt/GraspGenModels/checkpoints/graspgen_franka_panda.yml /start_
 
 At the moment this only proves that the planner image can host GraspGen. The planner code itself is not yet calling the embedded model path.
 
+## Single Launcher
+
+The planner-side stack can now be started with one ROS2 launch command.
+
+Inside the planner container:
+
+```bash
+source /opt/ros/humble/setup.bash
+cd /ros2_ws
+source install/setup.bash
+export GEMINI_API_KEY=...
+export SAM3_API_KEY=...
+ros2 launch pipeline_orchestrator planner_pipeline.launch.py \
+  start_graspgen_server:=true \
+  auto_run_on_task_command:=true
+```
+
+What this starts:
+
+- embedded GraspGen server when `start_graspgen_server:=true`
+- `segmentation_service`
+- `graspgen_service`
+- `orchestrator`
+
+Useful overrides:
+
+```bash
+ros2 launch pipeline_orchestrator planner_pipeline.launch.py \
+  start_graspgen_server:=false \
+  graspgen_host:=127.0.0.1 \
+  graspgen_port:=5556 \
+  use_sim_time:=true \
+  auto_run_on_task_command:=false
+```
+
+Default topic wiring:
+
+- RGB: `/camera/camera/color/image_raw`
+- organized point cloud: `/camera/camera/depth/color/points`
+- segmentation service: `/segmentation/segment_prompt`
+- segmented object cloud: `/graspgen/segmented_object`
+- background cloud: `/graspgen/background`
+- grasp service: `/graspgen/infer`
+
 ## Architecture
 
 Intended package layout:

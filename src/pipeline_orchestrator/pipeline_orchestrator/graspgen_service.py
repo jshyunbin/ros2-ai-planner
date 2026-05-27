@@ -1,4 +1,6 @@
 import json
+from pathlib import Path
+import time
 
 import numpy as np
 import rclpy
@@ -33,13 +35,14 @@ class GraspGenService(Node):
         self.declare_parameter("topk_num_grasps", 100)
         self.declare_parameter("min_grasps", 20)
         self.declare_parameter("max_tries", 4)
-        self.declare_parameter("remove_outliers", True)
+        self.declare_parameter("remove_outliers", False)
         self.declare_parameter("rank_mode", "horizontal_grasp")
         self.declare_parameter("target_approach_dir", [0.0, 0.0, 1.0])
         self.declare_parameter("max_returned_grasps", 5)
         self.declare_parameter("enable_collision_check", False)
         self.declare_parameter("collision_threshold", 0.002)
         self.declare_parameter("collision_samples", 2000)
+        self.declare_parameter("debug_dir", "/ros2_ws/segmented_objects/graspgen_service")
 
         qos = QoSProfile(depth=10)
         qos.reliability = ReliabilityPolicy.BEST_EFFORT
@@ -48,6 +51,8 @@ class GraspGenService(Node):
         self._latest_background_cloud = None
         self._latest_segmented_frame = ""
         self._latest_background_frame = ""
+        self._debug_dir = Path(str(self.get_parameter("debug_dir").value))
+        self._debug_dir.mkdir(parents=True, exist_ok=True)
 
         host = str(self.get_parameter("server_host").value)
         port = int(self.get_parameter("server_port").value)
@@ -107,23 +112,39 @@ class GraspGenService(Node):
             return response
 
         segmented_cloud = self._latest_segmented_cloud
+        debug_id = time.strftime("%Y%m%d-%H%M%S") + f"-{int(time.time_ns() % 1_000_000_000):09d}"
+        debug_path = self._debug_dir / debug_id
+        debug_path.mkdir(parents=True, exist_ok=True)
+        remove_outliers = bool(self.get_parameter("remove_outliers").value)
         try:
-            grasps, confidences = self._client.infer(
+            grasps, confidences = self._infer_with_optional_retry(
                 segmented_cloud,
-                num_grasps=int(self.get_parameter("num_grasps").value),
-                topk_num_grasps=int(self.get_parameter("topk_num_grasps").value),
-                min_grasps=int(self.get_parameter("min_grasps").value),
-                max_tries=int(self.get_parameter("max_tries").value),
-                remove_outliers=bool(self.get_parameter("remove_outliers").value),
+                remove_outliers=remove_outliers,
             )
         except Exception as exc:
             response.success = False
             response.message = f"GraspGen inference failed: {exc}"
+            self._save_debug_artifacts(
+                debug_path,
+                segmented_cloud=segmented_cloud,
+                background_cloud=self._latest_background_cloud,
+                response_payload={"success": False, "error": response.message},
+                grasps=None,
+                confidences=None,
+            )
             return response
 
         if len(grasps) == 0:
             response.success = False
             response.message = "No grasps returned."
+            self._save_debug_artifacts(
+                debug_path,
+                segmented_cloud=segmented_cloud,
+                background_cloud=self._latest_background_cloud,
+                response_payload={"success": False, "error": response.message},
+                grasps=np.asarray(grasps, dtype=np.float32),
+                confidences=np.asarray(confidences, dtype=np.float32),
+            )
             return response
 
         collision_free_mask = self._compute_collision_free_mask(grasps)
@@ -140,14 +161,58 @@ class GraspGenService(Node):
             else None,
             "rank_mode": str(self.get_parameter("rank_mode").value),
             "top_grasps": top_rows,
+            "debug_dir": str(debug_path),
         }
         response.success = len(top_rows) > 0
         response.message = json.dumps(payload)
+        self._save_debug_artifacts(
+            debug_path,
+            segmented_cloud=segmented_cloud,
+            background_cloud=self._latest_background_cloud,
+            response_payload=payload,
+            grasps=np.asarray(grasps, dtype=np.float32),
+            confidences=np.asarray(confidences, dtype=np.float32),
+        )
         self.get_logger().info(
             f"Returned {len(top_rows)} filtered grasps from {len(grasps)} raw grasps "
             f"for frame {self._latest_segmented_frame}"
         )
         return response
+
+    def _infer_with_optional_retry(
+        self,
+        segmented_cloud: np.ndarray,
+        *,
+        remove_outliers: bool,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        infer_kwargs = {
+            "num_grasps": int(self.get_parameter("num_grasps").value),
+            "topk_num_grasps": int(self.get_parameter("topk_num_grasps").value),
+            "min_grasps": int(self.get_parameter("min_grasps").value),
+            "max_tries": int(self.get_parameter("max_tries").value),
+        }
+        try:
+            return self._client.infer(
+                segmented_cloud,
+                remove_outliers=remove_outliers,
+                **infer_kwargs,
+            )
+        except Exception as exc:
+            if not remove_outliers or not self._looks_like_empty_cloud_after_filter(exc):
+                raise
+            self.get_logger().warn(
+                "GraspGen removed all segmented points during outlier filtering; retrying with remove_outliers=false."
+            )
+            return self._client.infer(
+                segmented_cloud,
+                remove_outliers=False,
+                **infer_kwargs,
+            )
+
+    @staticmethod
+    def _looks_like_empty_cloud_after_filter(exc: Exception) -> bool:
+        message = str(exc)
+        return "cannot reshape tensor of 0 elements" in message or "shape [-1, 0, 3]" in message
 
     def _compute_collision_free_mask(self, grasps: np.ndarray):
         if not bool(self.get_parameter("enable_collision_check").value):
@@ -230,6 +295,26 @@ class GraspGenService(Node):
         row["finger_flatness"] = round(finger_flatness, 4)
         row["horizontal_score"] = round(approach_flatness * finger_flatness, 4)
         return row
+
+    def _save_debug_artifacts(
+        self,
+        debug_path: Path,
+        *,
+        segmented_cloud: np.ndarray,
+        background_cloud: np.ndarray | None,
+        response_payload: dict,
+        grasps: np.ndarray | None,
+        confidences: np.ndarray | None,
+    ) -> None:
+        np.save(debug_path / "segmented_cloud.npy", np.asarray(segmented_cloud, dtype=np.float32))
+        if background_cloud is not None:
+            np.save(debug_path / "background_cloud.npy", np.asarray(background_cloud, dtype=np.float32))
+        if grasps is not None:
+            np.save(debug_path / "grasps.npy", np.asarray(grasps, dtype=np.float32))
+        if confidences is not None:
+            np.save(debug_path / "confidences.npy", np.asarray(confidences, dtype=np.float32))
+        with open(debug_path / "result.json", "w", encoding="utf-8") as handle:
+            json.dump(response_payload, handle, indent=2)
 
     def destroy_node(self):
         self._client.close()

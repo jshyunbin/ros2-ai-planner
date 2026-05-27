@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+from pathlib import Path
 import time
 import urllib.error
 import urllib.request
@@ -13,7 +14,6 @@ from PIL import Image as PILImage
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image, PointCloud2, PointField
-from sensor_msgs_py import point_cloud2
 from std_msgs.msg import Header
 
 from pipeline_orchestrator.segmentation_utils import (
@@ -21,12 +21,12 @@ from pipeline_orchestrator.segmentation_utils import (
     build_overlay_image,
     compute_centroid,
     compute_mask_roi,
-    encode_image_to_data_uri,
+    depth_to_masked_points,
+    encode_image_to_base64,
     parse_sam3_polygons,
     rasterize_polygons,
     resize_for_api,
     scale_polygons,
-    select_masked_points,
     stable_downsample,
 )
 
@@ -99,30 +99,37 @@ class SegmentationService(Node):
         super().__init__("segmentation_service")
 
         self.declare_parameter("service_name", "/segmentation/segment_prompt")
-        self.declare_parameter("rgb_topic", "/camera/camera/color/image_raw")
-        self.declare_parameter("point_cloud_topic", "/camera/camera/depth/color/points")
+        self.declare_parameter("rgb_topic", "/wrist_camera/wrist_camera/color/image_raw")
+        self.declare_parameter("depth_topic", "/wrist_camera/wrist_camera/depth/color/image_raw")
         self.declare_parameter("segmented_point_cloud_topic", "/graspgen/segmented_object")
         self.declare_parameter("background_point_cloud_topic", "/graspgen/background")
         self.declare_parameter("overlay_topic", "/segmentation/overlay")
         self.declare_parameter("mask_topic", "/segmentation/mask")
         self.declare_parameter("gemini_model", "gemini-2.5-flash")
         self.declare_parameter("sam3_endpoint", "https://sam3.ai/api/v1/pvs")
-        self.declare_parameter("api_timeout_sec", 45.0)
+        self.declare_parameter("api_timeout_sec", 120.0)
         self.declare_parameter("max_api_image_dim", 1024)
         self.declare_parameter("min_depth_m", 0.05)
         self.declare_parameter("max_depth_m", 2.5)
         self.declare_parameter("surface_band_m", 0.02)
         self.declare_parameter("max_object_points", 4096)
         self.declare_parameter("max_background_points", 12000)
-        self.declare_parameter("stale_data_sec", 2.0)
-
+        self.declare_parameter("camera_fx", 615.0)
+        self.declare_parameter("camera_fy", 615.0)
+        self.declare_parameter("camera_cx", 320.0)
+        self.declare_parameter("camera_cy", 240.0)
+        self.declare_parameter("depth_unit_scale", 0.001)
+        self.declare_parameter("debug_dir", "/ros2_ws/segmented_objects/segmentation_service")
         self._bridge = CvBridge()
         self._latest_rgb = None
         self._latest_rgb_stamp_ns = 0
-        self._latest_xyz_image = None
-        self._latest_cloud_frame = ""
-        self._latest_cloud_stamp_ns = 0
-        self._warned_unorganized_cloud = False
+        self._latest_depth = None
+        self._latest_depth_stamp_ns = 0
+        self._latest_frame_id = ""
+        self._logged_first_rgb = False
+        self._logged_first_depth = False
+        self._debug_dir = Path(str(self.get_parameter("debug_dir").value))
+        self._debug_dir.mkdir(parents=True, exist_ok=True)
 
         gemini_api_key = os.getenv("GEMINI_API_KEY")
         sam3_api_key = os.getenv("SAM3_API_KEY")
@@ -145,9 +152,9 @@ class SegmentationService(Node):
             Image, str(self.get_parameter("rgb_topic").value), self._rgb_callback, qos
         )
         self.create_subscription(
-            PointCloud2,
-            str(self.get_parameter("point_cloud_topic").value),
-            self._point_cloud_callback,
+            Image,
+            str(self.get_parameter("depth_topic").value),
+            self._depth_callback,
             qos,
         )
 
@@ -169,52 +176,64 @@ class SegmentationService(Node):
         self.get_logger().info(
             "segmentation_service ready "
             f"rgb={self.get_parameter('rgb_topic').value} "
-            f"points={self.get_parameter('point_cloud_topic').value} "
+            f"depth={self.get_parameter('depth_topic').value} "
             f"service={self.get_parameter('service_name').value}"
         )
 
     def _rgb_callback(self, msg: Image) -> None:
         self._latest_rgb = self._bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
         self._latest_rgb_stamp_ns = self._stamp_to_ns(msg.header.stamp)
+        if not self._logged_first_rgb:
+            self.get_logger().info(
+                f"Received first RGB frame {msg.width}x{msg.height} on "
+                f"{self.get_parameter('rgb_topic').value}"
+            )
+            self._logged_first_rgb = True
 
-    def _point_cloud_callback(self, msg: PointCloud2) -> None:
-        if msg.height <= 1:
-            if not self._warned_unorganized_cloud:
-                self.get_logger().warn("Segmentation requires an organized point cloud.")
-                self._warned_unorganized_cloud = True
-            return
+    def _depth_callback(self, msg: Image) -> None:
+        if msg.encoding == "16UC1":
+            depth = self._bridge.imgmsg_to_cv2(msg, desired_encoding="16UC1").astype(np.float32)
+            depth *= float(self.get_parameter("depth_unit_scale").value)
+        else:
+            depth = self._bridge.imgmsg_to_cv2(msg, desired_encoding="32FC1").astype(np.float32)
 
-        xyz = point_cloud2.read_points_numpy(msg, field_names=("x", "y", "z"))
-        xyz = np.asarray(xyz, dtype=np.float32)
-        expected = int(msg.width) * int(msg.height)
-        if xyz.size == 0 or xyz.shape != (expected, 3):
-            return
-
-        self._latest_xyz_image = xyz.reshape(int(msg.height), int(msg.width), 3)
-        self._latest_cloud_frame = msg.header.frame_id
-        self._latest_cloud_stamp_ns = self._stamp_to_ns(msg.header.stamp)
+        self._latest_depth = depth
+        self._latest_depth_stamp_ns = self._stamp_to_ns(msg.header.stamp)
+        self._latest_frame_id = msg.header.frame_id
+        if not self._logged_first_depth:
+            self.get_logger().info(
+                f"Received first depth frame {msg.width}x{msg.height} "
+                f"frame={msg.header.frame_id} on {self.get_parameter('depth_topic').value}"
+            )
+            self._logged_first_depth = True
 
     def _handle_request(self, request: StringString.Request, response: StringString.Response):
         prompt = request.data.strip()
         if not prompt:
             prompt = "Pick the requested object."
 
-        if self._latest_rgb is None or self._latest_xyz_image is None:
+        if self._latest_rgb is None or self._latest_depth is None:
+            missing = []
+            if self._latest_rgb is None:
+                missing.append("rgb")
+            if self._latest_depth is None:
+                missing.append("depth")
             response.data = json.dumps(
-                {"success": False, "error": "Waiting for RGB image and organized point cloud."}
-            )
-            return response
-
-        if not self._data_is_fresh():
-            response.data = json.dumps(
-                {"success": False, "error": "Cached camera data is stale."}
+                {
+                    "success": False,
+                    "error": "Waiting for RGB image and depth image.",
+                    "missing": missing,
+                }
             )
             return response
 
         start_time = time.perf_counter()
+        debug_id = time.strftime("%Y%m%d-%H%M%S") + f"-{int(time.time_ns() % 1_000_000_000):09d}"
+        debug_path = self._debug_dir / debug_id
+        debug_path.mkdir(parents=True, exist_ok=True)
         try:
             rgb_bgr = self._latest_rgb.copy()
-            xyz_image = self._latest_xyz_image.copy()
+            depth_image = self._latest_depth.copy()
 
             api_image_bgr, scale_x, scale_y = resize_for_api(
                 rgb_bgr, int(self.get_parameter("max_api_image_dim").value)
@@ -234,9 +253,13 @@ class SegmentationService(Node):
             if not mask.any():
                 raise RuntimeError("Rasterized mask is empty.")
 
-            object_points, background_points = select_masked_points(
-                xyz_image,
+            object_points, background_points = depth_to_masked_points(
+                depth_image,
                 mask,
+                fx=float(self.get_parameter("camera_fx").value),
+                fy=float(self.get_parameter("camera_fy").value),
+                cx=float(self.get_parameter("camera_cx").value),
+                cy=float(self.get_parameter("camera_cy").value),
                 min_depth_m=float(self.get_parameter("min_depth_m").value),
                 max_depth_m=float(self.get_parameter("max_depth_m").value),
             )
@@ -259,9 +282,9 @@ class SegmentationService(Node):
             assert roi is not None
             x_min, y_min, x_max, y_max = roi
 
-            self._segmented_pub.publish(make_xyz_cloud(object_points, self._latest_cloud_frame))
+            self._segmented_pub.publish(make_xyz_cloud(object_points, self._latest_frame_id))
             if len(background_points) > 0:
-                self._background_pub.publish(make_xyz_cloud(background_points, self._latest_cloud_frame))
+                self._background_pub.publish(make_xyz_cloud(background_points, self._latest_frame_id))
 
             prompt_points_full = [
                 PromptPoint(
@@ -283,24 +306,39 @@ class SegmentationService(Node):
             )
 
             elapsed_ms = round((time.perf_counter() - start_time) * 1000.0, 2)
-            response.data = json.dumps(
-                {
-                    "success": True,
-                    "prompt": prompt,
-                    "label": prompt_result["label"],
-                    "frame_id": self._latest_cloud_frame,
-                    "centroid": [round(float(v), 5) for v in centroid],
-                    "roi_xyxy": [x_min, y_min, x_max, y_max],
-                    "mask_pixel_count": int(mask.sum()),
-                    "object_point_count": int(len(object_points)),
-                    "background_point_count": int(len(background_points)),
-                    "mask_area_ratio": round(float(mask.mean()), 6),
-                    "processing_time_ms": elapsed_ms,
-                    "prompt_points": [
-                        {"x": int(p.x), "y": int(p.y), "positive": bool(p.positive)}
-                        for p in prompt_points_full
-                    ],
-                }
+            response_payload = {
+                "success": True,
+                "prompt": prompt,
+                "label": prompt_result["label"],
+                "frame_id": self._latest_frame_id,
+                "centroid": [round(float(v), 5) for v in centroid],
+                "roi_xyxy": [x_min, y_min, x_max, y_max],
+                "mask_pixel_count": int(mask.sum()),
+                "object_point_count": int(len(object_points)),
+                "background_point_count": int(len(background_points)),
+                "mask_area_ratio": round(float(mask.mean()), 6),
+                "processing_time_ms": elapsed_ms,
+                "prompt_points": [
+                    {"x": int(p.x), "y": int(p.y), "positive": bool(p.positive)}
+                    for p in prompt_points_full
+                ],
+                "debug_dir": str(debug_path),
+            }
+            response.data = json.dumps(response_payload)
+            self._save_debug_artifacts(
+                debug_path,
+                prompt=prompt,
+                rgb_bgr=rgb_bgr,
+                depth_image=depth_image,
+                api_image_bgr=api_image_bgr,
+                mask=mask,
+                overlay=overlay,
+                prompt_result=prompt_result,
+                prompt_points_full=prompt_points_full,
+                polygons_full=polygons_full,
+                object_points=object_points,
+                background_points=background_points,
+                response_payload=response_payload,
             )
             self.get_logger().info(
                 f"Segmented '{prompt_result['label']}' "
@@ -310,16 +348,21 @@ class SegmentationService(Node):
             return response
         except Exception as exc:
             self.get_logger().error(f"Segmentation request failed: {exc}")
-            response.data = json.dumps({"success": False, "error": str(exc), "prompt": prompt})
+            failure_payload = {
+                "success": False,
+                "error": str(exc),
+                "prompt": prompt,
+                "debug_dir": str(debug_path),
+            }
+            self._save_failure_debug_artifacts(
+                debug_path,
+                prompt=prompt,
+                rgb_bgr=self._latest_rgb,
+                depth_image=self._latest_depth,
+                failure_payload=failure_payload,
+            )
+            response.data = json.dumps(failure_payload)
             return response
-
-    def _data_is_fresh(self) -> bool:
-        stale_ns = int(float(self.get_parameter("stale_data_sec").value) * 1e9)
-        now_ns = self.get_clock().now().nanoseconds
-        return (
-            now_ns - self._latest_rgb_stamp_ns <= stale_ns
-            and now_ns - self._latest_cloud_stamp_ns <= stale_ns
-        )
 
     def _localize_prompt(self, image_bgr: np.ndarray, prompt: str) -> dict:
         rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
@@ -374,10 +417,10 @@ class SegmentationService(Node):
         return sanitized
 
     def _segment_with_sam3(self, image_bgr: np.ndarray, prompt_points: list[PromptPoint]) -> list[np.ndarray]:
-        image_uri = encode_image_to_data_uri(image_bgr)
-        image_id = hashlib.sha1(image_uri[-512:].encode("ascii")).hexdigest()[:16]
+        image_base64 = encode_image_to_base64(image_bgr)
+        image_id = hashlib.sha1(image_base64[-512:].encode("ascii")).hexdigest()[:16]
         payload = {
-            "image": image_uri,
+            "image": image_base64,
             "imageId": image_id,
             "multimaskOutput": False,
             "points": [
@@ -405,7 +448,11 @@ class SegmentationService(Node):
         headers: dict[str, str] | None = None,
         timeout: float,
     ) -> dict:
-        request_headers = {"Content-Type": "application/json"}
+        request_headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "ros2-ai-planner/0.1 (+https://sam3.ai/docs/api-reference)",
+        }
         if headers:
             request_headers.update(headers)
 
@@ -423,6 +470,62 @@ class SegmentationService(Node):
             raise RuntimeError(f"HTTP {exc.code} from {url}: {body[:400]}") from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"Failed to reach {url}: {exc.reason}") from exc
+
+    def _save_debug_artifacts(
+        self,
+        debug_path: Path,
+        *,
+        prompt: str,
+        rgb_bgr: np.ndarray,
+        depth_image: np.ndarray,
+        api_image_bgr: np.ndarray,
+        mask: np.ndarray,
+        overlay: np.ndarray,
+        prompt_result: dict,
+        prompt_points_full: list[PromptPoint],
+        polygons_full: list[np.ndarray],
+        object_points: np.ndarray,
+        background_points: np.ndarray,
+        response_payload: dict,
+    ) -> None:
+        cv2.imwrite(str(debug_path / "rgb.png"), rgb_bgr)
+        cv2.imwrite(str(debug_path / "api_rgb.png"), api_image_bgr)
+        cv2.imwrite(str(debug_path / "mask.png"), (mask.astype(np.uint8) * 255))
+        cv2.imwrite(str(debug_path / "overlay.png"), overlay)
+        np.save(debug_path / "depth_m.npy", depth_image.astype(np.float32))
+        np.save(debug_path / "object_points.npy", object_points.astype(np.float32))
+        np.save(debug_path / "background_points.npy", background_points.astype(np.float32))
+        with open(debug_path / "polygons.json", "w", encoding="utf-8") as handle:
+            json.dump([polygon.tolist() for polygon in polygons_full], handle)
+        with open(debug_path / "result.json", "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "prompt": prompt,
+                    "prompt_result": prompt_result,
+                    "prompt_points_full": [
+                        {"x": p.x, "y": p.y, "positive": p.positive} for p in prompt_points_full
+                    ],
+                    "response": response_payload,
+                },
+                handle,
+                indent=2,
+            )
+
+    def _save_failure_debug_artifacts(
+        self,
+        debug_path: Path,
+        *,
+        prompt: str,
+        rgb_bgr: np.ndarray | None,
+        depth_image: np.ndarray | None,
+        failure_payload: dict,
+    ) -> None:
+        if rgb_bgr is not None:
+            cv2.imwrite(str(debug_path / "rgb.png"), rgb_bgr)
+        if depth_image is not None:
+            np.save(debug_path / "depth_m.npy", np.asarray(depth_image, dtype=np.float32))
+        with open(debug_path / "failure.json", "w", encoding="utf-8") as handle:
+            json.dump({"prompt": prompt, "response": failure_payload}, handle, indent=2)
 
     @staticmethod
     def _stamp_to_ns(stamp) -> int:
