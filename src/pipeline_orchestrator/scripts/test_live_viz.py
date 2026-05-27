@@ -112,6 +112,10 @@ class LiveVizNode(Node):
             flying_pixel_threshold=0.5,
             bilateral_kernel_size=3,
         )
+        # cuRobo's TSDF integrator unconditionally calls rgb_image.reshape(),
+        # so CameraObservation needs an rgb_image even for depth-only mapping.
+        self._dummy_rgb = torch.zeros(
+            (2, 480, 640, 3), dtype=torch.uint8, device='cuda')
         self._plan_thread: Optional[threading.Thread] = None
 
         # Gazebo realsense plugin publishes camera streams with BEST_EFFORT
@@ -200,6 +204,7 @@ class LiveVizNode(Node):
             return
 
         batched = CameraObservation(
+            rgb_image=self._dummy_rgb,
             depth_image=torch.stack([
                 self._cam_depth['overhead'],
                 self._cam_depth['wrist'],
