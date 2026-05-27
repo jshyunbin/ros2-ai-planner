@@ -57,6 +57,10 @@ RUN pip3 install --no-cache-dir uv && \
     uv pip install --system ".[cu12]" && \
     cd / && rm -rf /tmp/curobo
 
+# Re-pin numpy<2 — cuRobo's install pulled in numpy 2.x which breaks
+# ros-humble-cv-bridge (compiled against NumPy 1.x ABI)
+RUN pip3 install --no-cache-dir --force-reinstall "numpy<2"
+
 # Workspace
 WORKDIR /ros2_ws
 COPY src/ src/
