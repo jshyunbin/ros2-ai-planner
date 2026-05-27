@@ -29,6 +29,9 @@ Important environment split:
 ## Usage
 
 ```bash
+# Optional: create a local env file for ROS2 transport and API keys
+cp .env.example .env
+
 # Build the reusable ROS2/GraspGen base image once
 ./scripts/build_base_image.sh
 
@@ -45,6 +48,14 @@ For local hot-reload development with bind mounts, use:
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.dev.yml up
 ```
+
+Container-side runtime environment expected by the planner:
+
+- `ROS_DOMAIN_ID=0`
+- `ROS_LOCALHOST_ONLY=0`
+- `RMW_IMPLEMENTATION=rmw_fastrtps_cpp`
+- `FASTDDS_BUILTIN_TRANSPORTS=UDPv4`
+- `GEMINI_API_KEY` and `SAM3_API_KEY` when running `segmentation_service`
 
 ## Current Status
 

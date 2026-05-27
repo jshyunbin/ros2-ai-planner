@@ -8,11 +8,18 @@ This file is the shortest practical guide for running `ros2-ai-planner`.
 
 Use one persistent Docker container, launch the planner stack once, and test the pipeline through `/task_commands`.
 
+The final target is a single self-contained planner image:
+
+- GraspGen code lives inside the image under `/opt/GraspGen`
+- GraspGen checkpoints live inside the image under `/opt/GraspGenModels`
+- host bind mounts are development-only and come from `docker-compose.dev.yml`
+- runtime debug artifacts are written to host `./artifacts/`
+
 Do not keep creating new `docker compose run ...` containers for each shell.
 
 ## Working Environment
 
-Use these on both host and planner container when testing ROS2 communication:
+Use these on the host when testing ROS2 communication:
 
 ```bash
 export ROS_DOMAIN_ID=0
@@ -20,6 +27,8 @@ export ROS_LOCALHOST_ONLY=0
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 export FASTDDS_BUILTIN_TRANSPORTS=UDPv4
 ```
+
+The planner container receives the same values from `.env` through `docker compose`.
 
 On the host, unpause Gazebo before testing:
 
@@ -32,6 +41,8 @@ ros2 service call /unpause_physics std_srvs/srv/Empty "{}"
 Build images from `ros2-ai-planner/`:
 
 ```bash
+cp .env.example .env
+# Fill in GEMINI_API_KEY and SAM3_API_KEY in .env if using segmentation.
 ./scripts/build_base_image.sh
 ./scripts/build_image.sh
 ```
@@ -60,6 +71,19 @@ Remove the container when done:
 docker rm -f ai_planner_dev
 ```
 
+Verify the container sees the expected ROS2 and API environment:
+
+```bash
+docker compose run --rm ai_planner env | rg 'ROS_DOMAIN_ID|ROS_LOCALHOST_ONLY|RMW_IMPLEMENTATION|FASTDDS_BUILTIN_TRANSPORTS|GEMINI_API_KEY|SAM3_API_KEY'
+```
+
+Artifacts are saved on the host under:
+
+```text
+./artifacts/segmentation_service/
+./artifacts/graspgen_service/
+```
+
 ## Inside The Container
 
 Source the environment in every shell:
@@ -70,11 +94,11 @@ cd /ros2_ws
 source install/setup.bash
 ```
 
-For live segmentation:
+Quick image sanity checks:
 
 ```bash
-export GEMINI_API_KEY=...
-export SAM3_API_KEY=...
+ls /opt/GraspGen
+ls /opt/GraspGenModels/checkpoints
 ```
 
 ## Main Launcher
@@ -106,7 +130,7 @@ ros2 launch pipeline_orchestrator planner_pipeline.launch.py \
 
 ## Manual Rebuild
 
-If mounted source changes inside the container:
+If mounted source changes inside the container with `docker-compose.dev.yml`:
 
 ```bash
 source /opt/ros/humble/setup.bash
@@ -157,12 +181,6 @@ Container:
 source /opt/ros/humble/setup.bash
 cd /ros2_ws
 source install/setup.bash
-export ROS_DOMAIN_ID=0
-export ROS_LOCALHOST_ONLY=0
-export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-export FASTDDS_BUILTIN_TRANSPORTS=UDPv4
-export GEMINI_API_KEY=...
-export SAM3_API_KEY=...
 ros2 launch pipeline_orchestrator planner_pipeline.launch.py \
   start_graspgen_server:=true \
   auto_run_on_task_command:=true \
@@ -186,13 +204,13 @@ ros2 service call /graspgen/infer std_srvs/srv/Trigger "{}"
 
 Working:
 
-- Docker build
+- single-image Docker build
+- embedded GraspGen server startup
 - host-to-container ROS transport
 - RGB and organized pointcloud ingestion
 - Gemini prompt generation
 - SAM3 request path
 - segmented pointcloud publication
-- embedded GraspGen startup
 
 Current blocker:
 

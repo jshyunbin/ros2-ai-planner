@@ -119,7 +119,7 @@ class SegmentationService(Node):
         self.declare_parameter("camera_cx", 320.0)
         self.declare_parameter("camera_cy", 240.0)
         self.declare_parameter("depth_unit_scale", 0.001)
-        self.declare_parameter("debug_dir", "/tmp/ros2-ai-planner/segmentation_service")
+        self.declare_parameter("debug_dir", "/artifacts/segmentation_service")
         self._bridge = CvBridge()
         self._latest_rgb = None
         self._latest_rgb_stamp_ns = 0

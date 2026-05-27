@@ -42,7 +42,7 @@ class GraspGenService(Node):
         self.declare_parameter("enable_collision_check", False)
         self.declare_parameter("collision_threshold", 0.002)
         self.declare_parameter("collision_samples", 2000)
-        self.declare_parameter("debug_dir", "/tmp/ros2-ai-planner/graspgen_service")
+        self.declare_parameter("debug_dir", "/artifacts/graspgen_service")
 
         qos = QoSProfile(depth=10)
         qos.reliability = ReliabilityPolicy.BEST_EFFORT

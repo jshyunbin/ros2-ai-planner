@@ -49,11 +49,11 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("graspgen_remove_outliers", default_value="false"),
             DeclareLaunchArgument(
                 "segmentation_debug_dir",
-                default_value="/tmp/ros2-ai-planner/segmentation_service",
+                default_value="/artifacts/segmentation_service",
             ),
             DeclareLaunchArgument(
                 "graspgen_debug_dir",
-                default_value="/tmp/ros2-ai-planner/graspgen_service",
+                default_value="/artifacts/graspgen_service",
             ),
             ExecuteProcess(
                 cmd=["/start_graspgen_server.sh"],
