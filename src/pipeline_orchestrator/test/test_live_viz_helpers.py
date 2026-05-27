@@ -1,6 +1,5 @@
 import torch
 import numpy as np
-import pytest
 
 
 def test_depth_to_xyz_single_pixel():
