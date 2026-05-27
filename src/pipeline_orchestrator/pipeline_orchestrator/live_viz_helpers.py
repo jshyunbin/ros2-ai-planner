@@ -45,3 +45,57 @@ def depth_to_xyz(depth_m: torch.Tensor, K: torch.Tensor) -> torch.Tensor:
     y = (v_coords[valid] - cy) / fy * z
 
     return torch.stack([x, y, z], dim=-1)
+
+
+def esdf_to_points(voxel_grid: object) -> np.ndarray:
+    """Extract occupied voxel centres from a cuRobo ESDF VoxelGrid.
+
+    A voxel is "occupied" when its ESDF value is ≤ 0 (inside or on the
+    surface of an obstacle).
+
+    Args:
+        voxel_grid: cuRobo VoxelGrid, or any duck-typed object with
+                    ``esdf_tensor`` (X, Y, Z) CUDA tensor,
+                    ``origin`` (3,) tensor, and ``voxel_size`` scalar.
+
+    Returns:
+        (M, 3) float32 numpy array of world-frame XYZ voxel centres.
+        Returns shape (0, 3) on failure or when the grid is entirely free.
+    """
+    try:
+        esdf: torch.Tensor = voxel_grid.esdf_tensor   # (X, Y, Z)
+        occupied = esdf <= 0.0
+        if not occupied.any():
+            return np.zeros((0, 3), dtype=np.float32)
+
+        origin  = voxel_grid.origin.cpu().numpy()     # (3,)
+        vsize   = float(voxel_grid.voxel_size)
+        indices = torch.argwhere(occupied).float().cpu().numpy()  # (M, 3)
+        centres = origin + indices * vsize + vsize / 2.0
+        return centres.astype(np.float32)
+    except Exception:
+        return np.zeros((0, 3), dtype=np.float32)
+
+
+def resolve_urdf(urdf_path: str) -> Path:
+    """Rewrite ``package://`` URIs to absolute paths; return a temp file path.
+
+    viser's URDF loader does not handle ROS2 package URIs. This rewrites
+    ``package://ur_description`` to the absolute ROS2 share directory and
+    writes the result to a temp file that persists for the session.
+
+    Args:
+        urdf_path: Absolute path to the URDF file (may contain package:// URIs).
+
+    Returns:
+        Path to a temp URDF file with all URIs resolved.
+    """
+    pkg_root = '/opt/ros/humble/share'
+    with open(urdf_path) as f:
+        content = f.read()
+    content = content.replace(
+        'package://ur_description', f'{pkg_root}/ur_description')
+    tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.urdf', delete=False)
+    tmp.write(content)
+    tmp.flush()
+    return Path(tmp.name)
