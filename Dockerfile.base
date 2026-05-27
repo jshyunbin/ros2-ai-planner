@@ -14,6 +14,8 @@ ENV LC_ALL=en_US.UTF-8
 ENV GRASPGEN_REPO_DIR=/opt/GraspGen
 ENV GRASPGEN_MODELS_DIR=/opt/GraspGenModels
 
+COPY requirements/ /tmp/requirements/
+
 # Locale
 RUN apt-get update && apt-get install -y locales && \
     locale-gen en_US en_US.UTF-8 && \
@@ -75,7 +77,8 @@ RUN pip install --upgrade pip && \
     pip install torch-scatter -f https://data.pyg.org/whl/torch-2.1.2+cu121.html && \
     pip install spconv-cu120 && \
     pip install qpsolvers[clarabel] yourdfpy==0.0.56 webdataset objaverse==0.1.7 && \
-    pip install google-genai msgpack msgpack-numpy pyzmq viser==1.0.29 tensordict==0.12.4 transformers==4.48.3
+    pip install google-genai msgpack msgpack-numpy pyzmq viser==1.0.29 tensordict==0.12.4 transformers==4.48.3 && \
+    pip install --no-deps -r /tmp/requirements/sam2.txt
 
 # Optional geometry tooling used by the upstream environment.
 RUN mkdir -p /install && \

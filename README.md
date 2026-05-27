@@ -55,7 +55,7 @@ Container-side runtime environment expected by the planner:
 - `ROS_LOCALHOST_ONLY=0`
 - `RMW_IMPLEMENTATION=rmw_fastrtps_cpp`
 - `FASTDDS_BUILTIN_TRANSPORTS=UDPv4`
-- `GEMINI_API_KEY` and `SAM3_API_KEY` when running `segmentation_service`
+- `GEMINI_API_KEY` and `SAM3_API_KEY` when running the current `segmentation_service`
 
 ## Current Status
 
@@ -256,6 +256,20 @@ ros2 launch pipeline_orchestrator planner_pipeline.launch.py \
   start_graspgen_server:=true \
   auto_run_on_task_command:=true
 ```
+
+## Ultralytics SAM2 Status
+
+The current planner image can install and run Ultralytics SAM2 without changing the
+existing torch/CUDA stack.
+
+- install path used in this repo: `pip install --no-deps "ultralytics>=8.2.70"`
+- rationale: the base image already contains a working runtime set, and allowing pip
+  to resolve dependencies would risk replacing pinned GPU packages used elsewhere
+- practical status: local testing in the container succeeded with Ultralytics SAM2
+  checkpoint download and image inference
+
+This is distinct from the official `facebookresearch/sam2` installation path, which
+has different version expectations and is not the integration target for this repo.
 
 What this starts:
 

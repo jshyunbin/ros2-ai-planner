@@ -13,6 +13,43 @@ class PromptPoint:
     positive: bool = True
 
 
+def prompt_points_from_box(
+    x_min: int,
+    y_min: int,
+    x_max: int,
+    y_max: int,
+    width: int,
+    height: int,
+) -> list[PromptPoint]:
+    if width <= 0 or height <= 0:
+        raise ValueError("Image width and height must be positive.")
+
+    x_min = int(np.clip(x_min, 0, width - 1))
+    y_min = int(np.clip(y_min, 0, height - 1))
+    x_max = int(np.clip(x_max, 0, width - 1))
+    y_max = int(np.clip(y_max, 0, height - 1))
+    if x_max < x_min:
+        x_min, x_max = x_max, x_min
+    if y_max < y_min:
+        y_min, y_max = y_max, y_min
+
+    raw_points = [
+        (int(round((x_min + x_max) / 2.0)), int(round((y_min + y_max) / 2.0))),
+        (int(round(x_min + (x_max - x_min) * 0.35)), int(round(y_min + (y_max - y_min) * 0.35))),
+        (int(round(x_min + (x_max - x_min) * 0.65)), int(round(y_min + (y_max - y_min) * 0.65))),
+    ]
+
+    prompt_points = []
+    seen = set()
+    for x, y in raw_points:
+        point = (int(np.clip(x, 0, width - 1)), int(np.clip(y, 0, height - 1)))
+        if point in seen:
+            continue
+        seen.add(point)
+        prompt_points.append(PromptPoint(x=point[0], y=point[1], positive=True))
+    return prompt_points
+
+
 def resize_for_api(image_bgr: np.ndarray, max_dimension: int) -> tuple[np.ndarray, float, float]:
     height, width = image_bgr.shape[:2]
     largest_dim = max(height, width)

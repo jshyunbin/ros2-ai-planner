@@ -24,6 +24,7 @@ from pipeline_orchestrator.segmentation_utils import (
     depth_to_masked_points,
     encode_image_to_base64,
     parse_sam3_polygons,
+    prompt_points_from_box,
     rasterize_polygons,
     resize_for_api,
     scale_polygons,
@@ -32,8 +33,10 @@ from pipeline_orchestrator.segmentation_utils import (
 
 try:  # pragma: no cover - runtime dependency
     from google import genai
+    from google.genai import types
 except ImportError:  # pragma: no cover - runtime dependency
     genai = None
+    types = None
 
 try:  # pragma: no cover - runtime dependency
     from riro_srvs.srv import StringString
@@ -42,31 +45,22 @@ except ImportError:  # pragma: no cover - runtime dependency
 
 
 PROMPT_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "label": {
-            "type": "string",
-            "description": "Short target label such as banana or meat can.",
-        },
-        "points": {
-            "type": "array",
-            "description": "Up to four image points for SAM3 prompting.",
-            "minItems": 1,
-            "maxItems": 4,
-            "items": {
-                "type": "object",
-                "properties": {
-                    "x": {"type": "integer", "minimum": 0},
-                    "y": {"type": "integer", "minimum": 0},
-                    "positive": {"type": "boolean"},
-                },
-                "required": ["x", "y", "positive"],
-                "additionalProperties": False,
+    "type": "ARRAY",
+    "items": {
+        "type": "OBJECT",
+        "properties": {
+            "box_2d": {
+                "type": "ARRAY",
+                "items": {"type": "INTEGER"},
+                "description": "Bounding box [ymin, xmin, ymax, xmax] scaled strictly from 0 to 1000.",
+            },
+            "label": {
+                "type": "STRING",
+                "description": "Descriptive text label of the detected item.",
             },
         },
+        "required": ["box_2d", "label"],
     },
-    "required": ["label", "points"],
-    "additionalProperties": False,
 }
 
 
@@ -137,7 +131,7 @@ class SegmentationService(Node):
             raise ValueError("GEMINI_API_KEY is not set.")
         if not sam3_api_key:
             raise ValueError("SAM3_API_KEY is not set.")
-        if genai is None:
+        if genai is None or types is None:
             raise ImportError("google-genai is required for segmentation_service.")
 
         self._gemini = genai.Client(api_key=gemini_api_key)
@@ -242,7 +236,10 @@ class SegmentationService(Node):
             api_height = int(api_image_bgr.shape[0])
 
             prompt_result = self._localize_prompt(api_image_bgr, prompt)
-            prompt_points = self._sanitize_prompt_points(prompt_result["points"], api_width, api_height)
+            prompt_bbox = self._sanitize_detection_box(
+                prompt_result["box_2d"], api_width, api_height
+            )
+            prompt_points = prompt_points_from_box(*prompt_bbox, api_width, api_height)
             polygons_api = self._segment_with_sam3(api_image_bgr, prompt_points)
             if not polygons_api:
                 raise RuntimeError("SAM3 returned no polygons.")
@@ -318,6 +315,7 @@ class SegmentationService(Node):
                 "background_point_count": int(len(background_points)),
                 "mask_area_ratio": round(float(mask.mean()), 6),
                 "processing_time_ms": elapsed_ms,
+                "gemini_bbox_xyxy": list(prompt_bbox),
                 "prompt_points": [
                     {"x": int(p.x), "y": int(p.y), "positive": bool(p.positive)}
                     for p in prompt_points_full
@@ -334,6 +332,7 @@ class SegmentationService(Node):
                 mask=mask,
                 overlay=overlay,
                 prompt_result=prompt_result,
+                prompt_bbox=prompt_bbox,
                 prompt_points_full=prompt_points_full,
                 polygons_full=polygons_full,
                 object_points=object_points,
@@ -370,51 +369,62 @@ class SegmentationService(Node):
         width = int(image_bgr.shape[1])
         height = int(image_bgr.shape[0])
 
-        prompt_text = (
-            "You are selecting point prompts for point-based image segmentation.\n"
-            f"Image width={width}, height={height}.\n"
-            "Find only the single visible object that best matches the user request.\n"
-            "Return 1-4 image points in pixel coordinates for the uploaded image.\n"
-            "Use 2-3 positive points on the target surface when possible.\n"
-            "Add at most one negative point only if it helps exclude a touching distractor.\n"
-            "Do not use bounding boxes.\n"
-            f"User request: {prompt}"
+        config = types.GenerateContentConfig(
+            response_mime_type="application/json",
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+            response_schema=PROMPT_SCHEMA,
+            temperature=0.1,
         )
 
-        config = {
-            "response_mime_type": "application/json",
-            "response_json_schema": PROMPT_SCHEMA,
-        }
+        full_prompt = (
+            f"{prompt}\n"
+            "Return a JSON list. For each object, return the label and the 'box_2d' "
+            "as an array of exactly 4 integers: [ymin, xmin, ymax, xmax]."
+        )
         response = self._gemini.models.generate_content(
             model=self._gemini_model,
-            contents=[pil_image, prompt_text],
+            contents=[full_prompt, pil_image],
             config=config,
         )
         payload = json.loads(response.text)
-        label = str(payload.get("label", "")).strip() or "target"
-        points = payload.get("points", [])
-        if not isinstance(points, list) or not points:
-            raise RuntimeError("Gemini returned no prompt points.")
-        return {"label": label, "points": points}
+        if not isinstance(payload, list) or not payload:
+            raise RuntimeError("Gemini returned no detections.")
 
-    def _sanitize_prompt_points(self, raw_points: list[dict], width: int, height: int) -> list[PromptPoint]:
-        sanitized = []
-        for point in raw_points:
-            try:
-                x = int(point["x"])
-                y = int(point["y"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            x = int(np.clip(x, 0, width - 1))
-            y = int(np.clip(y, 0, height - 1))
-            sanitized.append(PromptPoint(x=x, y=y, positive=bool(point.get("positive", True))))
+        detection = payload[0]
+        label = str(detection.get("label", "")).strip() or "target"
+        box_2d = detection.get("box_2d", [])
+        return {"label": label, "box_2d": box_2d, "image_size": [width, height]}
 
-        if not sanitized:
-            raise RuntimeError("No valid Gemini prompt points remained after validation.")
-        if not any(point.positive for point in sanitized):
-            first = sanitized[0]
-            sanitized[0] = PromptPoint(x=first.x, y=first.y, positive=True)
-        return sanitized
+    def _sanitize_detection_box(
+        self, raw_box: list[int], width: int, height: int
+    ) -> tuple[int, int, int, int]:
+        if not isinstance(raw_box, list) or len(raw_box) != 4:
+            raise RuntimeError(f"Invalid Gemini box format: {raw_box}")
+
+        try:
+            ymin_norm, xmin_norm, ymax_norm, xmax_norm = [int(value) for value in raw_box]
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"Non-integer Gemini box format: {raw_box}") from exc
+
+        ymin_norm = int(np.clip(ymin_norm, 0, 1000))
+        xmin_norm = int(np.clip(xmin_norm, 0, 1000))
+        ymax_norm = int(np.clip(ymax_norm, 0, 1000))
+        xmax_norm = int(np.clip(xmax_norm, 0, 1000))
+
+        x_min = int(round(xmin_norm / 1000.0 * width))
+        y_min = int(round(ymin_norm / 1000.0 * height))
+        x_max = int(round(xmax_norm / 1000.0 * width))
+        y_max = int(round(ymax_norm / 1000.0 * height))
+
+        x_min = int(np.clip(x_min, 0, width - 1))
+        y_min = int(np.clip(y_min, 0, height - 1))
+        x_max = int(np.clip(x_max, 0, width - 1))
+        y_max = int(np.clip(y_max, 0, height - 1))
+        if x_max <= x_min or y_max <= y_min:
+            raise RuntimeError(
+                f"Degenerate Gemini box after scaling: raw={raw_box} scaled={[x_min, y_min, x_max, y_max]}"
+            )
+        return x_min, y_min, x_max, y_max
 
     def _segment_with_sam3(self, image_bgr: np.ndarray, prompt_points: list[PromptPoint]) -> list[np.ndarray]:
         image_base64 = encode_image_to_base64(image_bgr)
@@ -482,6 +492,7 @@ class SegmentationService(Node):
         mask: np.ndarray,
         overlay: np.ndarray,
         prompt_result: dict,
+        prompt_bbox: tuple[int, int, int, int],
         prompt_points_full: list[PromptPoint],
         polygons_full: list[np.ndarray],
         object_points: np.ndarray,
@@ -502,6 +513,7 @@ class SegmentationService(Node):
                 {
                     "prompt": prompt,
                     "prompt_result": prompt_result,
+                    "prompt_bbox_xyxy": list(prompt_bbox),
                     "prompt_points_full": [
                         {"x": p.x, "y": p.y, "positive": p.positive} for p in prompt_points_full
                     ],
