@@ -303,8 +303,13 @@ class LiveVizNode(Node):
 
         result = self._planner.plan_pose(goal, start)
         if result is None or not result.success.any():
+            status = getattr(result, 'status', None)
+            ik_succ = getattr(getattr(result, 'ik_result', None), 'success', None)
             self.get_logger().warning(
-                'CuRobo planning failed — keeping previous trajectory.')
+                f'CuRobo planning failed — status={status} '
+                f'ik_success={ik_succ.any().item() if ik_succ is not None else None} '
+                f'start_q={start.position.tolist() if hasattr(start, "position") else "?"}',
+                throttle_duration_sec=5.0)
             return
 
         pos = result.get_interpolated_plan().position[0]
@@ -334,24 +339,27 @@ def update_loop(
 
     Loops forever; raise KeyboardInterrupt to exit.
     """
-    home_array = np.array([HOME_CFG])
-    traj_idx   = 0
-    period     = 1.0 / VIZ_HZ
+    traj_idx = 0
+    period   = 1.0 / VIZ_HZ
 
     while True:
         t0 = time.time()
 
         with state.lock:
-            clouds   = dict(state.point_clouds)   # shallow copy of dict
-            vg       = state.voxel_grid
-            traj     = state.traj if state.traj is not None else home_array
-            n_frames = state.frame_count
+            clouds      = dict(state.point_clouds)   # shallow copy of dict
+            vg          = state.voxel_grid
+            traj        = state.traj                  # None if no plan yet
+            n_frames    = state.frame_count
+            latest_js   = state.latest_joints
 
         # ── status label ──────────────────────────────────────────────────────
+        traj_len = 0 if traj is None else len(traj)
         if n_frames < MIN_FRAMES:
             status_text = f'Waiting for depth frames ({n_frames}/{MIN_FRAMES})…'
         else:
-            status_text = f'Frames: {n_frames}  |  Traj waypoints: {len(traj)}'
+            status_text = (f'Frames: {n_frames}  |  '
+                           f'Traj waypoints: {traj_len}  |  '
+                           f'Mode: {"plan" if traj_len > 0 else "live"}')
         server.scene.add_label('/status', status_text, position=(0.0, 0.0, 1.6))
 
         # ── point clouds ──────────────────────────────────────────────────────
@@ -378,15 +386,23 @@ def update_loop(
                     point_size=0.02,
                 )
 
-        # ── robot animation ───────────────────────────────────────────────────
-        if len(traj) > 0:
-            waypoint = traj[traj_idx % len(traj)]
-            if robot is not None:
+        # ── robot pose ────────────────────────────────────────────────────────
+        # With a successful plan: animate through traj waypoints.
+        # Otherwise: mirror the live /joint_states so the URDF reflects reality.
+        if robot is not None:
+            if traj is not None and len(traj) > 0:
+                waypoint = traj[traj_idx % len(traj)]
                 robot.update_cfg(dict(zip(JOINT_NAMES, waypoint.tolist())))
-            traj_idx += 1
-            if traj_idx >= len(traj):
-                traj_idx = 0
-                time.sleep(1.0)   # brief pause before replaying
+                traj_idx += 1
+                if traj_idx >= len(traj):
+                    traj_idx = 0
+                    time.sleep(1.0)   # brief pause before replaying
+            elif latest_js is not None:
+                # Index /joint_states by name; only update joints we know.
+                by_name = dict(zip(latest_js.name, latest_js.position))
+                cfg = {n: by_name[n] for n in JOINT_NAMES if n in by_name}
+                if cfg:
+                    robot.update_cfg(cfg)
 
         elapsed = time.time() - t0
         time.sleep(max(0.0, period - elapsed))
