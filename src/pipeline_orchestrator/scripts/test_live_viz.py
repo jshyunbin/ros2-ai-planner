@@ -28,7 +28,7 @@ from rclpy.qos import qos_profile_sensor_data
 from cv_bridge import CvBridge
 import viser
 
-from curobo.perception import FilterDepth, Mapper, MapperCfg
+from curobo.perception import FilterDepth, Mapper, MapperCfg, RobotSegmenter
 from curobo.motion_planner import MotionPlanner, MotionPlannerCfg
 from curobo.types import CameraObservation, Pose
 from curobo.types import JointState as CuRoboJointState, GoalToolPose
@@ -116,6 +116,14 @@ class LiveVizNode(Node):
         # so CameraObservation needs an rgb_image even for depth-only mapping.
         self._dummy_rgb = torch.zeros(
             (2, 480, 640, 3), dtype=torch.uint8, device='cuda')
+
+        # Mask the robot's own body out of depth before integrating, so the
+        # ESDF never marks the arm itself as an obstacle. The segmenter
+        # projects the robot's collision spheres into the camera using the
+        # current joint state.
+        self._segmenter = RobotSegmenter.from_robot_file(
+            UR5_CONFIG, distance_threshold=0.05, use_cuda_graph=False)
+
         self._plan_thread: Optional[threading.Thread] = None
 
         # Gazebo realsense plugin publishes camera streams with BEST_EFFORT
@@ -190,6 +198,34 @@ class LiveVizNode(Node):
             np.array([t.x, t.y, t.z], dtype=np.float32),
             np.array([r.w, r.x, r.y, r.z], dtype=np.float32),
         )
+
+        # Mask out pixels that hit the robot itself (otherwise the ESDF
+        # marks the arm as an obstacle and the planner refuses every
+        # config). Skip if /joint_states hasn't arrived yet.
+        with self._state.lock:
+            js = self._state.latest_joints
+        if js is not None:
+            by_name = dict(zip(js.name, js.position))
+            ordered = [by_name[n] for n in JOINT_NAMES if n in by_name]
+            if len(ordered) == len(JOINT_NAMES):
+                cam_obs_single = CameraObservation(
+                    rgb_image=self._dummy_rgb[:1],   # (1, H, W, 3)
+                    depth_image=depth.unsqueeze(0),  # (1, H, W)
+                    intrinsics=K.unsqueeze(0),       # (1, 3, 3)
+                    pose=pose,
+                )
+                seg_js = CuRoboJointState.from_position(
+                    torch.tensor([ordered], dtype=torch.float32, device='cuda'),
+                    joint_names=JOINT_NAMES)
+                try:
+                    _, depth_masked = self._segmenter.get_robot_mask_from_active_js(
+                        cam_obs_single, seg_js)
+                    depth = depth_masked[0]
+                except Exception as exc:
+                    self.get_logger().warning(
+                        f'RobotSegmenter failed for {cam_id}: '
+                        f'{type(exc).__name__}: {exc}',
+                        throttle_duration_sec=5.0)
 
         # Unproject depth to XYZ in camera frame, then transform to world
         # frame for viser display. (Mapper does its own transform internally
