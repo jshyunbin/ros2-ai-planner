@@ -2,11 +2,11 @@ import threading
 
 # Light-weight ROS2 message types (always available in ROS2 environment)
 try:
-    from sensor_msgs.msg import Image, CameraInfo
+    from sensor_msgs.msg import Image, CameraInfo, JointState
     from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
     from builtin_interfaces.msg import Duration as RosDuration
 except ImportError:
-    Image = CameraInfo = JointTrajectory = JointTrajectoryPoint = RosDuration = None
+    Image = CameraInfo = JointState = JointTrajectory = JointTrajectoryPoint = RosDuration = None
 
 # Heavy deps — imported lazily so tests can mock them via patch.multiple
 try:
@@ -17,10 +17,16 @@ try:
     from rclpy.time import Time
     from tf2_ros import Buffer, TransformListener, LookupException, ExtrapolationException
     from cv_bridge import CvBridge
-    from curobo.perception import Mapper, MapperCfg, FilterDepth
+    from curobo.perception import Mapper, MapperCfg, FilterDepth, RobotSegmenter
     from curobo.motion_planner import MotionPlanner, MotionPlannerCfg
     from curobo.types import CameraObservation, Pose, JointState as CuRoboJointState, GoalToolPose
     from curobo._src.geom.types import SceneCfg, VoxelGrid
+    # RobotSegmenter.from_robot_file does not forward ops_dtype to __init__,
+    # so build Kinematics ourselves to override the default (bfloat16) which
+    # mismatches the float32 robot_spheres tensor at runtime.
+    from curobo._src.robot.kinematics.kinematics import Kinematics
+    from curobo._src.types.robot import RobotCfg
+    from curobo._src.util_file import get_robot_configs_path, join_path, load_yaml
     _HEAVY_DEPS_AVAILABLE = True
 except ImportError:
     _HEAVY_DEPS_AVAILABLE = False
@@ -43,6 +49,12 @@ except ImportError:
     Mapper = _make_mock_class()
     MapperCfg = _make_mock_class()
     FilterDepth = _make_mock_class()
+    RobotSegmenter = _make_mock_class()
+    Kinematics = _make_mock_class()
+    RobotCfg = _make_mock_class()
+    get_robot_configs_path = _mock.MagicMock(return_value='')
+    join_path = _mock.MagicMock(return_value='')
+    load_yaml = _mock.MagicMock(return_value={})
     MotionPlanner = _make_mock_class()
     MotionPlannerCfg = _make_mock_class()
     # Types used inside methods
@@ -76,6 +88,10 @@ WRIST_FRAME    = 'wrist_camera_color_optical_frame'
 WORLD_FRAME    = 'world'
 MIN_FRAMES     = 5
 UR5_CONFIG     = '/ros2_ws/src/pipeline_orchestrator/config/ur5_curobo.yml'
+JOINT_NAMES    = [
+    'shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint',
+    'wrist_1_joint', 'wrist_2_joint', 'wrist_3_joint',
+]
 
 
 class CuRobo:
@@ -90,6 +106,7 @@ class CuRobo:
         self._cam_depth: dict = {}
         self._cam_intrinsics: dict = {}
         self._cam_pose: dict = {}
+        self._latest_joints = None   # sensor_msgs/JointState; needed by segmenter
 
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, node)
@@ -102,7 +119,10 @@ class CuRobo:
             truncation_distance=0.1,
             depth_minimum_distance=0.15,
             depth_maximum_distance=2.0,
-            decay_factor=1.0,
+            # 1.0 = cuRobo default, fine for offline static datasets, but for
+            # live noisy depth (Gazebo RealSense) it pins every noisy pixel
+            # in forever. 0.95 fades stale single-view noise over ~14 frames.
+            decay_factor=0.95,
             frustum_decay_factor=1.0,
             enable_static=False,
             num_cameras=2,
@@ -114,6 +134,23 @@ class CuRobo:
             flying_pixel_threshold=0.5,
             bilateral_kernel_size=3,
         )
+        # cuRobo's TSDF integrator unconditionally calls rgb_image.reshape(),
+        # so CameraObservation needs an rgb_image even for depth-only mapping.
+        self._dummy_rgb = torch.zeros(
+            (2, 480, 640, 3), dtype=torch.uint8, device='cuda')
+
+        # Mask the robot's own body out of depth before integrating, so the
+        # ESDF never marks the arm itself as an obstacle. Build Kinematics
+        # manually to force ops_dtype=float32 -- the from_robot_file factory
+        # leaves it at bfloat16 default which mismatches robot_spheres.
+        robot_yaml = load_yaml(join_path(get_robot_configs_path(), UR5_CONFIG))
+        robot_cfg = RobotCfg.create(robot_yaml)
+        self._segmenter = RobotSegmenter(
+            Kinematics(robot_cfg.kinematics),
+            distance_threshold=0.05,
+            use_cuda_graph=False,
+            ops_dtype=torch.float32,
+        )
 
         node.create_subscription(Image, OVERHEAD_DEPTH_TOPIC,
                                   lambda msg: self._on_depth(msg, 'overhead', OVERHEAD_FRAME), 10)
@@ -123,9 +160,14 @@ class CuRobo:
                                   lambda msg: self._on_depth(msg, 'wrist', WRIST_FRAME), 10)
         node.create_subscription(CameraInfo, WRIST_INFO_TOPIC,
                                   lambda msg: self._on_info(msg, 'wrist'), 1)
+        node.create_subscription(JointState, '/joint_states', self._on_joints, 10)
 
         self._planner = self._build_planner()
         self._logger.info('CuRobo: ready.')
+
+    def _on_joints(self, msg):
+        with self._lock:
+            self._latest_joints = msg
 
     def _on_info(self, msg, cam_id: str):
         K = torch.tensor([
@@ -165,6 +207,39 @@ class CuRobo:
             np.array([r.w, r.x, r.y, r.z], dtype=np.float32),
         )
 
+        # Mask out pixels that hit the robot itself; otherwise the ESDF marks
+        # the arm/gripper as obstacles and the planner refuses every config.
+        # Skip silently if /joint_states hasn't arrived yet.
+        with self._lock:
+            js = self._latest_joints
+        if js is not None:
+            by_name = dict(zip(js.name, js.position))
+            ordered = [by_name[n] for n in JOINT_NAMES if n in by_name]
+            if len(ordered) == len(JOINT_NAMES):
+                cam_obs_single = CameraObservation(
+                    rgb_image=self._dummy_rgb[:1],
+                    depth_image=depth.unsqueeze(0),
+                    intrinsics=K.unsqueeze(0),
+                    pose=pose,
+                    # depth is already in metres; override the mm-default.
+                    depth_to_meter=1.0,
+                )
+                seg_js = CuRoboJointState.from_position(
+                    torch.tensor([ordered], dtype=torch.float32, device='cuda'),
+                    joint_names=JOINT_NAMES)
+                try:
+                    _, depth_masked = self._segmenter.get_robot_mask_from_active_js(
+                        cam_obs_single, seg_js)
+                    depth = depth_masked[0]
+                    # Flush segmenter ops before downstream Mapper kernels;
+                    # otherwise their async work can poison a later CUDA
+                    # graph capture in compute_esdf.
+                    torch.cuda.synchronize()
+                except Exception as exc:
+                    self._logger.warning(
+                        f'CuRobo: RobotSegmenter failed for {cam_id}: '
+                        f'{type(exc).__name__}: {exc}')
+
         with self._lock:
             self._cam_depth[cam_id] = depth
             self._cam_pose[cam_id] = pose
@@ -172,6 +247,7 @@ class CuRobo:
             ready = ('overhead' in self._cam_depth and 'wrist' in self._cam_depth)
             if ready:
                 batched = CameraObservation(
+                    rgb_image=self._dummy_rgb,
                     depth_image=torch.stack([
                         self._cam_depth['overhead'],
                         self._cam_depth['wrist'],
@@ -190,6 +266,9 @@ class CuRobo:
                             self._cam_pose['wrist'].quaternion,
                         ]),
                     ),
+                    # depth is already in metres; override the mm-default so
+                    # the TSDF integrator doesn't scale every depth by 0.001.
+                    depth_to_meter=1.0,
                 )
 
         if ready:
@@ -202,6 +281,10 @@ class CuRobo:
             frame_count = self._frame_count
 
         if frame_count >= MIN_FRAMES:
+            # Sync first so any pending Warp/segmenter ops complete before
+            # compute_esdf opens its CUDA graph capture; an error queued on a
+            # different stream otherwise invalidates the capture (Warp 901).
+            torch.cuda.synchronize()
             voxel_grid = self._mapper.compute_esdf()
             self._planner.update_world(SceneCfg(voxel=[voxel_grid]))
         else:
