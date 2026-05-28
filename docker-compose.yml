@@ -14,6 +14,14 @@ services:
     volumes:
       - ./src:/ros2_ws/src
       - ./config:/ros2_ws/config:ro
+      # Robotiq 85 meshes — needed so viser can load the full robot URDF
+      # received from /robot_description (which uses package://robotiq_85_description).
+      - /media/sunho/data/hyunbin/cs477_ws/install/robotiq_85_description/share/robotiq_85_description:/opt/ros/humble/share/robotiq_85_description:ro
+      # The /robot_description URDF published by Gazebo contains absolute
+      # host file:// paths to UR5 / gripper / realsense meshes inside the
+      # cs477_ws install tree. Mount the whole workspace (read-only) so that
+      # the symlinks in install/.../meshes/ resolve to their src/ targets.
+      - /media/sunho/data/hyunbin/cs477_ws:/media/sunho/data/hyunbin/cs477_ws:ro
     ipc: host
     stdin_open: true
     tty: true

@@ -50,39 +50,61 @@ def depth_to_xyz(depth_m: torch.Tensor, K: torch.Tensor) -> torch.Tensor:
 def esdf_to_points(voxel_grid: object) -> np.ndarray:
     """Extract occupied voxel centres from a cuRobo ESDF VoxelGrid.
 
-    A voxel is "occupied" when its ESDF value is < 0 (strictly inside
-    an obstacle; the zero surface is treated as free to avoid noise).
+    cuRobo's nvblox ESDF stores **inverted** signed distance:
+      - positive  → inside an obstacle (penetration depth)
+      - zero      → on the surface
+      - negative  → free space (distance to nearest obstacle)
+
+    A voxel is occupied when ``feature_tensor > -0.5 * voxel_size`` —
+    matching cuRobo's internal collision threshold (see VoxelGrid
+    .get_occupied_voxels in curobo._src.geom.types).
 
     Args:
-        voxel_grid: cuRobo VoxelGrid, or any duck-typed object with
-                    ``esdf_tensor`` (X, Y, Z) CUDA tensor,
-                    ``origin`` (3,) tensor, and ``voxel_size`` scalar.
+        voxel_grid: cuRobo VoxelGrid with ``feature_tensor`` (nx, ny, nz)
+                    CUDA tensor, ``pose`` (7,) list (xyz + wxyz at centre),
+                    ``dims`` (3,) list (metres), and ``voxel_size`` scalar.
 
     Returns:
         (M, 3) float32 numpy array of world-frame XYZ voxel centres.
-        Returns shape (0, 3) on failure or when the grid is entirely free.
+        Returns shape (0, 3) when the grid is entirely free or unreadable.
     """
     try:
-        esdf: torch.Tensor = voxel_grid.esdf_tensor   # (X, Y, Z)
-        occupied = esdf < 0.0
+        feat: torch.Tensor = voxel_grid.feature_tensor   # (nx, ny, nz)
+        if feat is None:
+            return np.zeros((0, 3), dtype=np.float32)
+        vsize = float(voxel_grid.voxel_size)
+        threshold = -0.5 * vsize
+        occupied = feat > threshold
         if not occupied.any():
             return np.zeros((0, 3), dtype=np.float32)
 
-        origin  = voxel_grid.origin.cpu().numpy()     # (3,)
-        vsize   = float(voxel_grid.voxel_size)
+        # Pose is at grid centre; origin = bottom-left-front corner.
+        pose_xyz = np.asarray(voxel_grid.pose[:3], dtype=np.float32)
+        dims     = np.asarray(voxel_grid.dims,     dtype=np.float32)
+        origin   = pose_xyz - dims / 2.0
+
         indices = torch.argwhere(occupied).float().cpu().numpy()  # (M, 3)
-        centres = origin + indices * vsize + vsize / 2.0
+        centres = origin + (indices + 0.5) * vsize
         return centres.astype(np.float32)
     except Exception:
         return np.zeros((0, 3), dtype=np.float32)
 
 
+def _rewrite_package_uris(content: str) -> str:
+    """Rewrite URDF mesh URIs to plain absolute paths.
+
+    Handles two schemes seen in published URDFs:
+      - ``package://<pkg>/...`` → ``/opt/ros/humble/share/<pkg>/...``
+      - ``file:///...``         → ``/...``  (strip scheme; yourdfpy chokes on file://)
+    """
+    import re
+    content = re.sub(r'package://([^/"]+)', r'/opt/ros/humble/share/\1', content)
+    content = content.replace('file://', '')
+    return content
+
+
 def resolve_urdf(urdf_path: str) -> Path:
     """Rewrite ``package://`` URIs to absolute paths; return a temp file path.
-
-    viser's URDF loader does not handle ROS2 package URIs. This rewrites
-    ``package://ur_description`` to the absolute ROS2 share directory and
-    writes the result to a temp file that persists for the session.
 
     Args:
         urdf_path: Absolute path to the URDF file (may contain package:// URIs).
@@ -90,12 +112,27 @@ def resolve_urdf(urdf_path: str) -> Path:
     Returns:
         Path to a temp URDF file with all URIs resolved.
     """
-    pkg_root = '/opt/ros/humble/share'
     with open(urdf_path) as f:
         content = f.read()
-    content = content.replace(
-        'package://ur_description', f'{pkg_root}/ur_description')
     tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.urdf', delete=False)
-    tmp.write(content)
+    tmp.write(_rewrite_package_uris(content))
+    tmp.close()
+    return Path(tmp.name)
+
+
+def resolve_urdf_string(content: str) -> Path:
+    """Rewrite ``package://`` URIs in a URDF string; write to a temp file.
+
+    Designed for use with the ``/robot_description`` ROS2 topic which
+    publishes the full robot URDF as a string.
+
+    Args:
+        content: Raw URDF XML string (may contain package:// URIs).
+
+    Returns:
+        Path to a temp URDF file with all URIs resolved.
+    """
+    tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.urdf', delete=False)
+    tmp.write(_rewrite_package_uris(content))
     tmp.close()
     return Path(tmp.name)

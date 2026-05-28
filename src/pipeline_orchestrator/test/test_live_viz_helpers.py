@@ -65,33 +65,35 @@ def test_depth_to_xyz_centre_pixel():
 
 
 def test_esdf_to_points_extracts_occupied():
-    """Voxels with ESDF ≤ 0 are occupied; their centres should be returned."""
+    """Voxels with feature > -0.5*vsize are occupied (inverted SDF)."""
     from pipeline_orchestrator.live_viz_helpers import esdf_to_points
 
-    esdf = torch.zeros(2, 2, 2, dtype=torch.float32)
-    esdf[0, 0, 0] = -0.1   # occupied
-    esdf[1, 0, 0] =  0.1   # free
+    # voxel_size=0.1 → threshold = -0.05
+    feat = torch.full((2, 2, 2), -1.0, dtype=torch.float32)
+    feat[1, 0, 0] = 0.1   # occupied (positive = inside obstacle)
 
     vg = types.SimpleNamespace(
-        esdf_tensor=esdf,
-        origin=torch.tensor([0.0, 0.0, 0.0]),
+        feature_tensor=feat,
+        pose=[0.1, 0.1, 0.1, 1.0, 0.0, 0.0, 0.0],  # centre of a 0.2³ grid
+        dims=[0.2, 0.2, 0.2],
         voxel_size=0.1,
     )
 
     pts = esdf_to_points(vg)
 
     assert pts.shape == (1, 3)
-    # centre of voxel index (0,0,0): origin + 0*size + size/2 = 0.05
-    np.testing.assert_allclose(pts[0], [0.05, 0.05, 0.05], atol=1e-6)
+    # origin = pose_xyz - dims/2 = (0, 0, 0); voxel (1,0,0) centre = (0.15, 0.05, 0.05)
+    np.testing.assert_allclose(pts[0], [0.15, 0.05, 0.05], atol=1e-6)
 
 
 def test_esdf_to_points_all_free():
-    """Grid with all positive ESDF values should return empty (0, 3) array."""
+    """Grid with all very-negative ESDF values should return empty array."""
     from pipeline_orchestrator.live_viz_helpers import esdf_to_points
 
     vg = types.SimpleNamespace(
-        esdf_tensor=torch.ones(2, 2, 2, dtype=torch.float32),
-        origin=torch.tensor([0.0, 0.0, 0.0]),
+        feature_tensor=torch.full((2, 2, 2), -1.0, dtype=torch.float32),
+        pose=[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+        dims=[0.2, 0.2, 0.2],
         voxel_size=0.1,
     )
 
@@ -121,12 +123,17 @@ def test_live_viz_script_constants(monkeypatch):
 
     # Stub every heavy dep so we don't need a live ROS2/CUDA context
     stubs = [
-        'rclpy', 'rclpy.node', 'rclpy.duration', 'rclpy.time',
+        'rclpy', 'rclpy.node', 'rclpy.duration', 'rclpy.time', 'rclpy.qos',
         'sensor_msgs', 'sensor_msgs.msg',
+        'std_msgs', 'std_msgs.msg',
         'tf2_ros', 'cv_bridge', 'viser', 'viser.extras', 'warp',
         'curobo', 'curobo.perception', 'curobo.motion_planner',
         'curobo.types', 'curobo._src', 'curobo._src.geom',
         'curobo._src.geom.types',
+        'curobo._src.robot', 'curobo._src.robot.kinematics',
+        'curobo._src.robot.kinematics.kinematics',
+        'curobo._src.types', 'curobo._src.types.robot',
+        'curobo._src.util_file',
     ]
     for name in stubs:
         if name not in sys.modules:

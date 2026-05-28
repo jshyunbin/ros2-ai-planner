@@ -21,11 +21,15 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, Image
 from sensor_msgs.msg import JointState
+from std_msgs.msg import String
 from tf2_ros import Buffer, TransformListener
 import rclpy.duration
-from rclpy.time import Time
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import (
+    qos_profile_sensor_data, QoSProfile,
+    QoSDurabilityPolicy, QoSReliabilityPolicy, QoSHistoryPolicy,
+)
 from cv_bridge import CvBridge
+from pathlib import Path
 import viser
 
 from curobo.perception import FilterDepth, Mapper, MapperCfg, RobotSegmenter
@@ -44,6 +48,7 @@ from pipeline_orchestrator.live_viz_helpers import (
     depth_to_xyz,
     esdf_to_points,
     resolve_urdf,
+    resolve_urdf_string,
 )
 
 # ── constants ─────────────────────────────────────────────────────────────────
@@ -81,12 +86,13 @@ class SharedState:
     CUDA graph capture and a concurrent .cpu() in another thread would
     invalidate the capture (cudaErrorStreamCaptureUnsupported).
     """
-    lock:          threading.Lock                    = field(default_factory=threading.Lock)
-    point_clouds:  Dict[str, Optional[np.ndarray]]   = field(default_factory=dict)
-    esdf_points:   Optional[np.ndarray]              = None   # (M, 3) occupied voxel centres
-    traj:          Optional[np.ndarray]              = None   # (T, J) float32
-    frame_count:   int                               = 0
-    latest_joints: Optional[object]                  = None   # sensor_msgs/JointState
+    lock:            threading.Lock                    = field(default_factory=threading.Lock)
+    point_clouds:    Dict[str, Optional[np.ndarray]]   = field(default_factory=dict)
+    esdf_points:     Optional[np.ndarray]              = None   # (M, 3) occupied voxel centres
+    traj:            Optional[np.ndarray]              = None   # (T, J) float32
+    frame_count:     int                               = 0
+    latest_joints:   Optional[object]                  = None   # sensor_msgs/JointState
+    robot_desc_path: Optional[Path]                    = None   # resolved full URDF (UR5+gripper)
 
 
 # ── ROS2 node ─────────────────────────────────────────────────────────────────
@@ -168,6 +174,19 @@ class LiveVizNode(Node):
         self.create_subscription(
             JointState, '/joint_states', self._on_joints, 10)
 
+        # Subscribe to /robot_description to get the full URDF (UR5 + Robotiq
+        # gripper). TRANSIENT_LOCAL so the latched message arrives even though
+        # it was published before we subscribed.
+        _robot_desc_qos = QoSProfile(
+            depth=1,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            history=QoSHistoryPolicy.KEEP_LAST,
+        )
+        self.create_subscription(
+            String, '/robot_description', self._on_robot_description,
+            _robot_desc_qos)
+
         self.get_logger().info('LiveVizNode ready — waiting for depth frames.')
 
     # ── callbacks ─────────────────────────────────────────────────────────────
@@ -175,6 +194,16 @@ class LiveVizNode(Node):
     def _on_joints(self, msg: JointState) -> None:
         with self._state.lock:
             self._state.latest_joints = msg
+
+    def _on_robot_description(self, msg: String) -> None:
+        try:
+            path = resolve_urdf_string(msg.data)
+            with self._state.lock:
+                self._state.robot_desc_path = path
+            self.get_logger().info(f'robot_description resolved → {path}')
+        except Exception as exc:
+            self.get_logger().warning(
+                f'Failed to resolve /robot_description: {exc}')
 
     def _on_info(self, msg: CameraInfo, cam_id: str) -> None:
         K = torch.tensor([
@@ -269,9 +298,8 @@ class LiveVizNode(Node):
         xyz_world = xyz_cam @ R.T + t_vec
 
         # Cache per-camera data
-        self._cam_depth[cam_id]      = depth
-        self._cam_pose[cam_id]       = pose
-        self._cam_intrinsics[cam_id] = K
+        self._cam_depth[cam_id] = depth
+        self._cam_pose[cam_id]  = pose
 
         # Hand off to viser as numpy — keep CUDA ops out of update_loop.
         xyz_np = xyz_world.cpu().numpy()
@@ -340,6 +368,16 @@ class LiveVizNode(Node):
         # Extract occupied voxel centres as numpy here, on the producer
         # thread, so update_loop never touches a CUDA tensor.
         esdf_pts = esdf_to_points(voxel_grid)
+        ft = getattr(voxel_grid, 'feature_tensor', None)
+        if ft is not None:
+            self.get_logger().info(
+                f'ESDF: shape={tuple(ft.shape)} '
+                f'min={ft.min().item():.3f} max={ft.max().item():.3f} '
+                f'#>-0.025={(ft > -0.025).sum().item()} '
+                f'#>0={(ft > 0).sum().item()} '
+                f'extracted={len(esdf_pts)} pose={voxel_grid.pose[:3]} '
+                f'dims={voxel_grid.dims}',
+                throttle_duration_sec=5.0)
 
         with self._state.lock:
             self._state.esdf_points = esdf_pts
@@ -370,14 +408,15 @@ class LiveVizNode(Node):
                 torch.tensor([HOME_CFG], dtype=torch.float32, device='cuda'),
                 joint_names=JOINT_NAMES)
 
+        # GoalToolPose expects a 5-D shape (B, n_goals, n_grasps, n_envs, dim).
         goal = GoalToolPose(
             tool_frames=self._planner.tool_frames,
             position=torch.tensor(
-                [[[[[GOAL_XYZ[0], GOAL_XYZ[1], GOAL_XYZ[2]]]]]], device='cuda',
-                dtype=torch.float32),
+                GOAL_XYZ, device='cuda', dtype=torch.float32
+            ).view(1, 1, 1, 1, 3),
             quaternion=torch.tensor(
-                [[[[[GOAL_QUAT[0], GOAL_QUAT[1], GOAL_QUAT[2], GOAL_QUAT[3]]]]]], device='cuda',
-                dtype=torch.float32),
+                GOAL_QUAT, device='cuda', dtype=torch.float32
+            ).view(1, 1, 1, 1, 4),
         )
 
         result = self._planner.plan_pose(goal, start)
@@ -413,7 +452,7 @@ def update_loop(
     Reads lock-protected SharedState and updates:
       - /depth/overhead, /depth/wrist   — live point clouds
       - /esdf/voxels                    — occupied ESDF voxels
-      - /ur5 robot joints               — animated trajectory
+      - /robot joints                   — animated trajectory + live mirror
       - /status label                   — frame count and status text
 
     Loops forever; raise KeyboardInterrupt to exit.
@@ -468,17 +507,24 @@ def update_loop(
         if robot is not None:
             if traj is not None and len(traj) > 0:
                 waypoint = traj[traj_idx % len(traj)]
-                robot.update_cfg(dict(zip(JOINT_NAMES, waypoint.tolist())))
+                cfg = dict(zip(JOINT_NAMES, waypoint.tolist()))
+                # Also mirror live gripper joints (not in the plan) so fingers
+                # render at their actual position rather than the URDF default.
+                if latest_js is not None:
+                    by_name = dict(zip(latest_js.name, latest_js.position))
+                    cfg.update({n: v for n, v in by_name.items()
+                                if n not in cfg})
+                robot.update_cfg(cfg)
                 traj_idx += 1
                 if traj_idx >= len(traj):
                     traj_idx = 0
                     time.sleep(1.0)   # brief pause before replaying
             elif latest_js is not None:
-                # Index /joint_states by name; only update joints we know.
+                # Mirror all live joints — ViserUrdf silently ignores any
+                # joints that don't exist in the loaded URDF.
                 by_name = dict(zip(latest_js.name, latest_js.position))
-                cfg = {n: by_name[n] for n in JOINT_NAMES if n in by_name}
-                if cfg:
-                    robot.update_cfg(cfg)
+                if by_name:
+                    robot.update_cfg(by_name)
 
         elapsed = time.time() - t0
         time.sleep(max(0.0, period - elapsed))
@@ -540,12 +586,28 @@ def main() -> None:
     server.scene.add_icosphere(
         '/target', radius=0.03, color=(255, 80, 80), position=GOAL_XYZ)
 
+    # Wait up to 5 s for /robot_description (TRANSIENT_LOCAL — should arrive
+    # within the first spin_once). Fall back to the baked UR5-only URDF.
+    print('  Waiting for /robot_description (up to 5 s)…')
+    for _ in range(50):
+        with state.lock:
+            robot_desc_path = state.robot_desc_path
+        if robot_desc_path is not None:
+            break
+        time.sleep(0.1)
+    if robot_desc_path is not None:
+        print('  Full robot URDF received (UR5 + gripper).')
+        urdf_source = robot_desc_path
+    else:
+        print('  /robot_description not received; falling back to UR5-only URDF.')
+        urdf_source = resolve_urdf(URDF_PATH)
+
     try:
         from viser.extras import ViserUrdf
         robot = ViserUrdf(
             server,
-            urdf_or_path=resolve_urdf(URDF_PATH),
-            root_node_name='/ur5',
+            urdf_or_path=urdf_source,
+            root_node_name='/robot',
         )
         print('  Robot model loaded.')
     except Exception as exc:
