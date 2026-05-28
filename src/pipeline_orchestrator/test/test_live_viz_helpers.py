@@ -65,10 +65,9 @@ def test_depth_to_xyz_centre_pixel():
 
 
 def test_esdf_to_points_extracts_occupied():
-    """Voxels with feature < 0.5*vsize are obstacles (cuRobo convention: negative = inside)."""
+    """Voxels with feature < 0 are obstacles (cuRobo convention: negative = inside)."""
     from pipeline_orchestrator.live_viz_helpers import esdf_to_points
 
-    # voxel_size=0.1 → threshold = 0.05; only voxels with feat<0.05 are obstacle
     feat = torch.full((2, 2, 2), 1.0, dtype=torch.float32)   # all free space
     feat[1, 0, 0] = -0.1   # obstacle (negative = inside obstacle)
 
@@ -84,6 +83,35 @@ def test_esdf_to_points_extracts_occupied():
     assert pts.shape == (1, 3)
     # origin = pose_xyz - dims/2 = (0, 0, 0); voxel (1,0,0) centre = (0.15, 0.05, 0.05)
     np.testing.assert_allclose(pts[0], [0.15, 0.05, 0.05], atol=1e-6)
+
+
+def test_esdf_to_points_includes_surface_excludes_positive():
+    """Surface (feat==0) and interior (feat<0) extracted; small/large positives excluded.
+
+    Models the live ESDF distribution observed in nvblox: most voxels sit in
+    a small (0, voxel_size) band (these are *not* obstacles), observed
+    surfaces land at exactly 0, and the interior is rare. The filter must
+    grab surface+interior without sucking in the small-positive band.
+    """
+    from pipeline_orchestrator.live_viz_helpers import esdf_to_points
+
+    feat = torch.tensor(
+        [[[ 0.0, 0.001], [ 0.02,  5.0]],
+         [[-0.1, -0.01], [ 0.0,   0.024]]],
+        dtype=torch.float32,
+    )
+    # Obstacle voxels: feat[1,0,0]=-0.1, feat[1,0,1]=-0.01, feat[0,0,0]=0, feat[1,1,0]=0
+
+    vg = types.SimpleNamespace(
+        feature_tensor=feat,
+        pose=[0.1, 0.1, 0.1, 1.0, 0.0, 0.0, 0.0],
+        dims=[0.2, 0.2, 0.2],
+        voxel_size=0.1,
+    )
+
+    pts = esdf_to_points(vg)
+
+    assert pts.shape == (4, 3)
 
 
 def test_esdf_to_points_all_free():

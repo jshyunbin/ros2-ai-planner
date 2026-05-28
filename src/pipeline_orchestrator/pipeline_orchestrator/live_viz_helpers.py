@@ -55,9 +55,13 @@ def esdf_to_points(voxel_grid: object) -> np.ndarray:
       - zero      → on the surface
       - positive  → free space (distance to nearest obstacle)
 
-    A voxel is treated as obstacle when ``feature_tensor < 0.5 * voxel_size``,
-    i.e. the surface band plus the interior. Unobserved voxels carry a large
-    positive sentinel and are therefore excluded.
+    A voxel is treated as obstacle when ``feature_tensor <= 0``. Empirically
+    the entire grid sits in a thin (0, voxel_size) band of small positive
+    distances just outside observed surfaces, so ``< voxel_size * 0.5`` is
+    too loose and grabs ~all voxels; ``< 0`` is too strict and only picks
+    penetration interior (rare for thin obstacles). Observed surfaces land
+    at exactly 0 in cuRobo's ESDF, and unobserved voxels get a positive
+    sentinel (e.g. ~5.0), so ``<= 0`` gives the obstacle shell we want.
 
     Args:
         voxel_grid: cuRobo VoxelGrid with ``feature_tensor`` (nx, ny, nz)
@@ -71,11 +75,10 @@ def esdf_to_points(voxel_grid: object) -> np.ndarray:
     feat: torch.Tensor = voxel_grid.feature_tensor   # (nx, ny, nz)
     if feat is None:
         return np.zeros((0, 3), dtype=np.float32)
-    vsize = float(voxel_grid.voxel_size)
-    threshold = 0.5 * vsize
-    occupied = feat < threshold
+    occupied = feat <= 0
     if not occupied.any():
         return np.zeros((0, 3), dtype=np.float32)
+    vsize = float(voxel_grid.voxel_size)
 
     # Pose is at grid centre; origin = bottom-left-front corner.
     pose_xyz = np.asarray(voxel_grid.pose[:3], dtype=np.float32)

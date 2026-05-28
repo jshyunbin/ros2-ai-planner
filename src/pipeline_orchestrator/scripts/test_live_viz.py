@@ -242,6 +242,11 @@ class LiveVizNode(Node):
         depth  = torch.nan_to_num(depth, nan=0.0)
         filtered, _ = self._depth_filter(depth.unsqueeze(0))
         depth  = filtered[0]
+        # Snapshot the pre-segmenter depth so the viser point cloud can show
+        # the camera POV including the robot/gripper. The downstream `depth`
+        # variable gets self-masked for ESDF integration; without this copy
+        # the live cloud would also lose those pixels.
+        depth_for_viz = depth.clone()
 
         # Camera pose in world frame (w, x, y, z quaternion convention)
         t = transform.transform.translation
@@ -285,10 +290,11 @@ class LiveVizNode(Node):
                         f'{type(exc).__name__}: {exc}',
                         throttle_duration_sec=5.0)
 
-        # Unproject depth to XYZ in camera frame, then transform to world
-        # frame for viser display. (Mapper does its own transform internally
-        # using the pose we pass, so its ESDF is independent of this.)
-        xyz_cam = depth_to_xyz(depth, K)
+        # Unproject the *unmasked* depth to XYZ in camera frame, then transform
+        # to world frame for viser display, so the camera POV shows the robot
+        # too. (Mapper does its own transform internally using the pose we
+        # pass, so its ESDF — built from the masked `depth` — is independent.)
+        xyz_cam = depth_to_xyz(depth_for_viz, K)
         qw, qx, qy, qz = float(r.w), float(r.x), float(r.y), float(r.z)
         R = torch.tensor([
             [1 - 2*(qy*qy + qz*qz), 2*(qx*qy - qw*qz),     2*(qx*qz + qw*qy)],
