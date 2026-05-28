@@ -48,16 +48,16 @@ def depth_to_xyz(depth_m: torch.Tensor, K: torch.Tensor) -> torch.Tensor:
 
 
 def esdf_to_points(voxel_grid: object) -> np.ndarray:
-    """Extract occupied voxel centres from a cuRobo ESDF VoxelGrid.
+    """Extract obstacle voxel centres from a cuRobo ESDF VoxelGrid.
 
-    cuRobo's nvblox ESDF stores **inverted** signed distance:
-      - positive  → inside an obstacle (penetration depth)
+    cuRobo's ESDF uses the standard signed-distance convention:
+      - negative  → inside an obstacle (penetration depth)
       - zero      → on the surface
-      - negative  → free space (distance to nearest obstacle)
+      - positive  → free space (distance to nearest obstacle)
 
-    A voxel is occupied when ``feature_tensor > -0.5 * voxel_size`` —
-    matching cuRobo's internal collision threshold (see VoxelGrid
-    .get_occupied_voxels in curobo._src.geom.types).
+    A voxel is treated as obstacle when ``feature_tensor < 0.5 * voxel_size``,
+    i.e. the surface band plus the interior. Unobserved voxels carry a large
+    positive sentinel and are therefore excluded.
 
     Args:
         voxel_grid: cuRobo VoxelGrid with ``feature_tensor`` (nx, ny, nz)
@@ -68,26 +68,23 @@ def esdf_to_points(voxel_grid: object) -> np.ndarray:
         (M, 3) float32 numpy array of world-frame XYZ voxel centres.
         Returns shape (0, 3) when the grid is entirely free or unreadable.
     """
-    try:
-        feat: torch.Tensor = voxel_grid.feature_tensor   # (nx, ny, nz)
-        if feat is None:
-            return np.zeros((0, 3), dtype=np.float32)
-        vsize = float(voxel_grid.voxel_size)
-        threshold = -0.5 * vsize
-        occupied = feat > threshold
-        if not occupied.any():
-            return np.zeros((0, 3), dtype=np.float32)
-
-        # Pose is at grid centre; origin = bottom-left-front corner.
-        pose_xyz = np.asarray(voxel_grid.pose[:3], dtype=np.float32)
-        dims     = np.asarray(voxel_grid.dims,     dtype=np.float32)
-        origin   = pose_xyz - dims / 2.0
-
-        indices = torch.argwhere(occupied).float().cpu().numpy()  # (M, 3)
-        centres = origin + (indices + 0.5) * vsize
-        return centres.astype(np.float32)
-    except Exception:
+    feat: torch.Tensor = voxel_grid.feature_tensor   # (nx, ny, nz)
+    if feat is None:
         return np.zeros((0, 3), dtype=np.float32)
+    vsize = float(voxel_grid.voxel_size)
+    threshold = 0.5 * vsize
+    occupied = feat < threshold
+    if not occupied.any():
+        return np.zeros((0, 3), dtype=np.float32)
+
+    # Pose is at grid centre; origin = bottom-left-front corner.
+    pose_xyz = np.asarray(voxel_grid.pose[:3], dtype=np.float32)
+    dims     = np.asarray(voxel_grid.dims,     dtype=np.float32)
+    origin   = pose_xyz - dims / 2.0
+
+    indices = torch.argwhere(occupied).float().cpu().numpy()  # (M, 3)
+    centres = origin + (indices + 0.5) * vsize
+    return centres.astype(np.float32)
 
 
 def _rewrite_package_uris(content: str) -> str:

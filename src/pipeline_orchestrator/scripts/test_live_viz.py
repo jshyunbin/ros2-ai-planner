@@ -265,6 +265,8 @@ class LiveVizNode(Node):
                     depth_image=depth.unsqueeze(0),  # (1, H, W)
                     intrinsics=K.unsqueeze(0),       # (1, 3, 3)
                     pose=pose,
+                    # depth is already in metres; override the mm-default.
+                    depth_to_meter=1.0,
                 )
                 seg_js = CuRoboJointState.from_position(
                     torch.tensor([ordered], dtype=torch.float32, device='cuda'),
@@ -330,6 +332,9 @@ class LiveVizNode(Node):
                     self._cam_pose['wrist'].quaternion,
                 ]),
             ),
+            # depth is already in metres; override the mm-default so the TSDF
+            # integrator doesn't scale every depth by 0.001.
+            depth_to_meter=1.0,
         )
         try:
             self._mapper.integrate(batched)

@@ -65,12 +65,12 @@ def test_depth_to_xyz_centre_pixel():
 
 
 def test_esdf_to_points_extracts_occupied():
-    """Voxels with feature > -0.5*vsize are occupied (inverted SDF)."""
+    """Voxels with feature < 0.5*vsize are obstacles (cuRobo convention: negative = inside)."""
     from pipeline_orchestrator.live_viz_helpers import esdf_to_points
 
-    # voxel_size=0.1 → threshold = -0.05
-    feat = torch.full((2, 2, 2), -1.0, dtype=torch.float32)
-    feat[1, 0, 0] = 0.1   # occupied (positive = inside obstacle)
+    # voxel_size=0.1 → threshold = 0.05; only voxels with feat<0.05 are obstacle
+    feat = torch.full((2, 2, 2), 1.0, dtype=torch.float32)   # all free space
+    feat[1, 0, 0] = -0.1   # obstacle (negative = inside obstacle)
 
     vg = types.SimpleNamespace(
         feature_tensor=feat,
@@ -87,11 +87,11 @@ def test_esdf_to_points_extracts_occupied():
 
 
 def test_esdf_to_points_all_free():
-    """Grid with all very-negative ESDF values should return empty array."""
+    """Grid with all large-positive ESDF values (free space sentinel) returns empty."""
     from pipeline_orchestrator.live_viz_helpers import esdf_to_points
 
     vg = types.SimpleNamespace(
-        feature_tensor=torch.full((2, 2, 2), -1.0, dtype=torch.float32),
+        feature_tensor=torch.full((2, 2, 2), 5.0, dtype=torch.float32),
         pose=[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
         dims=[0.2, 0.2, 0.2],
         voxel_size=0.1,
@@ -103,11 +103,16 @@ def test_esdf_to_points_all_free():
     assert pts.dtype == np.float32
 
 
-def test_esdf_to_points_malformed_object():
-    """Missing attributes on voxel_grid must return empty array, not raise."""
+def test_esdf_to_points_none_feature_returns_empty():
+    """A VoxelGrid whose feature_tensor is None returns an empty array, not a crash."""
     from pipeline_orchestrator.live_viz_helpers import esdf_to_points
 
-    vg = types.SimpleNamespace()   # no attributes at all
+    vg = types.SimpleNamespace(
+        feature_tensor=None,
+        pose=[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+        dims=[0.2, 0.2, 0.2],
+        voxel_size=0.1,
+    )
 
     pts = esdf_to_points(vg)
 
