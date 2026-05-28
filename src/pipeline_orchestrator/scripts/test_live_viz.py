@@ -29,6 +29,12 @@ from cv_bridge import CvBridge
 import viser
 
 from curobo.perception import FilterDepth, Mapper, MapperCfg, RobotSegmenter
+# RobotSegmenter.from_robot_file does not forward ops_dtype to __init__, so we
+# need to build the underlying Kinematics ourselves to override the default
+# (bfloat16) which mismatches the float32 robot_spheres tensor at runtime.
+from curobo._src.robot.kinematics.kinematics import Kinematics
+from curobo._src.types.robot import RobotCfg
+from curobo._src.util_file import get_robot_configs_path, join_path, load_yaml
 from curobo.motion_planner import MotionPlanner, MotionPlannerCfg
 from curobo.types import CameraObservation, Pose
 from curobo.types import JointState as CuRoboJointState, GoalToolPose
@@ -120,9 +126,18 @@ class LiveVizNode(Node):
         # Mask the robot's own body out of depth before integrating, so the
         # ESDF never marks the arm itself as an obstacle. The segmenter
         # projects the robot's collision spheres into the camera using the
-        # current joint state.
-        self._segmenter = RobotSegmenter.from_robot_file(
-            UR5_CONFIG, distance_threshold=0.05, use_cuda_graph=False)
+        # current joint state. Build manually so we can force
+        # ops_dtype=float32 — the from_robot_file factory leaves it at the
+        # bfloat16 default, which mismatches the float32 robot_spheres
+        # tensor and crashes the segmenter at runtime.
+        robot_yaml = load_yaml(join_path(get_robot_configs_path(), UR5_CONFIG))
+        robot_cfg = RobotCfg.create(robot_yaml)
+        self._segmenter = RobotSegmenter(
+            Kinematics(robot_cfg.kinematics),
+            distance_threshold=0.05,
+            use_cuda_graph=False,
+            ops_dtype=torch.float32,
+        )
 
         self._plan_thread: Optional[threading.Thread] = None
 
