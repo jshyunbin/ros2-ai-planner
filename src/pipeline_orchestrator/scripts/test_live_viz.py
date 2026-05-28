@@ -72,10 +72,18 @@ WORLD_FRAME          = 'world'
 # ── shared state ──────────────────────────────────────────────────────────────
 @dataclass
 class SharedState:
-    """Thread-safe container for data shared between ROS2 callbacks and viser."""
+    """Thread-safe container for data shared between ROS2 callbacks and viser.
+
+    All tensor data is converted to numpy by the producer (ROS callback /
+    replan thread) before being placed here, so the viser update_loop on
+    the main thread never has to call .cpu() — keeping CUDA ops confined
+    to a single thread, which is required because Mapper.compute_esdf uses
+    CUDA graph capture and a concurrent .cpu() in another thread would
+    invalidate the capture (cudaErrorStreamCaptureUnsupported).
+    """
     lock:          threading.Lock                    = field(default_factory=threading.Lock)
-    point_clouds:  Dict[str, Optional[torch.Tensor]] = field(default_factory=dict)
-    voxel_grid:    Optional[object]                  = None   # cuRobo VoxelGrid
+    point_clouds:  Dict[str, Optional[np.ndarray]]   = field(default_factory=dict)
+    esdf_points:   Optional[np.ndarray]              = None   # (M, 3) occupied voxel centres
     traj:          Optional[np.ndarray]              = None   # (T, J) float32
     frame_count:   int                               = 0
     latest_joints: Optional[object]                  = None   # sensor_msgs/JointState
@@ -258,15 +266,17 @@ class LiveVizNode(Node):
         ], dtype=torch.float32, device=xyz_cam.device)
         t_vec = torch.tensor(
             [t.x, t.y, t.z], dtype=torch.float32, device=xyz_cam.device)
-        xyz = xyz_cam @ R.T + t_vec
+        xyz_world = xyz_cam @ R.T + t_vec
 
         # Cache per-camera data
         self._cam_depth[cam_id]      = depth
         self._cam_pose[cam_id]       = pose
         self._cam_intrinsics[cam_id] = K
 
+        # Hand off to viser as numpy — keep CUDA ops out of update_loop.
+        xyz_np = xyz_world.cpu().numpy()
         with self._state.lock:
-            self._state.point_clouds[cam_id] = xyz
+            self._state.point_clouds[cam_id] = xyz_np
 
         # Integrate when both cameras have data
         if 'overhead' not in self._cam_depth or 'wrist' not in self._cam_depth:
@@ -327,8 +337,12 @@ class LiveVizNode(Node):
                 throttle_duration_sec=5.0)
             return
 
+        # Extract occupied voxel centres as numpy here, on the producer
+        # thread, so update_loop never touches a CUDA tensor.
+        esdf_pts = esdf_to_points(voxel_grid)
+
         with self._state.lock:
-            self._state.voxel_grid = voxel_grid
+            self._state.esdf_points = esdf_pts
             js = self._state.latest_joints
 
         # Slow GPU planning runs in a daemon thread so this callback returns fast.
@@ -412,7 +426,7 @@ def update_loop(
 
         with state.lock:
             clouds      = dict(state.point_clouds)   # shallow copy of dict
-            vg          = state.voxel_grid
+            esdf_pts    = state.esdf_points
             traj        = state.traj                  # None if no plan yet
             n_frames    = state.frame_count
             latest_js   = state.latest_joints
@@ -428,10 +442,9 @@ def update_loop(
         server.scene.add_label('/status', status_text, position=(0.0, 0.0, 1.6))
 
         # ── point clouds ──────────────────────────────────────────────────────
-        for cam_id, xyz in clouds.items():
-            if xyz is None or len(xyz) == 0:
+        for cam_id, pts in clouds.items():
+            if pts is None or len(pts) == 0:
                 continue
-            pts   = xyz.cpu().numpy()
             color = (200, 200, 200) if cam_id == 'overhead' else (100, 150, 255)
             server.scene.add_point_cloud(
                 f'/depth/{cam_id}',
@@ -441,15 +454,13 @@ def update_loop(
             )
 
         # ── ESDF voxels ───────────────────────────────────────────────────────
-        if vg is not None:
-            occ_pts = esdf_to_points(vg)
-            if len(occ_pts) > 0:
-                server.scene.add_point_cloud(
-                    '/esdf/voxels',
-                    points=occ_pts,
-                    colors=np.tile((220, 60, 60), (len(occ_pts), 1)).astype(np.uint8),
-                    point_size=0.02,
-                )
+        if esdf_pts is not None and len(esdf_pts) > 0:
+            server.scene.add_point_cloud(
+                '/esdf/voxels',
+                points=esdf_pts,
+                colors=np.tile((220, 60, 60), (len(esdf_pts), 1)).astype(np.uint8),
+                point_size=0.02,
+            )
 
         # ── robot pose ────────────────────────────────────────────────────────
         # With a successful plan: animate through traj waypoints.
