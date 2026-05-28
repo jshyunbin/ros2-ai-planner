@@ -277,10 +277,15 @@ class LiveVizNode(Node):
     def _run_plan(self, js) -> None:
         """Background thread: plan trajectory and store result in SharedState."""
         if js is not None:
+            # /joint_states includes the gripper (7 joints); the planner
+            # only knows the 6 UR5 joints. Extract those in the canonical
+            # order; fall back to HOME_CFG for any missing.
+            by_name = dict(zip(js.name, js.position))
+            ordered = [by_name.get(n, HOME_CFG[i])
+                       for i, n in enumerate(JOINT_NAMES)]
             start = CuRoboJointState.from_position(
-                torch.tensor(
-                    [list(js.position)], dtype=torch.float32, device='cuda'),
-                joint_names=list(js.name))
+                torch.tensor([ordered], dtype=torch.float32, device='cuda'),
+                joint_names=JOINT_NAMES)
         else:
             start = CuRoboJointState.from_position(
                 torch.tensor([HOME_CFG], dtype=torch.float32, device='cuda'),
