@@ -47,49 +47,6 @@ def depth_to_xyz(depth_m: torch.Tensor, K: torch.Tensor) -> torch.Tensor:
     return torch.stack([x, y, z], dim=-1)
 
 
-def esdf_to_points(voxel_grid: object) -> np.ndarray:
-    """Extract obstacle voxel centres from a cuRobo ESDF VoxelGrid.
-
-    cuRobo's ESDF uses the standard signed-distance convention:
-      - negative  → inside an obstacle (penetration depth)
-      - zero      → on the surface
-      - positive  → free space (distance to nearest obstacle)
-
-    A voxel is treated as obstacle when ``feature_tensor <= 0``. Empirically
-    the entire grid sits in a thin (0, voxel_size) band of small positive
-    distances just outside observed surfaces, so ``< voxel_size * 0.5`` is
-    too loose and grabs ~all voxels; ``< 0`` is too strict and only picks
-    penetration interior (rare for thin obstacles). Observed surfaces land
-    at exactly 0 in cuRobo's ESDF, and unobserved voxels get a positive
-    sentinel (e.g. ~5.0), so ``<= 0`` gives the obstacle shell we want.
-
-    Args:
-        voxel_grid: cuRobo VoxelGrid with ``feature_tensor`` (nx, ny, nz)
-                    CUDA tensor, ``pose`` (7,) list (xyz + wxyz at centre),
-                    ``dims`` (3,) list (metres), and ``voxel_size`` scalar.
-
-    Returns:
-        (M, 3) float32 numpy array of world-frame XYZ voxel centres.
-        Returns shape (0, 3) when the grid is entirely free or unreadable.
-    """
-    feat: torch.Tensor = voxel_grid.feature_tensor   # (nx, ny, nz)
-    if feat is None:
-        return np.zeros((0, 3), dtype=np.float32)
-    occupied = feat <= 0
-    if not occupied.any():
-        return np.zeros((0, 3), dtype=np.float32)
-    vsize = float(voxel_grid.voxel_size)
-
-    # Pose is at grid centre; origin = bottom-left-front corner.
-    pose_xyz = np.asarray(voxel_grid.pose[:3], dtype=np.float32)
-    dims     = np.asarray(voxel_grid.dims,     dtype=np.float32)
-    origin   = pose_xyz - dims / 2.0
-
-    indices = torch.argwhere(occupied).float().cpu().numpy()  # (M, 3)
-    centres = origin + (indices + 0.5) * vsize
-    return centres.astype(np.float32)
-
-
 def _rewrite_package_uris(content: str) -> str:
     """Rewrite URDF mesh URIs to plain absolute paths.
 

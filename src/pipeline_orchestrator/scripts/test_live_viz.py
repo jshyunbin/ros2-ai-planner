@@ -46,7 +46,6 @@ from curobo._src.geom.types import SceneCfg
 
 from pipeline_orchestrator.live_viz_helpers import (
     depth_to_xyz,
-    esdf_to_points,
     resolve_urdf,
     resolve_urdf_string,
 )
@@ -88,7 +87,7 @@ class SharedState:
     """
     lock:            threading.Lock                    = field(default_factory=threading.Lock)
     point_clouds:    Dict[str, Optional[np.ndarray]]   = field(default_factory=dict)
-    esdf_points:     Optional[np.ndarray]              = None   # (M, 3) occupied voxel centres
+    tsdf_centers:    Optional[np.ndarray]              = None   # (M, 3) reconstructed surface voxel centres
     traj:            Optional[np.ndarray]              = None   # (T, J) float32
     frame_count:     int                               = 0
     latest_joints:   Optional[object]                  = None   # sensor_msgs/JointState
@@ -120,7 +119,11 @@ class LiveVizNode(Node):
             truncation_distance=0.1,
             depth_minimum_distance=0.15,
             depth_maximum_distance=2.0,
-            decay_factor=1.0,
+            # decay < 1 makes the TSDF weight on existing voxels fade each
+            # frame, so stale single-view sensor noise doesn't accumulate
+            # forever. 0.95 ≈ half-life of ~14 frames; tune lower if bands
+            # still grow, higher if real obstacles flicker.
+            decay_factor=0.95,
             frustum_decay_factor=1.0,
             enable_static=False,
             num_cameras=2,
@@ -376,22 +379,22 @@ class LiveVizNode(Node):
                 throttle_duration_sec=5.0)
             return
 
-        # Extract occupied voxel centres as numpy here, on the producer
-        # thread, so update_loop never touches a CUDA tensor.
-        esdf_pts = esdf_to_points(voxel_grid)
-        ft = getattr(voxel_grid, 'feature_tensor', None)
-        if ft is not None:
-            self.get_logger().info(
-                f'ESDF: shape={tuple(ft.shape)} '
-                f'min={ft.min().item():.3f} max={ft.max().item():.3f} '
-                f'#>-0.025={(ft > -0.025).sum().item()} '
-                f'#>0={(ft > 0).sum().item()} '
-                f'extracted={len(esdf_pts)} pose={voxel_grid.pose[:3]} '
-                f'dims={voxel_grid.dims}',
+        # Extract the reconstructed TSDF surface voxels for viser display.
+        # This is the cuRobo-demo-style "coloured voxel cubes" view of the
+        # scene; we ignore the returned colors because we pass dummy RGB to
+        # the integrator, and shade by height in the update_loop instead.
+        try:
+            centers, _ = self._mapper.integrator.extract_occupied_voxels(
+                surface_only=True)
+            tsdf_np = centers.cpu().numpy() if centers is not None else None
+        except Exception as exc:
+            self.get_logger().warning(
+                f'extract_occupied_voxels failed: {type(exc).__name__}: {exc}',
                 throttle_duration_sec=5.0)
+            tsdf_np = None
 
         with self._state.lock:
-            self._state.esdf_points = esdf_pts
+            self._state.tsdf_centers = tsdf_np
             js = self._state.latest_joints
 
         # Slow GPU planning runs in a daemon thread so this callback returns fast.
@@ -462,7 +465,7 @@ def update_loop(
 
     Reads lock-protected SharedState and updates:
       - /depth/overhead, /depth/wrist   — live point clouds
-      - /esdf/voxels                    — occupied ESDF voxels
+      - /tsdf/voxels                    — reconstructed TSDF surface voxels
       - /robot joints                   — animated trajectory + live mirror
       - /status label                   — frame count and status text
 
@@ -476,7 +479,7 @@ def update_loop(
 
         with state.lock:
             clouds      = dict(state.point_clouds)   # shallow copy of dict
-            esdf_pts    = state.esdf_points
+            tsdf_pts    = state.tsdf_centers
             traj        = state.traj                  # None if no plan yet
             n_frames    = state.frame_count
             latest_js   = state.latest_joints
@@ -503,12 +506,21 @@ def update_loop(
                 point_size=0.005,
             )
 
-        # ── ESDF voxels ───────────────────────────────────────────────────────
-        if esdf_pts is not None and len(esdf_pts) > 0:
+        # ── TSDF surface voxels ───────────────────────────────────────────────
+        # cuRobo's reconstructed scene geometry. Shade by height for a viridis-
+        # ish gradient since we don't integrate real RGB into the TSDF.
+        if tsdf_pts is not None and len(tsdf_pts) > 0:
+            z = tsdf_pts[:, 2]
+            z_norm = np.clip((z - z.min()) / max(z.max() - z.min(), 1e-6), 0, 1)
+            colors = np.stack([
+                (255 * (1 - z_norm)).astype(np.uint8),     # red fades with height
+                (255 * z_norm).astype(np.uint8),           # green grows with height
+                np.full_like(z_norm, 120, dtype=np.uint8), # cyan tint
+            ], axis=1)
             server.scene.add_point_cloud(
-                '/esdf/voxels',
-                points=esdf_pts,
-                colors=np.tile((220, 60, 60), (len(esdf_pts), 1)).astype(np.uint8),
+                '/tsdf/voxels',
+                points=tsdf_pts,
+                colors=colors,
                 point_size=0.02,
             )
 
