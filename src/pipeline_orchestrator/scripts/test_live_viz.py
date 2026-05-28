@@ -236,6 +236,10 @@ class LiveVizNode(Node):
                     _, depth_masked = self._segmenter.get_robot_mask_from_active_js(
                         cam_obs_single, seg_js)
                     depth = depth_masked[0]
+                    # Flush segmenter ops before downstream Mapper kernels;
+                    # otherwise their async work can poison a later CUDA
+                    # graph capture in compute_esdf.
+                    torch.cuda.synchronize()
                 except Exception as exc:
                     self.get_logger().warning(
                         f'RobotSegmenter failed for {cam_id}: '
@@ -309,9 +313,19 @@ class LiveVizNode(Node):
     def _replan(self) -> None:
         """Compute a fresh ESDF synchronously, then plan in a background thread."""
         # ESDF update is fast — run on the callback thread so the mapper
-        # doesn't race with integrate() from the same thread.
-        voxel_grid = self._mapper.compute_esdf()
-        self._planner.update_world(SceneCfg(voxel=[voxel_grid]))
+        # doesn't race with integrate() from the same thread. Sync first so
+        # any pending Warp/segmenter ops complete before compute_esdf opens
+        # its CUDA graph capture; otherwise an error queued on a different
+        # stream invalidates the capture (Warp CUDA error 901).
+        torch.cuda.synchronize()
+        try:
+            voxel_grid = self._mapper.compute_esdf()
+            self._planner.update_world(SceneCfg(voxel=[voxel_grid]))
+        except Exception as exc:
+            self.get_logger().error(
+                f'compute_esdf/update_world failed: {type(exc).__name__}: {exc}',
+                throttle_duration_sec=5.0)
+            return
 
         with self._state.lock:
             self._state.voxel_grid = voxel_grid
