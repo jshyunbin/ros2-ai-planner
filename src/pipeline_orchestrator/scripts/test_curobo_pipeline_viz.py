@@ -12,8 +12,9 @@ motion-planning module:
                          also caches point clouds + surface voxels for viser).
   2. motion planning   — CuRobo.plan_trajectory(grasp_pose, joint_states)
                          returns a collision-free JointTrajectory to GOAL_XYZ.
-  3. action deployment — CuRobo.execute_trajectory(traj) sends the trajectory
-                         to /ur5_controller/follow_joint_trajectory.
+  3. action deployment — the harness (standing in for the orchestrator) sends
+                         the trajectory to /ur5_controller/follow_joint_trajectory.
+                         Deployment is the driver's job, not CuRobo's.
 
 viser renders the live clouds, reconstructed voxels, the planned trajectory
 (animated on the URDF) and the goal marker.
@@ -33,13 +34,17 @@ from typing import Optional
 
 import numpy as np
 import rclpy
+from rclpy.action import ActionClient
 from rclpy.node import Node
+from control_msgs.action import FollowJointTrajectory
+from sensor_msgs.msg import JointState
 
 from pipeline_orchestrator.curobo import CuRobo
 from pipeline_orchestrator.live_viz_helpers import resolve_urdf, resolve_urdf_string
 
 # ── constants ─────────────────────────────────────────────────────────────────
 URDF_PATH    = '/ur5.urdf'
+ARM_TRAJ_ACTION = '/ur5_controller/follow_joint_trajectory'
 JOINT_NAMES  = [
     'shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint',
     'wrist_1_joint', 'wrist_2_joint', 'wrist_3_joint',
@@ -96,9 +101,27 @@ def arm_joint_state(latest):
     return js
 
 
+# ── action deployment (the driver's job, not CuRobo's) ──────────────────────────
+
+def deploy_trajectory(arm_client, traj, timeout_sec: float = 2.0):
+    """Send a planned JointTrajectory to the UR5 arm controller.
+
+    Mirrors PipelineOrchestrator._execute_trajectory: CuRobo only plans, the
+    driver (here the harness, in production the orchestrator) deploys.
+    """
+    if traj is None or not traj.points:
+        return None
+    if not arm_client.wait_for_server(timeout_sec=timeout_sec):
+        print(f'  arm action server {ARM_TRAJ_ACTION} unavailable; plan-only.')
+        return None
+    goal = FollowJointTrajectory.Goal()
+    goal.trajectory = traj
+    return arm_client.send_goal_async(goal)
+
+
 # ── planning tick (runs on the ROS executor thread) ──────────────────────────────
 
-def make_plan_tick(curobo: CuRobo, state: SharedState):
+def make_plan_tick(curobo: CuRobo, state: SharedState, arm_client):
     """Build a timer callback that ping-pongs the arm: goal → home → goal …
 
     The first tick captures the robot's current end-effector pose (via FK) as
@@ -148,7 +171,7 @@ def make_plan_tick(curobo: CuRobo, state: SharedState):
             return
 
         arr = np.array([list(p.positions) for p in traj.points], dtype=np.float32)
-        future = curobo.execute_trajectory(traj)
+        future = deploy_trajectory(arm_client, traj)
 
         # Hold off the next leg until this trajectory's own duration elapses.
         last = traj.points[-1].time_from_start
@@ -267,6 +290,12 @@ def main() -> None:
     node = Node('curobo_pipeline_viz')
     curobo = CuRobo(node, enable_viz=True)
 
+    # The harness plays the orchestrator's role: it owns /joint_states (feeding
+    # CuRobo's robot segmenter) and the arm action client used to deploy plans.
+    node.create_subscription(
+        JointState, '/joint_states', curobo.update_joint_state, 10)
+    arm_client = ActionClient(node, FollowJointTrajectory, ARM_TRAJ_ACTION)
+
     # Grab the full robot URDF (UR5 + Robotiq gripper) so the gripper joints in
     # /joint_states resolve in viser. TRANSIENT_LOCAL: the latched message
     # arrives even though it was published before we subscribed. Create the
@@ -291,7 +320,7 @@ def main() -> None:
     # Plan + deploy from a timer on the executor thread so it's serialized with
     # the depth callbacks (shared CUDA stream — see make_plan_tick).
     state = SharedState()
-    node.create_timer(TICK_SEC, make_plan_tick(curobo, state))
+    node.create_timer(TICK_SEC, make_plan_tick(curobo, state, arm_client))
 
     spin_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
     spin_thread.start()

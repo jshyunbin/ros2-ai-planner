@@ -20,8 +20,7 @@ def make_curobo(enable_viz=False):
     with patch.multiple('pipeline_orchestrator.curobo',
                         Mapper=MagicMock(), FilterDepth=MagicMock(),
                         MotionPlanner=MagicMock(), Buffer=MagicMock(),
-                        TransformListener=MagicMock(),
-                        ActionClient=MagicMock()):
+                        TransformListener=MagicMock()):
         return CuRobo(node, enable_viz=enable_viz), node
 
 
@@ -66,35 +65,9 @@ def test_curobo_tool_pose_returns_none_on_fk_failure():
     assert curobo.tool_pose(js) is None
 
 
-# --- action deployment ---
-
-def test_curobo_execute_trajectory_sends_goal_to_arm_server():
-    from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
-    curobo, _ = make_curobo()
-    curobo._arm_client.wait_for_server.return_value = True
-
-    traj = JointTrajectory()
-    traj.joint_names = ['shoulder_pan_joint']
-    traj.points = [JointTrajectoryPoint()]
-
-    curobo.execute_trajectory(traj)
-
-    curobo._arm_client.send_goal_async.assert_called_once()
-    sent_goal = curobo._arm_client.send_goal_async.call_args.args[0]
-    assert list(sent_goal.trajectory.joint_names) == ['shoulder_pan_joint']
-
-
-def test_curobo_execute_trajectory_returns_none_when_server_unavailable():
-    from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
-    curobo, _ = make_curobo()
-    curobo._arm_client.wait_for_server.return_value = False
-
-    traj = JointTrajectory()
-    traj.points = [JointTrajectoryPoint()]
-    result = curobo.execute_trajectory(traj)
-
-    assert result is None
-    curobo._arm_client.send_goal_async.assert_not_called()
+# Action deployment moved to the orchestrator (it owns the arm/gripper action
+# clients and sequences pick-and-place); see test_orchestrator.py for those
+# tests. CuRobo only plans now.
 
 
 # --- viz script importability + constants ---

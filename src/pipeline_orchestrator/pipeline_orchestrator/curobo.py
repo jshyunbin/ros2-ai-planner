@@ -2,21 +2,13 @@ import threading
 
 # Light-weight ROS2 message types (always available in ROS2 environment)
 try:
-    from sensor_msgs.msg import Image, CameraInfo, JointState
+    from sensor_msgs.msg import Image, CameraInfo
     from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
     from builtin_interfaces.msg import Duration as RosDuration
-    from rclpy.action import ActionClient
     from rclpy.qos import qos_profile_sensor_data
 except ImportError:
-    Image = CameraInfo = JointState = JointTrajectory = JointTrajectoryPoint = RosDuration = None
-    ActionClient = qos_profile_sensor_data = None
-
-# control_msgs lives in its own block so a missing install can't silently null
-# out the core perception message types / QoS above.
-try:
-    from control_msgs.action import FollowJointTrajectory
-except ImportError:
-    FollowJointTrajectory = None
+    Image = CameraInfo = JointTrajectory = JointTrajectoryPoint = RosDuration = None
+    qos_profile_sensor_data = None
 
 # Heavy deps — imported lazily so tests can mock them via patch.multiple
 try:
@@ -97,7 +89,6 @@ OVERHEAD_FRAME = 'camera_color_optical_frame'
 WRIST_FRAME    = 'wrist_camera_color_optical_frame'
 WORLD_FRAME    = 'world'
 MIN_FRAMES     = 5
-ARM_TRAJ_ACTION = '/ur5_controller/follow_joint_trajectory'
 UR5_CONFIG     = '/ros2_ws/src/pipeline_orchestrator/config/ur5_curobo.yml'
 JOINT_NAMES    = [
     'shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint',
@@ -173,7 +164,12 @@ class CuRobo:
 
         # Gazebo's realsense plugin publishes camera streams with BEST_EFFORT
         # reliability; subscribers must match (qos_profile_sensor_data) or no
-        # data ever arrives. /joint_states is RELIABLE, so keep depth=10 there.
+        # data ever arrives.
+        #
+        # Note CuRobo only subscribes to the high-bandwidth perception streams
+        # it must fuse continuously (depth/info); /joint_states is owned by the
+        # orchestrator and pushed in via update_joint_state(), and trajectory
+        # deployment is the orchestrator's job too.
         node.create_subscription(Image, OVERHEAD_DEPTH_TOPIC,
                                   lambda msg: self._on_depth(msg, 'overhead', OVERHEAD_FRAME),
                                   qos_profile_sensor_data)
@@ -186,15 +182,16 @@ class CuRobo:
         node.create_subscription(CameraInfo, WRIST_INFO_TOPIC,
                                   lambda msg: self._on_info(msg, 'wrist'),
                                   qos_profile_sensor_data)
-        node.create_subscription(JointState, '/joint_states', self._on_joints, 10)
-
-        # Action deployment: send planned trajectories to the UR5 controller.
-        self._arm_client = ActionClient(node, FollowJointTrajectory, ARM_TRAJ_ACTION)
 
         self._planner = self._build_planner()
         self._logger.info('CuRobo: ready.')
 
-    def _on_joints(self, msg):
+    def update_joint_state(self, msg):
+        """Feed the latest /joint_states (called by the orchestrator).
+
+        The robot segmenter needs the live joints to mask the arm out of each
+        depth frame; the orchestrator owns the subscription and pushes them here.
+        """
         with self._lock:
             self._latest_joints = msg
 
@@ -446,25 +443,6 @@ class CuRobo:
             self._logger.warning(
                 f'CuRobo: FK failed: {type(exc).__name__}: {exc}')
             return None
-
-    def execute_trajectory(self, trajectory, timeout_sec: float = 2.0):
-        """Deploy a planned JointTrajectory to the UR5 controller action server.
-
-        Returns the send-goal future, or None if the trajectory is empty or the
-        action server never came up within ``timeout_sec``.
-        """
-        if trajectory is None or not trajectory.points:
-            self._logger.warning('CuRobo: refusing to execute empty trajectory.')
-            return None
-        if not self._arm_client.wait_for_server(timeout_sec=timeout_sec):
-            self._logger.error(
-                f'CuRobo: action server {ARM_TRAJ_ACTION} unavailable.')
-            return None
-        goal = FollowJointTrajectory.Goal()
-        goal.trajectory = trajectory
-        self._logger.info(
-            f'CuRobo: deploying {len(trajectory.points)}-point trajectory.')
-        return self._arm_client.send_goal_async(goal)
 
     def _to_ros_trajectory(self, result):
         traj_msg = JointTrajectory()

@@ -71,7 +71,14 @@ class PipelineOrchestrator(Node):
 
     def _cache_overhead_rgb(self, msg): self._latest_overhead_rgb = msg
     def _cache_wrist_rgb(self, msg):    self._latest_wrist_rgb    = msg
-    def _cache_joints(self, msg):       self._latest_joints       = msg
+
+    def _cache_joints(self, msg):
+        # The orchestrator owns the single /joint_states subscription and is the
+        # one source of truth for the robot's joint state. CuRobo needs the live
+        # joints to mask the arm out of each depth frame (the segmenter), so feed
+        # them through rather than have CuRobo open a second subscription.
+        self._latest_joints = msg
+        self._curobo.update_joint_state(msg)
 
     def task_command_callback(self, msg):
         self.get_logger().info(f'Received task command: {msg.data}')
@@ -94,6 +101,34 @@ class PipelineOrchestrator(Node):
             trajectory = self._moveit2.plan_trajectory(grasp_pose, self._latest_joints)
         if trajectory is None:
             return
+
+        # Deployment lives here, not in the planners: a pick-and-place is a
+        # *sequence* (move → grip → move → release) spanning the arm and gripper
+        # actions, and only the orchestrator holds both clients. The planners
+        # (cuRobo / MoveIt2) just produce a JointTrajectory; the orchestrator
+        # decides which one and executes it.
+        self._execute_trajectory(trajectory)
+
+    def _execute_trajectory(self, trajectory, timeout_sec: float = 2.0):
+        """Deploy a planned JointTrajectory to the UR5 arm controller.
+
+        Returns the send-goal future, or None if the trajectory is empty or the
+        action server never came up within ``timeout_sec``. Works on any
+        trajectory regardless of which planner produced it.
+        """
+        if trajectory is None or not trajectory.points:
+            self.get_logger().warning('refusing to execute empty trajectory.')
+            return None
+        if not self._arm_client.wait_for_server(timeout_sec=timeout_sec):
+            self.get_logger().error(
+                'arm action server /ur5_controller/follow_joint_trajectory '
+                'unavailable.')
+            return None
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory = trajectory
+        self.get_logger().info(
+            f'deploying {len(trajectory.points)}-point trajectory.')
+        return self._arm_client.send_goal_async(goal)
 
 
 def main(args=None):
