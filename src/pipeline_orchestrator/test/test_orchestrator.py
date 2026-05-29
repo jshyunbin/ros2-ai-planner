@@ -52,7 +52,8 @@ def make_curobo():
     with patch.multiple('pipeline_orchestrator.curobo',
                         Mapper=MagicMock(), FilterDepth=MagicMock(),
                         MotionPlanner=MagicMock(), Buffer=MagicMock(),
-                        TransformListener=MagicMock()):
+                        TransformListener=MagicMock(),
+                        ActionClient=MagicMock()):
         return CuRobo(node), node
 
 
@@ -60,9 +61,9 @@ def test_curobo_subscribes_to_four_topics():
     curobo, node = make_curobo()
     topics = [c.args[1] for c in node.create_subscription.call_args_list]
     assert '/camera/camera/depth/color/image_raw' in topics
-    assert '/camera/camera/depth/camera_info' in topics
+    assert '/camera/camera/depth/color/camera_info' in topics
     assert '/wrist_camera/wrist_camera/depth/color/image_raw' in topics
-    assert '/wrist_camera/wrist_camera/depth/camera_info' in topics
+    assert '/wrist_camera/wrist_camera/depth/color/camera_info' in topics
 
 
 def test_curobo_skips_depth_without_camera_info():
@@ -73,7 +74,8 @@ def test_curobo_skips_depth_without_camera_info():
                         Mapper=MagicMock(return_value=mock_mapper),
                         FilterDepth=MagicMock(),
                         MotionPlanner=MagicMock(), Buffer=MagicMock(),
-                        TransformListener=MagicMock()):
+                        TransformListener=MagicMock(),
+                        ActionClient=MagicMock()):
         curobo = CuRobo(node)
         curobo._on_depth(MagicMock(), 'overhead', 'camera_color_optical_frame')
         mock_mapper.integrate.assert_not_called()
@@ -89,7 +91,8 @@ def test_curobo_plan_trajectory_calls_update_world_after_min_frames():
                         Mapper=MagicMock(return_value=mock_mapper),
                         FilterDepth=MagicMock(),
                         MotionPlanner=MagicMock(return_value=mock_planner),
-                        Buffer=MagicMock(), TransformListener=MagicMock()):
+                        Buffer=MagicMock(), TransformListener=MagicMock(),
+                        ActionClient=MagicMock()):
         curobo = CuRobo(node)
         curobo._frame_count = MIN_FRAMES
         curobo.plan_trajectory(MagicMock(), MagicMock())

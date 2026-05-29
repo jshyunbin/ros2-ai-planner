@@ -61,6 +61,12 @@ RUN pip3 install --no-cache-dir uv && \
 # ros-humble-cv-bridge (compiled against NumPy 1.x ABI)
 RUN pip3 install --no-cache-dir --force-reinstall "numpy<2"
 
+# control_msgs — FollowJointTrajectory action, used to deploy planned
+# trajectories to the /ur5_controller and /gripper_controller action servers.
+RUN apt-get update && apt-get install -y \
+    ros-humble-control-msgs && \
+    rm -rf /var/lib/apt/lists/*
+
 # Workspace
 WORKDIR /ros2_ws
 COPY src/ src/

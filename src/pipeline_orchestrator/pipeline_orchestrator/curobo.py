@@ -5,8 +5,18 @@ try:
     from sensor_msgs.msg import Image, CameraInfo, JointState
     from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
     from builtin_interfaces.msg import Duration as RosDuration
+    from rclpy.action import ActionClient
+    from rclpy.qos import qos_profile_sensor_data
 except ImportError:
     Image = CameraInfo = JointState = JointTrajectory = JointTrajectoryPoint = RosDuration = None
+    ActionClient = qos_profile_sensor_data = None
+
+# control_msgs lives in its own block so a missing install can't silently null
+# out the core perception message types / QoS above.
+try:
+    from control_msgs.action import FollowJointTrajectory
+except ImportError:
+    FollowJointTrajectory = None
 
 # Heavy deps — imported lazily so tests can mock them via patch.multiple
 try:
@@ -80,13 +90,14 @@ except ImportError:
     CvBridge = _CvBridgeStub
 
 OVERHEAD_DEPTH_TOPIC = '/camera/camera/depth/color/image_raw'
-OVERHEAD_INFO_TOPIC  = '/camera/camera/depth/camera_info'
+OVERHEAD_INFO_TOPIC  = '/camera/camera/depth/color/camera_info'
 WRIST_DEPTH_TOPIC    = '/wrist_camera/wrist_camera/depth/color/image_raw'
-WRIST_INFO_TOPIC     = '/wrist_camera/wrist_camera/depth/camera_info'
+WRIST_INFO_TOPIC     = '/wrist_camera/wrist_camera/depth/color/camera_info'
 OVERHEAD_FRAME = 'camera_color_optical_frame'
 WRIST_FRAME    = 'wrist_camera_color_optical_frame'
 WORLD_FRAME    = 'world'
 MIN_FRAMES     = 5
+ARM_TRAJ_ACTION = '/ur5_controller/follow_joint_trajectory'
 UR5_CONFIG     = '/ros2_ws/src/pipeline_orchestrator/config/ur5_curobo.yml'
 JOINT_NAMES    = [
     'shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint',
@@ -97,11 +108,19 @@ JOINT_NAMES    = [
 class CuRobo:
     """Dual-RGBD TSDF fusion + collision-aware UR5 motion planning via cuRoboV2."""
 
-    def __init__(self, node):
+    def __init__(self, node, enable_viz=False):
         self._node = node
         self._logger = node.get_logger()
         self._lock = threading.Lock()
         self._frame_count = 0
+
+        # When enabled, _on_depth unprojects each frame into a world-frame
+        # point cloud and plan_trajectory snapshots the reconstructed TSDF
+        # surface voxels, so a viser front-end can render the perception
+        # state. Off by default to keep the orchestrator's hot path lean.
+        self._enable_viz = enable_viz
+        self._point_clouds: dict = {}   # cam_id -> (N, 3) np world points
+        self._tsdf_centers = None       # (M, 3) np surface voxel centres
 
         self._cam_depth: dict = {}
         self._cam_intrinsics: dict = {}
@@ -152,15 +171,25 @@ class CuRobo:
             ops_dtype=torch.float32,
         )
 
+        # Gazebo's realsense plugin publishes camera streams with BEST_EFFORT
+        # reliability; subscribers must match (qos_profile_sensor_data) or no
+        # data ever arrives. /joint_states is RELIABLE, so keep depth=10 there.
         node.create_subscription(Image, OVERHEAD_DEPTH_TOPIC,
-                                  lambda msg: self._on_depth(msg, 'overhead', OVERHEAD_FRAME), 10)
+                                  lambda msg: self._on_depth(msg, 'overhead', OVERHEAD_FRAME),
+                                  qos_profile_sensor_data)
         node.create_subscription(CameraInfo, OVERHEAD_INFO_TOPIC,
-                                  lambda msg: self._on_info(msg, 'overhead'), 1)
+                                  lambda msg: self._on_info(msg, 'overhead'),
+                                  qos_profile_sensor_data)
         node.create_subscription(Image, WRIST_DEPTH_TOPIC,
-                                  lambda msg: self._on_depth(msg, 'wrist', WRIST_FRAME), 10)
+                                  lambda msg: self._on_depth(msg, 'wrist', WRIST_FRAME),
+                                  qos_profile_sensor_data)
         node.create_subscription(CameraInfo, WRIST_INFO_TOPIC,
-                                  lambda msg: self._on_info(msg, 'wrist'), 1)
+                                  lambda msg: self._on_info(msg, 'wrist'),
+                                  qos_profile_sensor_data)
         node.create_subscription(JointState, '/joint_states', self._on_joints, 10)
+
+        # Action deployment: send planned trajectories to the UR5 controller.
+        self._arm_client = ActionClient(node, FollowJointTrajectory, ARM_TRAJ_ACTION)
 
         self._planner = self._build_planner()
         self._logger.info('CuRobo: ready.')
@@ -168,6 +197,76 @@ class CuRobo:
     def _on_joints(self, msg):
         with self._lock:
             self._latest_joints = msg
+
+    # ── viz accessors (thread-safe snapshots for a viser front-end) ──────────
+
+    @property
+    def frame_count(self) -> int:
+        """Number of dual-camera frames integrated into the TSDF so far."""
+        with self._lock:
+            return self._frame_count
+
+    def get_point_clouds(self) -> dict:
+        """Latest per-camera world-frame point clouds: {cam_id: (N, 3) ndarray}.
+
+        Empty until enable_viz is set and depth frames have arrived.
+        """
+        with self._lock:
+            return dict(self._point_clouds)
+
+    def get_tsdf_centers(self):
+        """Reconstructed TSDF surface voxel centres as (M, 3) ndarray, or None.
+
+        Populated by plan_trajectory once the ESDF has been computed.
+        """
+        with self._lock:
+            return self._tsdf_centers
+
+    def get_latest_joints(self):
+        """Most recent sensor_msgs/JointState, or None."""
+        with self._lock:
+            return self._latest_joints
+
+    def _cache_viz_cloud(self, cam_id, depth, t, r, K):
+        """Unproject depth to a world-frame point cloud and cache it (numpy).
+
+        Mirrors the transform the Mapper does internally so the viser cloud
+        lines up with the reconstructed TSDF. Best-effort: failures never
+        disrupt perception.
+        """
+        from pipeline_orchestrator.live_viz_helpers import depth_to_xyz
+        try:
+            xyz_cam = depth_to_xyz(depth, K)
+            qw, qx, qy, qz = float(r.w), float(r.x), float(r.y), float(r.z)
+            R = torch.tensor([
+                [1 - 2*(qy*qy + qz*qz), 2*(qx*qy - qw*qz),     2*(qx*qz + qw*qy)],
+                [2*(qx*qy + qw*qz),     1 - 2*(qx*qx + qz*qz), 2*(qy*qz - qw*qx)],
+                [2*(qx*qz - qw*qy),     2*(qy*qz + qw*qx),     1 - 2*(qx*qx + qy*qy)],
+            ], dtype=torch.float32, device=xyz_cam.device)
+            t_vec = torch.tensor(
+                [t.x, t.y, t.z], dtype=torch.float32, device=xyz_cam.device)
+            xyz_world = (xyz_cam @ R.T + t_vec).cpu().numpy()
+        except Exception as exc:
+            self._logger.warning(
+                f'CuRobo: viz cloud failed for {cam_id}: '
+                f'{type(exc).__name__}: {exc}')
+            return
+        with self._lock:
+            self._point_clouds[cam_id] = xyz_world
+
+    def _cache_viz_tsdf(self):
+        """Snapshot the reconstructed TSDF surface voxel centres (numpy)."""
+        try:
+            centers, _ = self._mapper.integrator.extract_occupied_voxels(
+                surface_only=True)
+            tsdf_np = centers.cpu().numpy() if centers is not None else None
+        except Exception as exc:
+            self._logger.warning(
+                f'CuRobo: extract_occupied_voxels failed: '
+                f'{type(exc).__name__}: {exc}')
+            return
+        with self._lock:
+            self._tsdf_centers = tsdf_np
 
     def _on_info(self, msg, cam_id: str):
         K = torch.tensor([
@@ -185,13 +284,18 @@ class CuRobo:
             K = self._cam_intrinsics[cam_id]
 
         try:
-            tf_time = Time(seconds=msg.header.stamp.sec,
-                           nanoseconds=msg.header.stamp.nanosec)
+            # Use the latest available transform (Time() == 0) rather than the
+            # depth message's exact stamp: the wrist camera's TF (which moves
+            # with the arm) lags the depth stream by a few hundred ms, so an
+            # exact-stamp lookup throws "extrapolation into the future" and the
+            # wrist frame never integrates — stalling the whole dual-cam map.
             transform = self._tf_buffer.lookup_transform(
-                WORLD_FRAME, frame, tf_time,
+                WORLD_FRAME, frame, Time(),
                 timeout=rclpy.duration.Duration(seconds=0.1))
         except Exception as e:
-            self._logger.warning(f'CuRobo: TF lookup failed for {frame}: {e}')
+            self._logger.warning(
+                f'CuRobo: TF lookup failed for {frame}: {e}',
+                throttle_duration_sec=2.0)
             return
 
         cv_img = self._bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
@@ -206,6 +310,11 @@ class CuRobo:
             np.array([t.x, t.y, t.z], dtype=np.float32),
             np.array([r.w, r.x, r.y, r.z], dtype=np.float32),
         )
+
+        # Snapshot the pre-segmenter cloud for viser (shows the robot/gripper
+        # too, since masking happens below only for the ESDF path).
+        if self._enable_viz:
+            self._cache_viz_cloud(cam_id, depth, t, r, K)
 
         # Mask out pixels that hit the robot itself; otherwise the ESDF marks
         # the arm/gripper as obstacles and the planner refuses every config.
@@ -287,6 +396,8 @@ class CuRobo:
             torch.cuda.synchronize()
             voxel_grid = self._mapper.compute_esdf()
             self._planner.update_world(SceneCfg(voxel=[voxel_grid]))
+            if self._enable_viz:
+                self._cache_viz_tsdf()
         else:
             self._logger.warning(
                 f'CuRobo: map not ready ({frame_count}/{MIN_FRAMES} frames), '
@@ -314,13 +425,65 @@ class CuRobo:
 
         return self._to_ros_trajectory(result)
 
+    def tool_pose(self, joint_states):
+        """Forward-kinematics tool pose for a joint state.
+
+        Returns ((x, y, z), (w, x, y, z)) in the planner's base frame, or None
+        on failure. Useful for capturing the robot's current end-effector pose
+        (e.g. a "home" target to return to). Touches CUDA, so call it from the
+        same thread that runs plan_trajectory (the ROS executor).
+        """
+        try:
+            positions = torch.tensor(
+                [list(joint_states.position)], dtype=torch.float32, device='cuda')
+            cjs = CuRoboJointState.from_position(
+                positions, joint_names=list(joint_states.name))
+            tp = self._planner.compute_kinematics(cjs).tool_poses
+            pos = tp.position.reshape(-1)[:3].tolist()
+            quat = tp.quaternion.reshape(-1)[:4].tolist()
+            return tuple(pos), tuple(quat)
+        except Exception as exc:
+            self._logger.warning(
+                f'CuRobo: FK failed: {type(exc).__name__}: {exc}')
+            return None
+
+    def execute_trajectory(self, trajectory, timeout_sec: float = 2.0):
+        """Deploy a planned JointTrajectory to the UR5 controller action server.
+
+        Returns the send-goal future, or None if the trajectory is empty or the
+        action server never came up within ``timeout_sec``.
+        """
+        if trajectory is None or not trajectory.points:
+            self._logger.warning('CuRobo: refusing to execute empty trajectory.')
+            return None
+        if not self._arm_client.wait_for_server(timeout_sec=timeout_sec):
+            self._logger.error(
+                f'CuRobo: action server {ARM_TRAJ_ACTION} unavailable.')
+            return None
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory = trajectory
+        self._logger.info(
+            f'CuRobo: deploying {len(trajectory.points)}-point trajectory.')
+        return self._arm_client.send_goal_async(goal)
+
     def _to_ros_trajectory(self, result):
         traj_msg = JointTrajectory()
         traj_msg.joint_names = list(self._planner.joint_names)
 
         plan = result.get_interpolated_plan()
-        positions = plan.position[0].cpu().numpy()
-        velocities = plan.velocity[0].cpu().numpy() if plan.velocity is not None else None
+        # position may be (B, H, L, G, J) or (B, T, J); reduce to (T, J) so each
+        # waypoint row is a flat float sequence (ROS2 rejects nested lists).
+        pos_t = plan.position
+        while pos_t.dim() > 2:
+            pos_t = pos_t[0]
+        positions = pos_t.cpu().numpy()
+        if plan.velocity is not None:
+            vel_t = plan.velocity
+            while vel_t.dim() > 2:
+                vel_t = vel_t[0]
+            velocities = vel_t.cpu().numpy()
+        else:
+            velocities = None
         dt = self._planner.trajopt_solver.config.interpolation_dt
 
         for i, pos in enumerate(positions):
@@ -337,7 +500,23 @@ class CuRobo:
         return traj_msg
 
     def _build_planner(self):
-        config = MotionPlannerCfg.create(robot=UR5_CONFIG)
+        # scene_model + a pre-allocated voxel collision cache are required so the
+        # planner builds a voxel scene_collision_checker; without them
+        # update_world(SceneCfg(voxel=...)) hits a None checker. cuRobo allocates
+        # a 128**3 ESDF tensor regardless of MapperCfg.extent_meters_xyz, so the
+        # 7 m / 0.05 m cache (140**3 slots) gives headroom over that.
+        collision_cache = {
+            'voxel': {
+                'layers': 1,
+                'dims': [7.0, 7.0, 7.0],
+                'voxel_size': 0.05,
+            }
+        }
+        config = MotionPlannerCfg.create(
+            robot=UR5_CONFIG,
+            scene_model='collision_test.yml',
+            collision_cache=collision_cache,
+        )
         planner = MotionPlanner(config)
         planner.warmup(enable_graph=True, num_warmup_iterations=3)
         return planner
