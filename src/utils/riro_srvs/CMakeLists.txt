@@ -18,6 +18,8 @@ endif()
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
+find_package(trajectory_msgs REQUIRED)
 find_package(action_msgs REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 
@@ -30,8 +32,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/StringGoalStatus.srv"
   "srv/NoneString.srv"
   "srv/BoolNone.srv"
-  DEPENDENCIES geometry_msgs
-  DEPENDENCIES action_msgs
+  "srv/PlanTrajectory.srv"
+  DEPENDENCIES geometry_msgs sensor_msgs trajectory_msgs action_msgs
  )
 
 if(BUILD_TESTING)

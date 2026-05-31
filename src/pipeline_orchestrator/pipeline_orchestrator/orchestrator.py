@@ -29,15 +29,10 @@ except ImportError:  # pragma: no cover - import-only test fallback
 
 try:  # pragma: no cover - runtime dependency
     from riro_srvs.srv import StringString
+    from riro_srvs.srv import PlanTrajectory
 except ImportError:  # pragma: no cover - runtime dependency
     StringString = None
-
-try:  # pragma: no cover - heavy runtime dependency
-    from pipeline_orchestrator.curobo import CuRobo
-    from pipeline_orchestrator.moveit2 import MoveIt2
-except ImportError:  # pragma: no cover - import-only test fallback
-    CuRobo = None
-    MoveIt2 = None
+    PlanTrajectory = None
 
 
 class PipelineOrchestrator(Node):
@@ -59,9 +54,10 @@ class PipelineOrchestrator(Node):
         self.declare_parameter("auto_run_on_task_command", True)
         self.declare_parameter("segmentation_service_wait_sec", 10.0)
         self.declare_parameter("graspgen_service_wait_sec", 10.0)
+        self.declare_parameter("curobo_service_name", "/curobo/plan_trajectory")
+        self.declare_parameter("curobo_service_wait_sec", 30.0)
         self.declare_parameter("enable_motion_execution", False)
         self.declare_parameter("arm_action_name", "/ur5_controller/follow_joint_trajectory")
-        self.declare_parameter("gripper_action_name", "/gripper_controller/follow_joint_trajectory")
 
         self._segmentation_service_name = str(
             self.get_parameter("segmentation_service_name").value
@@ -75,6 +71,10 @@ class PipelineOrchestrator(Node):
         )
         self._graspgen_service_wait_sec = float(
             self.get_parameter("graspgen_service_wait_sec").value
+        )
+        self._curobo_service_name = str(self.get_parameter("curobo_service_name").value)
+        self._curobo_service_wait_sec = float(
+            self.get_parameter("curobo_service_wait_sec").value
         )
         self._enable_motion_execution = bool(
             self.get_parameter("enable_motion_execution").value
@@ -97,30 +97,26 @@ class PipelineOrchestrator(Node):
         self._latest_graspgen = None
         self._latest_joints = None
 
-        self._curobo = None
-        self._moveit2 = None
+        self._curobo_client = None
         self._arm_client = None
-        self._gripper_client = None
         if self._enable_motion_execution:
-            if CuRobo is None or MoveIt2 is None or ActionClient is None:
-                raise ImportError("CuRobo, MoveIt2, and ROS2 actions are required for motion execution.")
+            if PlanTrajectory is None or ActionClient is None:
+                raise ImportError("PlanTrajectory service and ROS2 actions are required for motion execution.")
+            self._curobo_client = self.create_client(
+                PlanTrajectory,
+                self._curobo_service_name,
+            )
             self._arm_client = ActionClient(
                 self,
                 FollowJointTrajectory,
                 str(self.get_parameter("arm_action_name").value),
             )
-            self._gripper_client = ActionClient(
-                self,
-                FollowJointTrajectory,
-                str(self.get_parameter("gripper_action_name").value),
-            )
-            self._curobo = CuRobo(self)
-            self._moveit2 = MoveIt2(self)
 
         self.get_logger().info(
             "pipeline_orchestrator ready "
             f"segmentation={self._segmentation_service_name} "
             f"graspgen={self._graspgen_service_name} "
+            f"curobo={self._curobo_service_name} "
             f"motion_execution={self._enable_motion_execution}"
         )
 
@@ -131,8 +127,6 @@ class PipelineOrchestrator(Node):
 
     def _cache_joints(self, msg) -> None:
         self._latest_joints = msg
-        if self._curobo is not None:
-            self._curobo.update_joint_state(msg)
 
     def _run_pipeline(self, task: str) -> None:
         task = task.strip()
@@ -234,30 +228,57 @@ class PipelineOrchestrator(Node):
 
         if self._enable_motion_execution:
             self._plan_and_execute_best_grasp(top)
+            return
         self._reset_pipeline_state()
 
     def _plan_and_execute_best_grasp(self, top_grasp: dict) -> None:
         if self._latest_joints is None:
             self.get_logger().warn("No /joint_states received; skipping motion execution.")
+            self._reset_pipeline_state()
             return
-        if self._curobo is None or self._moveit2 is None:
-            self.get_logger().warn("Motion execution enabled but planners are unavailable.")
+        if self._curobo_client is None:
+            self.get_logger().warn("Motion execution enabled but CuRobo service client is unavailable.")
+            self._reset_pipeline_state()
             return
 
         grasp_pose = self._pose_from_grasp_row(top_grasp)
         if grasp_pose is None:
             self.get_logger().warn(f"Cannot build pose from GraspGen row: {top_grasp}")
+            self._reset_pipeline_state()
             return
 
-        trajectory = self._curobo.plan_trajectory(grasp_pose, self._latest_joints)
-        if trajectory is None:
-            self.get_logger().warning("cuRobo failed, falling back to MoveIt2.")
-            trajectory = self._moveit2.plan_trajectory(grasp_pose, self._latest_joints)
-        if trajectory is None:
-            self.get_logger().warn("No executable trajectory produced.")
+        if not self._curobo_client.wait_for_service(timeout_sec=self._curobo_service_wait_sec):
+            self.get_logger().warn(
+                "CuRobo service unavailable: "
+                f"{self._curobo_service_name} "
+                f"(waited {self._curobo_service_wait_sec:.1f}s)"
+            )
+            self._reset_pipeline_state()
             return
 
-        self._execute_trajectory(trajectory)
+        request = PlanTrajectory.Request()
+        request.grasp_pose = grasp_pose
+        request.joint_state = self._latest_joints
+        future = self._curobo_client.call_async(request)
+        future.add_done_callback(self._on_curobo_done)
+        self.get_logger().info("Requested CuRobo trajectory plan.")
+
+    def _on_curobo_done(self, future) -> None:
+        try:
+            result = future.result()
+        except Exception as exc:
+            self.get_logger().error(f"CuRobo service call failed: {exc}")
+            self._reset_pipeline_state()
+            return
+
+        if not result.success:
+            self.get_logger().warn(f"CuRobo planning failed: {result.message}")
+            self._reset_pipeline_state()
+            return
+
+        self.get_logger().info(result.message)
+        self._execute_trajectory(result.trajectory)
+        self._reset_pipeline_state()
 
     def _execute_trajectory(self, trajectory, timeout_sec: float = 2.0):
         """Deploy a planned JointTrajectory to the UR5 arm controller."""

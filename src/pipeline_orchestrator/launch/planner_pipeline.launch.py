@@ -12,6 +12,8 @@ def generate_launch_description() -> LaunchDescription:
     use_sim_time = LaunchConfiguration("use_sim_time")
     segmentation_service_name = LaunchConfiguration("segmentation_service_name")
     graspgen_service_name = LaunchConfiguration("graspgen_service_name")
+    curobo_service_name = LaunchConfiguration("curobo_service_name")
+    enable_motion_execution = LaunchConfiguration("enable_motion_execution")
     rgb_topic = LaunchConfiguration("rgb_topic")
     depth_topic = LaunchConfiguration("depth_topic")
     segmented_point_cloud_topic = LaunchConfiguration("segmented_point_cloud_topic")
@@ -36,6 +38,8 @@ def generate_launch_description() -> LaunchDescription:
                 "segmentation_service_name", default_value="/segmentation/segment_prompt"
             ),
             DeclareLaunchArgument("graspgen_service_name", default_value="/graspgen/infer"),
+            DeclareLaunchArgument("curobo_service_name", default_value="/curobo/plan_trajectory"),
+            DeclareLaunchArgument("enable_motion_execution", default_value="false"),
             DeclareLaunchArgument("rgb_topic", default_value="/wrist_camera/wrist_camera/color/image_raw"),
             DeclareLaunchArgument(
                 "depth_topic", default_value="/wrist_camera/wrist_camera/depth/color/image_raw"
@@ -113,6 +117,19 @@ def generate_launch_description() -> LaunchDescription:
             ),
             Node(
                 package="pipeline_orchestrator",
+                executable="curobo_service",
+                name="curobo_service",
+                output="screen",
+                parameters=[
+                    {
+                        "use_sim_time": use_sim_time,
+                        "service_name": curobo_service_name,
+                    }
+                ],
+                condition=IfCondition(enable_motion_execution),
+            ),
+            Node(
+                package="pipeline_orchestrator",
                 executable="orchestrator",
                 name="pipeline_orchestrator",
                 output="screen",
@@ -121,6 +138,8 @@ def generate_launch_description() -> LaunchDescription:
                         "use_sim_time": use_sim_time,
                         "segmentation_service_name": segmentation_service_name,
                         "graspgen_service_name": graspgen_service_name,
+                        "curobo_service_name": curobo_service_name,
+                        "enable_motion_execution": enable_motion_execution,
                         "auto_run_on_task_command": auto_run_on_task_command,
                     }
                 ],

@@ -27,6 +27,7 @@ setup(
     entry_points={
         'console_scripts': [
             'orchestrator = pipeline_orchestrator.orchestrator:main',
+            'curobo_service = pipeline_orchestrator.curobo_service:main',
             'graspgen_probe = pipeline_orchestrator.graspgen_probe:main',
             'graspgen_service = pipeline_orchestrator.graspgen_service:main',
             'graspgen_service_caller = pipeline_orchestrator.graspgen_service_caller:main',

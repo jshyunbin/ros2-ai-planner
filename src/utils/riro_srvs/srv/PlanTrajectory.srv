@@ -1,0 +1,6 @@
+geometry_msgs/Pose grasp_pose
+sensor_msgs/JointState joint_state
+---
+bool success
+string message
+trajectory_msgs/JointTrajectory trajectory

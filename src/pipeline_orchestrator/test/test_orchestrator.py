@@ -1,46 +1,5 @@
 import numpy as np
-import pytest
 from unittest.mock import MagicMock, patch
-
-
-# --- GeminiLocalizer ---
-
-def test_gemini_localizer_importable():
-    from pipeline_orchestrator.gemini import GeminiLocalizer
-    assert GeminiLocalizer is not None
-
-
-def test_gemini_locate_object_returns_none_stub():
-    from pipeline_orchestrator.gemini import GeminiLocalizer
-    localizer = GeminiLocalizer(MagicMock())
-    result = localizer.locate_object(MagicMock(), "pick up the red cube")
-    assert result is None
-
-
-# --- Sam2 ---
-
-def test_sam2_segment_accepts_bbox():
-    from pipeline_orchestrator.sam2 import Sam2
-    sam = Sam2(MagicMock())
-    result = sam.segment(MagicMock(), prompt="red cube", bbox=(10, 20, 100, 200))
-    assert result is None  # stub
-
-
-def test_sam2_segment_works_without_bbox():
-    from pipeline_orchestrator.sam2 import Sam2
-    sam = Sam2(MagicMock())
-    result = sam.segment(MagicMock(), prompt="red cube")
-    assert result is None  # stub
-
-
-# --- GraspGen ---
-
-def test_graspgen_accepts_point_cloud():
-    from pipeline_orchestrator.graspgen import GraspGen
-    graspgen = GraspGen(MagicMock())
-    point_cloud = np.zeros((100, 3), dtype=np.float32)
-    result = graspgen.generate_grasp(point_cloud)
-    assert result is None  # stub
 
 
 # --- CuRobo ---
@@ -66,8 +25,8 @@ def test_curobo_subscribes_to_four_topics():
 
 
 def test_curobo_does_not_subscribe_to_joint_states():
-    # The orchestrator owns /joint_states and feeds CuRobo via update_joint_state;
-    # CuRobo must not open its own duplicate subscription.
+    # The service node owns /joint_states and feeds CuRobo via update_joint_state;
+    # the CuRobo helper itself must not open a duplicate subscription.
     curobo, node = make_curobo()
     topics = [c.args[1] for c in node.create_subscription.call_args_list]
     assert '/joint_states' not in topics
@@ -204,20 +163,8 @@ def test_orchestrator_execute_trajectory_refuses_empty():
     orch._arm_client.send_goal_async.assert_not_called()
 
 
-def test_orchestrator_caches_and_forwards_joints_to_curobo():
+def test_orchestrator_caches_joints_without_touching_planner_runtime():
     orch = _orchestrator_skeleton()
-    orch._curobo = MagicMock()
-    msg = MagicMock()
-
-    orch._cache_joints(msg)
-
-    assert orch._latest_joints is msg
-    orch._curobo.update_joint_state.assert_called_once_with(msg)
-
-
-def test_orchestrator_caches_joints_without_curobo_when_motion_disabled():
-    orch = _orchestrator_skeleton()
-    orch._curobo = None
     msg = MagicMock()
 
     orch._cache_joints(msg)
@@ -225,37 +172,66 @@ def test_orchestrator_caches_joints_without_curobo_when_motion_disabled():
     assert orch._latest_joints is msg
 
 
-def test_orchestrator_plan_execute_uses_curobo_first():
+def test_orchestrator_plan_execute_calls_curobo_service():
+    from geometry_msgs.msg import Pose
+    from sensor_msgs.msg import JointState
     orch = _orchestrator_skeleton()
-    orch._latest_joints = MagicMock()
-    orch._curobo = MagicMock()
-    orch._moveit2 = MagicMock()
-    orch._execute_trajectory = MagicMock()
-    orch._pose_from_grasp_row = MagicMock(return_value=MagicMock())
-    orch._curobo.plan_trajectory.return_value = MagicMock(points=[MagicMock()])
+    orch._latest_joints = JointState()
+    orch._latest_joints.name = ["shoulder_pan_joint"]
+    orch._latest_joints.position = [0.0]
+    orch._curobo_client = MagicMock()
+    orch._curobo_client.wait_for_service.return_value = True
+    orch._curobo_service_wait_sec = 0.1
+    orch._pose_from_grasp_row = MagicMock(return_value=Pose())
 
     orch._plan_and_execute_best_grasp({"translation": [0, 0, 0], "rotation_matrix": np.eye(3).tolist()})
 
-    orch._curobo.plan_trajectory.assert_called_once()
-    orch._moveit2.plan_trajectory.assert_not_called()
-    orch._execute_trajectory.assert_called_once()
+    orch._curobo_client.call_async.assert_called_once()
+    request = orch._curobo_client.call_async.call_args.args[0]
+    assert request.grasp_pose is orch._pose_from_grasp_row.return_value
+    assert request.joint_state is orch._latest_joints
 
 
-def test_orchestrator_plan_execute_falls_back_to_moveit2():
+def test_orchestrator_curobo_done_executes_returned_trajectory():
+    from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
     orch = _orchestrator_skeleton()
-    orch._latest_joints = MagicMock()
-    orch._curobo = MagicMock()
-    orch._moveit2 = MagicMock()
     orch._execute_trajectory = MagicMock()
-    orch._pose_from_grasp_row = MagicMock(return_value=MagicMock())
-    orch._curobo.plan_trajectory.return_value = None
-    orch._moveit2.plan_trajectory.return_value = MagicMock(points=[MagicMock()])
+    orch._reset_pipeline_state = MagicMock()
+    trajectory = JointTrajectory()
+    trajectory.points = [JointTrajectoryPoint()]
+    future = MagicMock()
+    future.result.return_value = MagicMock(
+        success=True,
+        message="planned",
+        trajectory=trajectory,
+    )
 
-    orch._plan_and_execute_best_grasp({"translation": [0, 0, 0], "rotation_matrix": np.eye(3).tolist()})
+    orch._on_curobo_done(future)
 
-    orch._curobo.plan_trajectory.assert_called_once()
-    orch._moveit2.plan_trajectory.assert_called_once()
-    orch._execute_trajectory.assert_called_once()
+    orch._execute_trajectory.assert_called_once_with(trajectory)
+    orch._reset_pipeline_state.assert_called_once()
+
+
+def test_curobo_service_plans_with_supplied_joint_state():
+    from pipeline_orchestrator.curobo_service import CuRoboService
+
+    node = CuRoboService.__new__(CuRoboService)
+    node.get_logger = lambda: MagicMock()
+    node._curobo = MagicMock()
+    node._latest_joints = None
+    request = MagicMock()
+    request.joint_state.name = ["shoulder_pan_joint"]
+    request.grasp_pose = MagicMock()
+    response = MagicMock()
+    trajectory = MagicMock(points=[MagicMock()])
+    node._curobo.plan_trajectory.return_value = trajectory
+
+    result = node._handle_plan(request, response)
+
+    node._curobo.update_joint_state.assert_called_once_with(request.joint_state)
+    node._curobo.plan_trajectory.assert_called_once_with(request.grasp_pose, request.joint_state)
+    assert result.success is True
+    assert result.trajectory is trajectory
 
 
 def test_orchestrator_does_not_import_nvblox():

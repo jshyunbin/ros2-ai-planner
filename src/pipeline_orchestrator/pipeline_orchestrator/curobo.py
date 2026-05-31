@@ -1,85 +1,27 @@
 import threading
 
-# Light-weight ROS2 message types (always available in ROS2 environment)
-try:
-    from sensor_msgs.msg import Image, CameraInfo
-    from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
-    from builtin_interfaces.msg import Duration as RosDuration
-    from rclpy.qos import qos_profile_sensor_data
-except ImportError:
-    Image = CameraInfo = JointTrajectory = JointTrajectoryPoint = RosDuration = None
-    qos_profile_sensor_data = None
+import numpy as np
+import torch
+import rclpy.duration
+from builtin_interfaces.msg import Duration as RosDuration
+from cv_bridge import CvBridge
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from rclpy.time import Time
+from sensor_msgs.msg import CameraInfo, Image
+from tf2_ros import Buffer, ExtrapolationException, LookupException, TransformListener
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
-# Heavy deps — imported lazily so tests can mock them via patch.multiple
-try:
-    import numpy as np
-    import torch
-    import rclpy.duration
-    from rclpy.node import Node
-    from rclpy.time import Time
-    from tf2_ros import Buffer, TransformListener, LookupException, ExtrapolationException
-    from cv_bridge import CvBridge
-    from curobo.perception import Mapper, MapperCfg, FilterDepth, RobotSegmenter
-    from curobo.motion_planner import MotionPlanner, MotionPlannerCfg
-    from curobo.types import CameraObservation, Pose, JointState as CuRoboJointState, GoalToolPose
-    from curobo._src.geom.types import SceneCfg, VoxelGrid
-    # RobotSegmenter.from_robot_file does not forward ops_dtype to __init__,
-    # so build Kinematics ourselves to override the default (bfloat16) which
-    # mismatches the float32 robot_spheres tensor at runtime.
-    from curobo._src.robot.kinematics.kinematics import Kinematics
-    from curobo._src.types.robot import RobotCfg
-    from curobo._src.util_file import get_robot_configs_path, join_path, load_yaml
-    _HEAVY_DEPS_AVAILABLE = True
-except ImportError:
-    _HEAVY_DEPS_AVAILABLE = False
-    # Provide stub names so that patch.multiple targets exist at module level.
-    # Constructors (Mapper, MotionPlanner, Buffer, TransformListener, FilterDepth)
-    # must be MagicMock instances so they are callable and return MagicMocks.
-    # Config classes (MapperCfg, MotionPlannerCfg) are also instances so that
-    # attribute access like MotionPlannerCfg.create(...) works via MagicMock.
-    import unittest.mock as _mock
-
-    def _make_mock_class():
-        """Return a MagicMock that is callable (acts like a class)."""
-        m = _mock.MagicMock()
-        return m
-
-    np = _mock.MagicMock()
-    torch = _mock.MagicMock()
-    Buffer = _make_mock_class()
-    TransformListener = _make_mock_class()
-    Mapper = _make_mock_class()
-    MapperCfg = _make_mock_class()
-    FilterDepth = _make_mock_class()
-    RobotSegmenter = _make_mock_class()
-    Kinematics = _make_mock_class()
-    RobotCfg = _make_mock_class()
-    get_robot_configs_path = _mock.MagicMock(return_value='')
-    join_path = _mock.MagicMock(return_value='')
-    load_yaml = _mock.MagicMock(return_value={})
-    MotionPlanner = _make_mock_class()
-    MotionPlannerCfg = _make_mock_class()
-    # Types used inside methods
-    CameraObservation = _make_mock_class()
-    Pose = _make_mock_class()
-    CuRoboJointState = _make_mock_class()
-    GoalToolPose = _make_mock_class()
-    SceneCfg = _make_mock_class()
-    VoxelGrid = _make_mock_class()
-    Time = _make_mock_class()
-
-    class _RclpyDurationStub:
-        class Duration:
-            def __init__(self, **kwargs):
-                pass
-    rclpy = _mock.MagicMock()
-    rclpy.duration = _RclpyDurationStub()
-
-    class _CvBridgeStub:
-        def imgmsg_to_cv2(self, msg, desired_encoding='passthrough'):
-            import numpy
-            return numpy.zeros((480, 640), dtype=numpy.uint16)
-    CvBridge = _CvBridgeStub
+from curobo._src.geom.types import SceneCfg, VoxelGrid
+# RobotSegmenter.from_robot_file does not forward ops_dtype to __init__,
+# so build Kinematics ourselves to override the default (bfloat16) which
+# mismatches the float32 robot_spheres tensor at runtime.
+from curobo._src.robot.kinematics.kinematics import Kinematics
+from curobo._src.types.robot import RobotCfg
+from curobo._src.util_file import get_robot_configs_path, join_path, load_yaml
+from curobo.motion_planner import MotionPlanner, MotionPlannerCfg
+from curobo.perception import FilterDepth, Mapper, MapperCfg, RobotSegmenter
+from curobo.types import CameraObservation, GoalToolPose, JointState as CuRoboJointState, Pose
 
 OVERHEAD_DEPTH_TOPIC = '/camera/camera/depth/color/image_raw'
 OVERHEAD_INFO_TOPIC  = '/camera/camera/depth/color/camera_info'
