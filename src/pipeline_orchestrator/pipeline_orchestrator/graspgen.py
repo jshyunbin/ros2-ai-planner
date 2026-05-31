@@ -1,4 +1,4 @@
-from sensor_msgs.msg import Image
+import numpy as np
 
 
 class GraspGen:
@@ -8,8 +8,15 @@ class GraspGen:
         self._logger = logger
         # TODO: load GraspGen diffusion model
 
-    def generate_grasp(self, masks, depth: Image):
-        """Generate grasp pose from segmentation masks and depth image. Returns pose or None."""
-        # TODO: run GraspGen diffusion model on masks + depth
+    def generate_grasp(self, point_cloud: np.ndarray):
+        """Generate grasp pose from segmented object point cloud.
+
+        Args:
+            point_cloud: (N, 3) float32 array of object surface points
+                         in robot base frame.
+
+        Returns grasp pose or None on failure.
+        """
+        # TODO: run GraspGen diffusion model on point_cloud
         self._logger.warn('GraspGen.generate_grasp not yet implemented.')
         return None

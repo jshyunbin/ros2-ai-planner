@@ -1,4 +1,4 @@
-FROM nvidia/cuda:12.8.0-cudnn9-devel-ubuntu22.04
+FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV LANG=en_US.UTF-8
@@ -27,7 +27,8 @@ RUN apt-get update && apt-get install -y \
     ros-humble-vision-msgs \
     python3-colcon-common-extensions \
     python3-rosdep \
-    python3-pip && \
+    python3-pip \
+    git && \
     rm -rf /var/lib/apt/lists/*
 
 # PyTorch with CUDA 12.8
@@ -35,11 +36,42 @@ RUN pip3 install --no-cache-dir \
     torch torchvision torchaudio \
     --index-url https://download.pytorch.org/whl/cu128
 
+# ros-humble-cv-bridge is compiled against NumPy 1.x; pin before anything pulls 2.x
+RUN pip3 install --no-cache-dir "numpy<2"
+
+# UR5 URDF (for cuRoboV2 robot config)
+RUN apt-get update && apt-get install -y \
+    ros-humble-ur-description \
+    ros-humble-xacro && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN bash -c "source /opt/ros/humble/setup.bash && \
+    xacro /opt/ros/humble/share/ur_description/urdf/ur.urdf.xacro \
+        ur_type:=ur5 name:=ur > /ur5.urdf"
+
+# cuRoboV2 v0.8.0 — use uv (official install method) to handle setuptools_scm
+RUN pip3 install --no-cache-dir uv && \
+    git clone --branch v0.8.0 \
+        https://github.com/NVlabs/curobo.git /tmp/curobo && \
+    cd /tmp/curobo && \
+    uv pip install --system ".[cu12]" && \
+    cd / && rm -rf /tmp/curobo
+
+# Re-pin numpy<2 — cuRobo's install pulled in numpy 2.x which breaks
+# ros-humble-cv-bridge (compiled against NumPy 1.x ABI)
+RUN pip3 install --no-cache-dir --force-reinstall "numpy<2"
+
+# control_msgs — FollowJointTrajectory action, used to deploy planned
+# trajectories to the /ur5_controller and /gripper_controller action servers.
+RUN apt-get update && apt-get install -y \
+    ros-humble-control-msgs && \
+    rm -rf /var/lib/apt/lists/*
+
 # Workspace
 WORKDIR /ros2_ws
 COPY src/ src/
 RUN . /opt/ros/humble/setup.sh && \
-    colcon build --symlink-install
+    colcon build
 
 COPY scripts/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
