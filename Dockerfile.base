@@ -2,7 +2,7 @@ FROM nvcr.io/nvidia/pytorch:23.07-py3
 
 ARG GRASPGEN_REPO_URL=https://github.com/pianojay/GraspGen.git
 ARG GRASPGEN_BRANCH=jaeuk
-ARG GRASPGEN_COMMIT=beddd216a62781670a9b0938e7624b1ea10925f6
+ARG GRASPGEN_COMMIT=31b67f65f3cb88928887edd2ee24e302c30cab70
 ARG GRASPGEN_MODELS_REPO_URL=https://huggingface.co/adithyamurali/GraspGenModels
 ARG GRASPGEN_MODELS_COMMIT=ec1ccbb5eec0680db669246ac312a3636f16ee43
 ARG GRIPPER_CONFIG_NAME=graspgen_robotiq_2f_140.yml
@@ -11,6 +11,7 @@ ARG GRASPGEN_MODEL_FILES=checkpoints/graspgen_robotiq_2f_140.yml,checkpoints/gra
 ENV DEBIAN_FRONTEND=noninteractive
 ENV LANG=en_US.UTF-8
 ENV LC_ALL=en_US.UTF-8
+ENV PIP_ROOT_USER_ACTION=ignore
 ENV GRASPGEN_REPO_DIR=/opt/GraspGen
 ENV GRASPGEN_MODELS_DIR=/opt/GraspGenModels
 ENV SAM2_MODEL_DIR=/opt/models/sam2
@@ -36,7 +37,7 @@ RUN apt-get update && apt-get install -y \
     tmux \
     libosmesa6-dev && \
     curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
-        -o /usr/share/keyrings/ros-archive-keyring.gpg && \
+      -o /usr/share/keyrings/ros-archive-keyring.gpg && \
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] \
         http://packages.ros.org/ros2/ubuntu $(. /etc/os-release && echo $UBUNTU_CODENAME) main" | \
         tee /etc/apt/sources.list.d/ros2.list > /dev/null && \
@@ -57,57 +58,40 @@ RUN apt-get update && apt-get install -y \
     python3-pip && \
     rm -rf /var/lib/apt/lists/*
 
-# GraspGen runtime dependencies based on the upstream GraspGen Docker environment.
-RUN pip install --upgrade pip && \
-    pip install \
-        h5py \
-        hydra-core \
-        matplotlib \
-        meshcat \
-        scikit-learn \
-        scipy \
-        tensorboard \
-        trimesh==4.5.3 && \
-    pip install scene-synthesizer[recommend] && \
-    pip install torch==2.1.0 torchvision && \
-    pip install torch-cluster -f https://data.pyg.org/whl/torch-2.1.0+cu121.html && \
-    pip install imageio pickle5 opencv-python python-fcl && \
-    pip install pyrender==0.1.45 pyglet==2.1.6 && \
-    pip install PyOpenGL==3.1.5 && \
-    pip install diffusers==0.11.1 timm==1.0.15 huggingface-hub==0.25.2 && \
-    pip install addict yapf==0.40.1 tensorboardx sharedarray torch-geometric && \
-    pip install torch-scatter -f https://data.pyg.org/whl/torch-2.1.2+cu121.html && \
-    pip install spconv-cu120 && \
-    pip install qpsolvers[clarabel] yourdfpy==0.0.56 webdataset objaverse==0.1.7 && \
-    pip install google-genai msgpack msgpack-numpy pyzmq viser==1.0.29 tensordict==0.12.4 transformers==4.48.3 && \
-    pip install --no-deps -r /tmp/requirements/sam2.txt
+# Additional non-ROS system packages for pointnet2_ops compilation.
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    python3-dev && \
+    rm -rf /var/lib/apt/lists/*
 
-# Bake the Ultralytics SAM2 checkpoint into the image so runtime does not depend on
-# the per-user Ultralytics cache or a first-run download.
+# Planner-side Python runtime. Keep this separate from GraspGen so Gemini/SAM2
+# issues do not get conflated with GraspGen inference issues.
+RUN python3 -m pip install --upgrade pip && \
+    python3 -m pip install --no-cache-dir -r /tmp/requirements/planner-runtime.txt && \
+    python3 -m pip install --no-cache-dir --no-deps -r /tmp/requirements/sam2.txt
+
+# Clone the fork only after ROS2/system and planner runtime are established.
+RUN git clone --recursive --branch ${GRASPGEN_BRANCH} ${GRASPGEN_REPO_URL} ${GRASPGEN_REPO_DIR} && \
+    cd ${GRASPGEN_REPO_DIR} && \
+    git checkout ${GRASPGEN_COMMIT} && \
+    git submodule update --init --recursive
+
+# GraspGen runtime. This is intentionally separated from the planner runtime above.
+RUN python3 -m pip install --no-cache-dir -r ${GRASPGEN_REPO_DIR}/requirements.zmq_pointnet_viser.txt
+
+# Official GraspGen pointnet installation pattern, adapted for the reduced runtime.
+RUN cd ${GRASPGEN_REPO_DIR}/pointnet2_ops && \
+    python3 -m pip install --no-cache-dir --no-build-isolation .
+
+# Install the fork itself without re-resolving the broad upstream dependency set.
+RUN cd ${GRASPGEN_REPO_DIR} && \
+    python3 -m pip install --no-cache-dir --no-deps -e .
+
+# Bake the Ultralytics SAM2 checkpoint into the image to avoid first-run downloads.
 RUN mkdir -p ${SAM2_MODEL_DIR} && \
     curl -L https://github.com/ultralytics/assets/releases/download/v8.4.0/sam2_t.pt \
       -o ${SAM2_MODEL_PATH} && \
     test -s ${SAM2_MODEL_PATH}
-
-# Optional geometry tooling used by the upstream environment.
-RUN mkdir -p /install && \
-    cd /install && \
-    git clone --recursive -j8 https://github.com/hjwdzh/Manifold.git && \
-    mkdir -p /install/Manifold/build && \
-    cd /install/Manifold/build && \
-    cmake .. -DCMAKE_BUILD_TYPE=Release && \
-    make
-
-ENV PATH="${PATH}:/install/Manifold/build/"
-
-# GraspGen source and editable install live inside the image.
-RUN git clone --recursive --branch ${GRASPGEN_BRANCH} ${GRASPGEN_REPO_URL} ${GRASPGEN_REPO_DIR} && \
-    cd ${GRASPGEN_REPO_DIR} && \
-    git checkout ${GRASPGEN_COMMIT} && \
-    git submodule update --init --recursive && \
-    pip3 uninstall -y opencv-python || true && \
-    pip3 install --no-cache-dir --no-build-isolation ${GRASPGEN_REPO_DIR}/pointnet2_ops && \
-    pip3 install --no-cache-dir --no-deps -e ${GRASPGEN_REPO_DIR}
 
 # Download only the pinned GraspGen model assets required by the planner.
 RUN export GIT_LFS_SKIP_SMUDGE=1 && \

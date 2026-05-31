@@ -1,0 +1,18 @@
+# Planner-side Python runtime kept separate from GraspGen.
+# This section is intentionally conservative because the cost of a broken
+# long CUDA/ROS2 rebuild is higher than a few extra pure-Python dependencies.
+
+google-genai
+Pillow
+matplotlib
+PyYAML
+requests
+scipy
+tqdm
+psutil
+py-cpuinfo
+pandas
+seaborn
+msgpack
+msgpack-numpy
+pyzmq

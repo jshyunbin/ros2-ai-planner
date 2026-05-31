@@ -18,7 +18,7 @@ if [ ! -f "${GRIPPER_CONFIG}" ]; then
 fi
 
 cd "${GRASPGEN_REPO_DIR}"
-exec python client-server/graspgen_server.py \
+exec python3 client-server/graspgen_server.py \
     --gripper_config "${GRIPPER_CONFIG}" \
     --host "${GRASPGEN_HOST}" \
     --port "${GRASPGEN_PORT}"
