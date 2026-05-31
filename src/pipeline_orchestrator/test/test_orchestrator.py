@@ -1,4 +1,5 @@
 import numpy as np
+import threading
 from unittest.mock import MagicMock, patch
 
 
@@ -181,6 +182,7 @@ def test_orchestrator_plan_execute_calls_curobo_service():
     orch._latest_joints.position = [0.0]
     orch._curobo_client = MagicMock()
     orch._curobo_client.wait_for_service.return_value = True
+    orch._curobo_service_name = "/curobo/plan_trajectory"
     orch._curobo_service_wait_sec = 0.1
     orch._pose_from_grasp_row = MagicMock(return_value=Pose())
 
@@ -218,6 +220,8 @@ def test_curobo_service_plans_with_supplied_joint_state():
     node = CuRoboService.__new__(CuRoboService)
     node.get_logger = lambda: MagicMock()
     node._curobo = MagicMock()
+    node._init_error = ""
+    node._init_lock = threading.Lock()
     node._latest_joints = None
     request = MagicMock()
     request.joint_state.name = ["shoulder_pan_joint"]
@@ -232,6 +236,22 @@ def test_curobo_service_plans_with_supplied_joint_state():
     node._curobo.plan_trajectory.assert_called_once_with(request.grasp_pose, request.joint_state)
     assert result.success is True
     assert result.trajectory is trajectory
+
+
+def test_curobo_service_reports_initializing_before_planner_ready():
+    from pipeline_orchestrator.curobo_service import CuRoboService
+
+    node = CuRoboService.__new__(CuRoboService)
+    node._curobo = None
+    node._init_error = ""
+    node._init_lock = threading.Lock()
+    request = MagicMock()
+    response = MagicMock()
+
+    result = node._handle_plan(request, response)
+
+    assert result.success is False
+    assert result.message == "CuRobo is still initializing."
 
 
 def test_orchestrator_does_not_import_nvblox():

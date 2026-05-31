@@ -1,4 +1,5 @@
 import traceback
+import threading
 
 import rclpy
 from rclpy.node import Node
@@ -20,10 +21,9 @@ class CuRoboService(Node):
         self.declare_parameter("enable_viz", False)
 
         self._latest_joints = None
-        self._curobo = CuRobo(
-            self,
-            enable_viz=bool(self.get_parameter("enable_viz").value),
-        )
+        self._curobo = None
+        self._init_error = ""
+        self._init_lock = threading.Lock()
         self.create_subscription(
             JointState,
             self.JOINT_STATES_TOPIC,
@@ -33,17 +33,69 @@ class CuRoboService(Node):
 
         service_name = str(self.get_parameter("service_name").value)
         self.create_service(PlanTrajectory, service_name, self._handle_plan)
-        self.get_logger().info(f"curobo_service ready service={service_name}")
+        self.get_logger().info(
+            f"curobo_service advertised service={service_name}; initializing CuRobo in background."
+        )
+        self._init_thread = threading.Thread(
+            target=self._initialize_curobo,
+            name="curobo_initializer",
+            daemon=True,
+        )
+        self._init_thread.start()
+
+    @staticmethod
+    def _as_bool(value) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on")
+        return bool(value)
+
+    def _initialize_curobo(self) -> None:
+        self.get_logger().info("CuRobo initialization started.")
+        try:
+            curobo = CuRobo(
+                self,
+                enable_viz=self._as_bool(self.get_parameter("enable_viz").value),
+            )
+        except Exception as exc:
+            with self._init_lock:
+                self._init_error = f"{type(exc).__name__}: {exc}"
+            self.get_logger().error(f"CuRobo initialization failed: {self._init_error}")
+            self.get_logger().debug(traceback.format_exc())
+            return
+
+        with self._init_lock:
+            self._curobo = curobo
+            latest_joints = self._latest_joints
+        if latest_joints is not None:
+            self._curobo.update_joint_state(latest_joints)
+        self.get_logger().info("CuRobo initialization complete; planner service is ready.")
 
     def _cache_joints(self, msg: JointState) -> None:
         self._latest_joints = msg
-        self._curobo.update_joint_state(msg)
+        with self._init_lock:
+            curobo = self._curobo
+        if curobo is not None:
+            curobo.update_joint_state(msg)
 
     def _handle_plan(
         self,
         request: PlanTrajectory.Request,
         response: PlanTrajectory.Response,
     ) -> PlanTrajectory.Response:
+        with self._init_lock:
+            curobo = self._curobo
+            init_error = self._init_error
+        if init_error:
+            response.success = False
+            response.message = f"CuRobo initialization failed: {init_error}"
+            return response
+        if curobo is None:
+            response.success = False
+            response.message = "CuRobo is still initializing."
+            return response
+
         joint_state = request.joint_state
         if not joint_state.name:
             joint_state = self._latest_joints
@@ -53,8 +105,8 @@ class CuRoboService(Node):
             return response
 
         try:
-            self._curobo.update_joint_state(joint_state)
-            trajectory = self._curobo.plan_trajectory(request.grasp_pose, joint_state)
+            curobo.update_joint_state(joint_state)
+            trajectory = curobo.plan_trajectory(request.grasp_pose, joint_state)
         except Exception as exc:
             response.success = False
             response.message = f"CuRobo planning exception: {type(exc).__name__}: {exc}"

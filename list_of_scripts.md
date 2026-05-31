@@ -1,25 +1,8 @@
-# Operator Notes
+# Pipeline Debug Cheat Sheet
 
-Date: 2026-05-27
+Quick copy-paste commands for running and debugging the planner pipeline.
 
-This file is the shortest practical guide for running `ros2-ai-planner`.
-
-## Intent
-
-Use one persistent Docker container, launch the planner stack once, and test the pipeline through `/task_commands`.
-
-The final target is a single self-contained planner image:
-
-- GraspGen code lives inside the image under `/opt/GraspGen`
-- GraspGen checkpoints live inside the image under `/opt/GraspGenModels`
-- host bind mounts are development-only and come from `docker-compose.dev.yml`
-- runtime debug artifacts are written to host `./artifacts/`
-
-Do not keep creating new `docker compose run ...` containers for each shell.
-
-## Working Environment
-
-Use these on the host when testing ROS2 communication:
+## Host Env
 
 ```bash
 export ROS_DOMAIN_ID=0
@@ -28,65 +11,48 @@ export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 export FASTDDS_BUILTIN_TRANSPORTS=UDPv4
 ```
 
-The planner container receives the same values from `.env` through `docker compose`.
-
-On the host, unpause Gazebo before testing:
-
 ```bash
 ros2 service call /unpause_physics std_srvs/srv/Empty "{}"
 ```
 
-## Docker Workflow
-
-Build images from `ros2-ai-planner/`:
+## Build Images
 
 ```bash
 cp .env.example .env
-# Fill in GEMINI_API_KEY in .env if using segmentation.
+# Fill GEMINI_API_KEY in .env.
 ./scripts/build_base_image.sh
 ./scripts/build_image.sh
 ```
 
-Start one persistent planner container from the self-contained image:
+## Open Docker
+
+Persistent container:
 
 ```bash
 docker compose run --name ai_planner_dev --service-ports ai_planner bash
 ```
 
-For host bind mounts during development only:
+Persistent development container with source mounts:
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.dev.yml run --name ai_planner_dev --service-ports ai_planner bash
 ```
 
-Open more shells into the same container:
+Extra shell:
 
 ```bash
 docker exec -it ai_planner_dev bash
 ```
 
-Remove the container when done:
+Cleanup:
 
 ```bash
 docker rm -f ai_planner_dev
 ```
 
-Verify the container sees the expected ROS2 and API environment:
+## Source Workspace
 
-```bash
-docker compose run --rm ai_planner env | rg 'ROS_DOMAIN_ID|ROS_LOCALHOST_ONLY|RMW_IMPLEMENTATION|FASTDDS_BUILTIN_TRANSPORTS|GEMINI_API_KEY'
-```
-
-Artifacts are saved on the host under:
-
-```text
-./artifacts/segmentation_service/
-./artifacts/graspgen_service/
-```
-
-## Inside The Container
-
-Source the environment in every shell:
+Run inside every container shell:
 
 ```bash
 source /opt/ros/humble/setup.bash
@@ -94,126 +60,103 @@ cd /ros2_ws
 source install/setup.bash
 ```
 
-Quick image sanity checks:
+## Rebuild Mounted Source
+
+Use this after source/interface edits in the development container:
 
 ```bash
-ls /opt/GraspGen
-ls /opt/GraspGenModels/checkpoints
+source /opt/ros/humble/setup.bash
+cd /ros2_ws
+colcon build --symlink-install --packages-select riro_srvs pipeline_orchestrator
+source install/setup.bash
 ```
 
-## Main Launcher
+## Launch Pipeline
 
-Recommended planner-side launch:
+Perception and grasp ranking only:
 
 ```bash
 ros2 launch pipeline_orchestrator planner_pipeline.launch.py \
   start_graspgen_server:=true \
   auto_run_on_task_command:=true \
+  enable_motion_execution:=false \
   use_sim_time:=true
 ```
 
-This starts:
+Perception, grasp ranking, CuRobo service planning, and arm trajectory execution:
 
-- embedded GraspGen server
-- `segmentation_service`
-- `graspgen_service`
-- `orchestrator`
+```bash
+ros2 launch pipeline_orchestrator planner_pipeline.launch.py \
+  start_graspgen_server:=true \
+  auto_run_on_task_command:=true \
+  enable_motion_execution:=true \
+  use_sim_time:=true
+```
 
-For debugging without automatic task execution:
+Launch without auto-running task commands:
 
 ```bash
 ros2 launch pipeline_orchestrator planner_pipeline.launch.py \
   start_graspgen_server:=true \
   auto_run_on_task_command:=false \
+  enable_motion_execution:=false \
   use_sim_time:=true
 ```
 
-## Manual Rebuild
+## Publish Task
 
-If mounted source changes inside the container with `docker-compose.dev.yml`:
-
-```bash
-source /opt/ros/humble/setup.bash
-cd /ros2_ws
-colcon build --symlink-install --packages-select pipeline_orchestrator
-source install/setup.bash
-```
-
-## Essential Scripts
-
-- `scripts/build_base_image.sh`
-  - builds the reusable heavy Docker base image
-
-- `scripts/build_image.sh`
-  - builds the planner image
-
-- `scripts/start_graspgen_server.sh`
-  - starts embedded GraspGen manually if needed
-
-- `misc/visualize_graspgen_artifact.py`
-  - opens one `artifacts/graspgen_service/<run>/` directory in the GraspGen viser web viewer
-
-## Essential Nodes
-
-- `segmentation_service`
-  - Gemini bbox + local SAM2 + world-frame pointcloud masking
-
-- `graspgen_service`
-  - subscribes to masked clouds and serves `/graspgen/infer`
-
-- `orchestrator`
-  - subscribes to `/task_commands` and runs the pipeline
-
-## Minimal Live Test
-
-Host:
+Run on host or inside a sourced container shell:
 
 ```bash
-source ~/.bashrc
-export ROS_DOMAIN_ID=0
-export ROS_LOCALHOST_ONLY=0
-export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-export FASTDDS_BUILTIN_TRANSPORTS=UDPv4
-ros2 service call /unpause_physics std_srvs/srv/Empty "{}"
 ros2 topic pub --once /task_commands std_msgs/msg/String "{data: 'banana'}"
 ```
 
-Container:
+## Manual Service Calls
 
 ```bash
-source /opt/ros/humble/setup.bash
-cd /ros2_ws
-source install/setup.bash
-ros2 launch pipeline_orchestrator planner_pipeline.launch.py \
-  start_graspgen_server:=true \
-  auto_run_on_task_command:=true \
-  use_sim_time:=true
+ros2 service call /segmentation/segment_prompt riro_srvs/srv/StringString "{data: 'banana'}"
 ```
 
-## Minimal Debug Commands
+```bash
+ros2 service call /graspgen/infer std_srvs/srv/Trigger "{}"
+```
 
-Inside container:
+CuRobo planning service is normally called by `orchestrator` because it needs a grasp pose and joint state:
+
+```bash
+ros2 interface show riro_srvs/srv/PlanTrajectory
+ros2 service type /curobo/plan_trajectory
+```
+
+## Inspect Runtime
 
 ```bash
 ros2 node list
 ros2 topic list
 ros2 service list
-ros2 topic echo /task_commands
-ros2 service call /segmentation/segment_prompt riro_srvs/srv/StringString "{data: 'banana'}"
-ros2 service call /graspgen/infer std_srvs/srv/Trigger "{}"
+ros2 action list
 ```
 
-## Current Status
+```bash
+ros2 topic echo /task_commands
+ros2 topic echo /joint_states --once
+```
 
-Working:
+## Quick Checks
 
-- single-image Docker build
-- embedded GraspGen server startup
-- host-to-container ROS transport
-- RGB and organized pointcloud ingestion
-- Gemini bbox localization
-- local SAM2 mask generation
-- world-frame segmented pointcloud publication
+```bash
+docker compose run --rm ai_planner env | grep -E 'ROS_DOMAIN_ID|ROS_LOCALHOST_ONLY|RMW_IMPLEMENTATION|FASTDDS_BUILTIN_TRANSPORTS|GEMINI_API_KEY'
+```
 
-Current blocker:
-- grasp filtering still needs better world-frame vertical ranking and scene-specific cleanup
+```bash
+ls /opt/GraspGen
+ls /opt/GraspGenModels/checkpoints
+ls /opt/models/sam2
+```
+
+## Artifacts
+
+```text
+./artifacts/segmentation_service/
+./artifacts/graspgen_service/
+```

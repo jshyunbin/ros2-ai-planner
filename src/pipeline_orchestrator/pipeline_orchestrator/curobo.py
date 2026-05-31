@@ -104,29 +104,45 @@ class CuRobo:
             ops_dtype=torch.float32,
         )
 
+        self._planner = self._build_planner()
+        self._subscriptions = []
+        self._subscribe_depth_streams(node)
+        self._logger.info('CuRobo: ready.')
+
+    def _subscribe_depth_streams(self, node: Node) -> None:
         # Gazebo's realsense plugin publishes camera streams with BEST_EFFORT
         # reliability; subscribers must match (qos_profile_sensor_data) or no
         # data ever arrives.
         #
-        # Note CuRobo only subscribes to the high-bandwidth perception streams
-        # it must fuse continuously (depth/info); /joint_states is owned by the
-        # orchestrator and pushed in via update_joint_state(), and trajectory
-        # deployment is the orchestrator's job too.
-        node.create_subscription(Image, OVERHEAD_DEPTH_TOPIC,
-                                  lambda msg: self._on_depth(msg, 'overhead', OVERHEAD_FRAME),
-                                  qos_profile_sensor_data)
-        node.create_subscription(CameraInfo, OVERHEAD_INFO_TOPIC,
-                                  lambda msg: self._on_info(msg, 'overhead'),
-                                  qos_profile_sensor_data)
-        node.create_subscription(Image, WRIST_DEPTH_TOPIC,
-                                  lambda msg: self._on_depth(msg, 'wrist', WRIST_FRAME),
-                                  qos_profile_sensor_data)
-        node.create_subscription(CameraInfo, WRIST_INFO_TOPIC,
-                                  lambda msg: self._on_info(msg, 'wrist'),
-                                  qos_profile_sensor_data)
-
-        self._planner = self._build_planner()
-        self._logger.info('CuRobo: ready.')
+        # Register subscriptions only after planner warmup. cuRobo warmup uses
+        # CUDA graph capture, and depth callbacks also touch CUDA; running both
+        # concurrently can poison the capture and abort the process.
+        self._subscriptions.extend([
+            node.create_subscription(
+                Image,
+                OVERHEAD_DEPTH_TOPIC,
+                lambda msg: self._on_depth(msg, 'overhead', OVERHEAD_FRAME),
+                qos_profile_sensor_data,
+            ),
+            node.create_subscription(
+                CameraInfo,
+                OVERHEAD_INFO_TOPIC,
+                lambda msg: self._on_info(msg, 'overhead'),
+                qos_profile_sensor_data,
+            ),
+            node.create_subscription(
+                Image,
+                WRIST_DEPTH_TOPIC,
+                lambda msg: self._on_depth(msg, 'wrist', WRIST_FRAME),
+                qos_profile_sensor_data,
+            ),
+            node.create_subscription(
+                CameraInfo,
+                WRIST_INFO_TOPIC,
+                lambda msg: self._on_info(msg, 'wrist'),
+                qos_profile_sensor_data,
+            ),
+        ])
 
     def update_joint_state(self, msg):
         """Feed the latest /joint_states (called by the orchestrator).
@@ -342,10 +358,10 @@ class CuRobo:
                 f'CuRobo: map not ready ({frame_count}/{MIN_FRAMES} frames), '
                 'planning in free space.')
 
-        positions = torch.tensor(
-            [list(joint_states.position)], dtype=torch.float32, device='cuda')
-        start = CuRoboJointState.from_position(
-            positions, joint_names=list(joint_states.name))
+        by_name = dict(zip(joint_states.name, joint_states.position))
+        ordered = [by_name[n] for n in JOINT_NAMES if n in by_name]
+        positions = torch.tensor([ordered], dtype=torch.float32, device='cuda')
+        start = CuRoboJointState.from_position(positions, joint_names=JOINT_NAMES)
 
         p = grasp_pose.position
         o = grasp_pose.orientation
@@ -373,10 +389,10 @@ class CuRobo:
         same thread that runs plan_trajectory (the ROS executor).
         """
         try:
-            positions = torch.tensor(
-                [list(joint_states.position)], dtype=torch.float32, device='cuda')
-            cjs = CuRoboJointState.from_position(
-                positions, joint_names=list(joint_states.name))
+            by_name = dict(zip(joint_states.name, joint_states.position))
+            ordered = [by_name[n] for n in JOINT_NAMES if n in by_name]
+            positions = torch.tensor([ordered], dtype=torch.float32, device='cuda')
+            cjs = CuRoboJointState.from_position(positions, joint_names=JOINT_NAMES)
             tp = self._planner.compute_kinematics(cjs).tool_poses
             pos = tp.position.reshape(-1)[:3].tolist()
             quat = tp.quaternion.reshape(-1)[:4].tolist()

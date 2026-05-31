@@ -35,6 +35,14 @@ except ImportError:  # pragma: no cover - runtime dependency
     PlanTrajectory = None
 
 
+def _as_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
 class PipelineOrchestrator(Node):
     """ROS2 orchestrator for segmentation, GraspGen, and optional motion execution."""
 
@@ -63,7 +71,7 @@ class PipelineOrchestrator(Node):
             self.get_parameter("segmentation_service_name").value
         )
         self._graspgen_service_name = str(self.get_parameter("graspgen_service_name").value)
-        self._auto_run_on_task_command = bool(
+        self._auto_run_on_task_command = _as_bool(
             self.get_parameter("auto_run_on_task_command").value
         )
         self._segmentation_service_wait_sec = float(
@@ -76,7 +84,7 @@ class PipelineOrchestrator(Node):
         self._curobo_service_wait_sec = float(
             self.get_parameter("curobo_service_wait_sec").value
         )
-        self._enable_motion_execution = bool(
+        self._enable_motion_execution = _as_bool(
             self.get_parameter("enable_motion_execution").value
         )
 
@@ -110,6 +118,10 @@ class PipelineOrchestrator(Node):
                 self,
                 FollowJointTrajectory,
                 str(self.get_parameter("arm_action_name").value),
+            )
+        else:
+            self.get_logger().info(
+                "Motion execution disabled; orchestrator will stop after GraspGen result."
             )
 
         self.get_logger().info(
@@ -226,12 +238,16 @@ class PipelineOrchestrator(Node):
             f"confidence={top.get('confidence')}"
         )
 
+        self.get_logger().info(
+            f"Motion execution gate enable_motion_execution={self._enable_motion_execution}"
+        )
         if self._enable_motion_execution:
             self._plan_and_execute_best_grasp(top)
             return
         self._reset_pipeline_state()
 
     def _plan_and_execute_best_grasp(self, top_grasp: dict) -> None:
+        self.get_logger().info("Motion execution requested; preparing CuRobo service call.")
         if self._latest_joints is None:
             self.get_logger().warn("No /joint_states received; skipping motion execution.")
             self._reset_pipeline_state()
@@ -247,6 +263,10 @@ class PipelineOrchestrator(Node):
             self._reset_pipeline_state()
             return
 
+        self.get_logger().info(
+            f"Waiting for CuRobo service {self._curobo_service_name} "
+            f"for up to {self._curobo_service_wait_sec:.1f}s."
+        )
         if not self._curobo_client.wait_for_service(timeout_sec=self._curobo_service_wait_sec):
             self.get_logger().warn(
                 "CuRobo service unavailable: "
