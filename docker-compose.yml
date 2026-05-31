@@ -13,11 +13,13 @@ services:
       ROS_LOCALHOST_ONLY: ${ROS_LOCALHOST_ONLY:-0}
       RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
       FASTDDS_BUILTIN_TRANSPORTS: ${FASTDDS_BUILTIN_TRANSPORTS:-UDPv4}
+      FASTRTPS_DEFAULT_PROFILES_FILE: /ros2_ws/config/fastdds_no_shm.xml
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       GRASPGEN_REPO_DIR: /opt/GraspGen
       GRASPGEN_MODELS_DIR: /opt/GraspGenModels
     volumes:
       - ./artifacts:/artifacts
+      - ./config:/ros2_ws/config:ro
     ipc: host
     stdin_open: true
     tty: true

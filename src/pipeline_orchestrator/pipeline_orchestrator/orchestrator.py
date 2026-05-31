@@ -1,12 +1,21 @@
 import json
+import math
 
 try:  # pragma: no cover - runtime dependency
     import rclpy
+    from rclpy.action import ActionClient
     from rclpy.node import Node
+    from sensor_msgs.msg import JointState
     from std_msgs.msg import String
     from std_srvs.srv import Trigger
+    from control_msgs.action import FollowJointTrajectory
+    from geometry_msgs.msg import Pose
 except ImportError:  # pragma: no cover - import-only test fallback
     rclpy = None
+    ActionClient = None
+    JointState = None
+    FollowJointTrajectory = None
+    Pose = None
 
     class Node:  # type: ignore[override]
         pass
@@ -23,11 +32,19 @@ try:  # pragma: no cover - runtime dependency
 except ImportError:  # pragma: no cover - runtime dependency
     StringString = None
 
+try:  # pragma: no cover - heavy runtime dependency
+    from pipeline_orchestrator.curobo import CuRobo
+    from pipeline_orchestrator.moveit2 import MoveIt2
+except ImportError:  # pragma: no cover - import-only test fallback
+    CuRobo = None
+    MoveIt2 = None
+
 
 class PipelineOrchestrator(Node):
-    """ROS2 orchestrator that chains segmentation and GraspGen service calls."""
+    """ROS2 orchestrator for segmentation, GraspGen, and optional motion execution."""
 
     TASK_COMMANDS_TOPIC = "/task_commands"
+    JOINT_STATES_TOPIC = "/joint_states"
 
     def __init__(self):
         if rclpy is None:
@@ -42,6 +59,9 @@ class PipelineOrchestrator(Node):
         self.declare_parameter("auto_run_on_task_command", True)
         self.declare_parameter("segmentation_service_wait_sec", 10.0)
         self.declare_parameter("graspgen_service_wait_sec", 10.0)
+        self.declare_parameter("enable_motion_execution", False)
+        self.declare_parameter("arm_action_name", "/ur5_controller/follow_joint_trajectory")
+        self.declare_parameter("gripper_action_name", "/gripper_controller/follow_joint_trajectory")
 
         self._segmentation_service_name = str(
             self.get_parameter("segmentation_service_name").value
@@ -56,9 +76,15 @@ class PipelineOrchestrator(Node):
         self._graspgen_service_wait_sec = float(
             self.get_parameter("graspgen_service_wait_sec").value
         )
+        self._enable_motion_execution = bool(
+            self.get_parameter("enable_motion_execution").value
+        )
 
         self._task_sub = self.create_subscription(
             String, self.TASK_COMMANDS_TOPIC, self.task_command_callback, 10
+        )
+        self._joint_sub = self.create_subscription(
+            JointState, self.JOINT_STATES_TOPIC, self._cache_joints, 10
         )
         self._segmentation_client = self.create_client(
             StringString, self._segmentation_service_name
@@ -69,17 +95,44 @@ class PipelineOrchestrator(Node):
         self._active_task = ""
         self._latest_segmentation = None
         self._latest_graspgen = None
+        self._latest_joints = None
+
+        self._curobo = None
+        self._moveit2 = None
+        self._arm_client = None
+        self._gripper_client = None
+        if self._enable_motion_execution:
+            if CuRobo is None or MoveIt2 is None or ActionClient is None:
+                raise ImportError("CuRobo, MoveIt2, and ROS2 actions are required for motion execution.")
+            self._arm_client = ActionClient(
+                self,
+                FollowJointTrajectory,
+                str(self.get_parameter("arm_action_name").value),
+            )
+            self._gripper_client = ActionClient(
+                self,
+                FollowJointTrajectory,
+                str(self.get_parameter("gripper_action_name").value),
+            )
+            self._curobo = CuRobo(self)
+            self._moveit2 = MoveIt2(self)
 
         self.get_logger().info(
             "pipeline_orchestrator ready "
             f"segmentation={self._segmentation_service_name} "
-            f"graspgen={self._graspgen_service_name}"
+            f"graspgen={self._graspgen_service_name} "
+            f"motion_execution={self._enable_motion_execution}"
         )
 
     def task_command_callback(self, msg: String) -> None:
         self.get_logger().info(f"Received task command: {msg.data}")
         if self._auto_run_on_task_command:
             self._run_pipeline(msg.data)
+
+    def _cache_joints(self, msg) -> None:
+        self._latest_joints = msg
+        if self._curobo is not None:
+            self._curobo.update_joint_state(msg)
 
     def _run_pipeline(self, task: str) -> None:
         task = task.strip()
@@ -165,20 +218,104 @@ class PipelineOrchestrator(Node):
 
         self._latest_graspgen = payload
         top_grasps = payload.get("top_grasps") or []
-        if top_grasps:
-            top = top_grasps[0]
-            self.get_logger().info(
-                "Pipeline result "
-                f"label={self._latest_segmentation.get('label', 'target')} "
-                f"centroid={self._latest_segmentation.get('centroid')} "
-                f"best_translation={top.get('translation')} "
-                f"confidence={top.get('confidence')}"
-            )
-        else:
+        if not top_grasps:
             self.get_logger().warn("GraspGen returned success but no ranked grasps.")
+            self._reset_pipeline_state()
+            return
 
-        # Motion execution stays separate until cuRobo / MoveIt2 integration is ready.
+        top = top_grasps[0]
+        self.get_logger().info(
+            "Pipeline result "
+            f"label={self._latest_segmentation.get('label', 'target')} "
+            f"centroid={self._latest_segmentation.get('centroid')} "
+            f"best_translation={top.get('translation')} "
+            f"confidence={top.get('confidence')}"
+        )
+
+        if self._enable_motion_execution:
+            self._plan_and_execute_best_grasp(top)
         self._reset_pipeline_state()
+
+    def _plan_and_execute_best_grasp(self, top_grasp: dict) -> None:
+        if self._latest_joints is None:
+            self.get_logger().warn("No /joint_states received; skipping motion execution.")
+            return
+        if self._curobo is None or self._moveit2 is None:
+            self.get_logger().warn("Motion execution enabled but planners are unavailable.")
+            return
+
+        grasp_pose = self._pose_from_grasp_row(top_grasp)
+        if grasp_pose is None:
+            self.get_logger().warn(f"Cannot build pose from GraspGen row: {top_grasp}")
+            return
+
+        trajectory = self._curobo.plan_trajectory(grasp_pose, self._latest_joints)
+        if trajectory is None:
+            self.get_logger().warning("cuRobo failed, falling back to MoveIt2.")
+            trajectory = self._moveit2.plan_trajectory(grasp_pose, self._latest_joints)
+        if trajectory is None:
+            self.get_logger().warn("No executable trajectory produced.")
+            return
+
+        self._execute_trajectory(trajectory)
+
+    def _execute_trajectory(self, trajectory, timeout_sec: float = 2.0):
+        """Deploy a planned JointTrajectory to the UR5 arm controller."""
+        if trajectory is None or not trajectory.points:
+            self.get_logger().warning("refusing to execute empty trajectory.")
+            return None
+        if self._arm_client is None:
+            self.get_logger().warning("arm action client is unavailable.")
+            return None
+        if not self._arm_client.wait_for_server(timeout_sec=timeout_sec):
+            self.get_logger().error(
+                "arm action server /ur5_controller/follow_joint_trajectory unavailable."
+            )
+            return None
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory = trajectory
+        self.get_logger().info(f"deploying {len(trajectory.points)}-point trajectory.")
+        return self._arm_client.send_goal_async(goal)
+
+    @staticmethod
+    def _pose_from_grasp_row(row: dict):
+        if Pose is None:
+            return None
+        translation = row.get("translation")
+        rotation = row.get("rotation_matrix")
+        if translation is None or rotation is None:
+            return None
+        if len(translation) != 3 or len(rotation) != 3:
+            return None
+
+        quat = PipelineOrchestrator._quat_from_rotation_matrix(rotation)
+        pose = Pose()
+        pose.position.x = float(translation[0])
+        pose.position.y = float(translation[1])
+        pose.position.z = float(translation[2])
+        pose.orientation.w = quat[0]
+        pose.orientation.x = quat[1]
+        pose.orientation.y = quat[2]
+        pose.orientation.z = quat[3]
+        return pose
+
+    @staticmethod
+    def _quat_from_rotation_matrix(rotation) -> tuple[float, float, float, float]:
+        r00, r01, r02 = [float(v) for v in rotation[0]]
+        r10, r11, r12 = [float(v) for v in rotation[1]]
+        r20, r21, r22 = [float(v) for v in rotation[2]]
+        trace = r00 + r11 + r22
+        if trace > 0.0:
+            s = math.sqrt(trace + 1.0) * 2.0
+            return (0.25 * s, (r21 - r12) / s, (r02 - r20) / s, (r10 - r01) / s)
+        if r00 > r11 and r00 > r22:
+            s = math.sqrt(1.0 + r00 - r11 - r22) * 2.0
+            return ((r21 - r12) / s, 0.25 * s, (r01 + r10) / s, (r02 + r20) / s)
+        if r11 > r22:
+            s = math.sqrt(1.0 + r11 - r00 - r22) * 2.0
+            return ((r02 - r20) / s, (r01 + r10) / s, 0.25 * s, (r12 + r21) / s)
+        s = math.sqrt(1.0 + r22 - r00 - r11) * 2.0
+        return ((r10 - r01) / s, (r02 + r20) / s, (r12 + r21) / s, 0.25 * s)
 
     def _reset_pipeline_state(self) -> None:
         self._pipeline_busy = False

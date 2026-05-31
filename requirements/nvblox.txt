@@ -1,0 +1,1 @@
+# nvblox is no longer used — cuRoboV2 Mapper handles TSDF/ESDF internally.

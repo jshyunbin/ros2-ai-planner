@@ -12,10 +12,14 @@ SAM2 (segment) -> pointcloud masking -> GraspGen (grasp pose) -> cuRobo (traject
 
 Current reality is still narrower than the final target architecture, but the prompted segmentation to GraspGen inference path is now working end-to-end inside the planner stack.
 
+**CuRobo owns the full depth pipeline.** It subscribes to both D435 depth streams internally, fuses them into a block-sparse TSDF/ESDF using cuRoboV2's built-in Mapper (GPU, no external nvblox node), and uses that map for collision-aware motion planning on every call.
+
 ## Requirements
 
 - Docker with [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)
 - host ROS2 Humble installation for `manip_challenge`
+- NVIDIA GPU (Turing or newer, ≥ 4 GB VRAM)
+- NVIDIA driver ≥ 580 (CUDA 12 support)
 - `manip_challenge` running on the host (Gazebo + ROS2 Humble)
 
 Important environment split:
@@ -311,24 +315,25 @@ src/pipeline_orchestrator/pipeline_orchestrator/
 ├── segmentation_service.py # ROS2 node: Gemini bbox + local SAM2 + point-cloud masking
 ├── segmentation_utils.py   # helpers for mask parsing / rasterization / cloud extraction
 ├── graspgen_probe.py # ROS2 node: raw PointCloud2 -> standalone GraspGen server
+├── curobo.py         # cuRoboV2 dual-RGBD Mapper + MotionPlanner
+├── live_viz_helpers.py # helpers for live point-cloud / ESDF visualization
 ├── sam2.py           # intended SAM2 segmentation module
 ├── graspgen.py       # intended GraspGen wrapper from masks + depth
-├── curobo.py         # intended planner
 └── moveit2.py        # intended fallback planner
 ```
 
 Current implementation status:
 
-- `orchestrator.py`: implemented as a segmentation + GraspGen service caller
+- `orchestrator.py`: implemented as a segmentation + GraspGen service caller with optional motion execution
 - `segmentation_service.py`: implemented
 - `segmentation_utils.py`: implemented
 - `sam2.py`: stub, returns `None`
 - `graspgen.py`: stub, returns `None`
-- `curobo.py`: stub
+- `curobo.py`: implemented from the main branch CuRoboV2 integration
 - `moveit2.py`: stub
 - `graspgen_probe.py`: implemented
 
-This means `ros2-ai-planner` now has a runtime segmentation-to-GraspGen path, but best-grasp filtering and physical execution are still incomplete.
+This means `ros2-ai-planner` now has a runtime segmentation-to-GraspGen path, and CuRobo planning can be enabled separately with the `enable_motion_execution` orchestrator parameter.
 
 ### Topics subscribed
 
@@ -336,11 +341,17 @@ This means `ros2-ai-planner` now has a runtime segmentation-to-GraspGen path, bu
 |---|---|---|
 | `/task_commands` | `std_msgs/String` | manip_challenge |
 | `/camera/camera/color/image_raw` | `sensor_msgs/Image` | overhead D435 |
-| `/camera/camera/depth/color/image_raw` | `sensor_msgs/Image` | overhead D435 |
 | `/wrist_camera/wrist_camera/color/image_raw` | `sensor_msgs/Image` | wrist D435 |
+| `/joint_states` | `sensor_msgs/JointState` | arm + gripper |
+
+### Topics subscribed (CuRobo — depth, internal)
+
+| Topic | Type | Source |
+|---|---|---|
+| `/camera/camera/depth/color/image_raw` | `sensor_msgs/Image` | overhead D435 |
+| `/camera/camera/depth/color/camera_info` | `sensor_msgs/CameraInfo` | overhead D435 |
 | `/wrist_camera/wrist_camera/depth/color/image_raw` | `sensor_msgs/Image` | wrist D435 |
-| `/wrist_camera/wrist_camera/depth/color/points` | `sensor_msgs/PointCloud2` | wrist D435 |
-| `/joint_states` | `sensor_msgs/JointState` | arm + gripper state |
+| `/wrist_camera/wrist_camera/depth/color/camera_info` | `sensor_msgs/CameraInfo` | wrist D435 |
 
 ### Action clients
 
@@ -349,9 +360,32 @@ This means `ros2-ai-planner` now has a runtime segmentation-to-GraspGen path, bu
 | `/ur5_controller/follow_joint_trajectory` | `control_msgs/FollowJointTrajectory` | UR5 arm |
 | `/gripper_controller/follow_joint_trajectory` | `control_msgs/FollowJointTrajectory` | Robotiq 85 gripper |
 
-## Development
+## Testing
 
 With the development override compose file, source edits in `src/` take effect immediately inside the container because of the volume mount plus `--symlink-install`.
+
+### Pipeline visualization (web-based, works over SSH)
+
+```bash
+# Forward the port if on SSH
+ssh -L 8080:localhost:8080 user@host
+
+# Run the test
+docker compose run --rm -p 8080:8080 ai_planner \
+  python3 /ros2_ws/src/pipeline_orchestrator/scripts/test_pipeline_viz.py
+```
+
+Open `http://localhost:8080`. The script runs synthetic depth frames through the full Mapper → MotionPlanner pipeline and animates the planned trajectory on the UR5 model.
+
+### Unit tests
+
+```bash
+docker compose run --rm ai_planner bash -c "
+  source /ros2_ws/install/setup.bash &&
+  python3 -m pytest src/pipeline_orchestrator/test/test_orchestrator.py -v"
+```
+
+## Development
 
 To rebuild the ROS2 workspace inside the container:
 
@@ -378,13 +412,16 @@ If the base image already exists locally, `build_image.sh` skips rebuilding it.
 
 ## Adding Dependencies
 
-Fill in the relevant file under `requirements/` and add a `pip3 install` step to the Dockerfile:
+## Implementation Status
 
-| File | For |
+| Module | Status |
 |---|---|
 | `requirements/sam2.txt` | SAM2 |
 | `requirements/graspgen.txt` | GraspGen |
 | `requirements/curobo.txt` | cuRobo |
+| `curobo.py` — dual-RGBD Mapper + MotionPlanner | implemented |
+| `orchestrator.py` — service pipeline | implemented |
+| `orchestrator.py` — motion execution | optional, gated by `enable_motion_execution` |
 
 ## Immediate Next Step
 
