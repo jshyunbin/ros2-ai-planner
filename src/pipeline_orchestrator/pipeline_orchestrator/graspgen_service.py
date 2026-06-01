@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import time
 
@@ -18,6 +19,12 @@ try:
 except ImportError:  # pragma: no cover - import is environment-dependent
     get_gripper_info = None
     filter_colliding_grasps = None
+
+# Kinematic reachability constants (ported from yeina / pick_and_place_ur5.py).
+# GraspGen TCP is GRIPPER_TCP_Z_OFFSET ahead of tool0 along the grasp Z-axis.
+_GRIPPER_TCP_Z_OFFSET = 0.1034   # m — robotiq_2f_140 checkpoint gripper_depth
+_MAX_REACH = 0.82                 # m — UR5 kinematic reach limit
+_MIN_TOOL_Z = 0.08                # m — minimum tool0 height above table
 
 
 class GraspGenService(Node):
@@ -147,6 +154,20 @@ class GraspGenService(Node):
             )
             return response
 
+        grasps, confidences = self._kinematic_filter(grasps, confidences)
+        if len(grasps) == 0:
+            response.success = False
+            response.message = "All grasps filtered by kinematic reachability (reach/table gate)."
+            self._save_debug_artifacts(
+                debug_path,
+                segmented_cloud=segmented_cloud,
+                background_cloud=self._latest_background_cloud,
+                response_payload={"success": False, "error": response.message},
+                grasps=np.empty((0, 4, 4), dtype=np.float32),
+                confidences=np.empty((0,), dtype=np.float32),
+            )
+            return response
+
         collision_free_mask = self._compute_collision_free_mask(grasps)
         filtered_rows = self._rank_grasps(grasps, confidences, collision_free_mask)
         max_returned = int(self.get_parameter("max_returned_grasps").value)
@@ -235,6 +256,30 @@ class GraspGenService(Node):
             collision_threshold=collision_threshold,
             num_collision_samples=collision_samples,
         )
+
+    def _kinematic_filter(
+        self, grasps: np.ndarray, confidences: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Remove grasps whose tool0 position violates UR5 reach or table clearance.
+
+        Ported from yeina graspgen.py AC2 filter.  tool0 is approximated by
+        backing off from the GraspGen TCP along the grasp +Z axis by
+        _GRIPPER_TCP_Z_OFFSET.
+        """
+        tool_pos = np.stack(
+            [g[:3, 3] - g[:3, 2] * _GRIPPER_TCP_Z_OFFSET for g in grasps]
+        )
+        radii = np.linalg.norm(tool_pos, axis=1)
+        min_tool_z = max(
+            float(os.environ.get('PIPELINE_GRASPGEN_MIN_TOOL_Z', _MIN_TOOL_Z)),
+            _MIN_TOOL_Z,
+        )
+        keep = (radii < _MAX_REACH) & (tool_pos[:, 2] > min_tool_z)
+        self.get_logger().info(
+            f'GraspGen kinematic filter: kept {int(keep.sum())}/{len(grasps)} grasps '
+            f'(reach<{_MAX_REACH:.2f}m, tool_z>{min_tool_z:.2f}m)'
+        )
+        return grasps[keep], confidences[keep]
 
     def _rank_grasps(self, grasps: np.ndarray, confidences: np.ndarray, collision_free_mask):
         rank_mode = str(self.get_parameter("rank_mode").value)

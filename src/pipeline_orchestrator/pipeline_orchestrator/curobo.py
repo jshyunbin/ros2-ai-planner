@@ -1,458 +1,328 @@
-import threading
+"""cuRobo motion planning module.
+
+Ported from yeina's proven integration (static-cuboid collision world +
+plan_grasp 3-phase pick with per-candidate / approach-offset retry).
+
+Key design decisions vs the previous TSDF-streaming approach:
+  - Collision world: explicit static cuboids (table, baskets, bookshelf) only.
+    The Mesh-from-pointcloud path requires warp.torch which is broken in this
+    Docker, and yeina's own code already treats static-only as the reliable
+    fallback.  Dynamic object collision is handled by GraspGen's inference.
+  - plan_grasp() gives approach → grasp → lift as separate result phases, so
+    the service can return them to the orchestrator for gripper interleaving.
+  - Close-in bias: _effective_gripper_tcp_z_offset() offsets the cuRobo tool0
+    goal slightly beyond the GraspGen TCP to compensate for 2F-85 vs 2F-140
+    checkpoint geometry mismatch.
+"""
+
+import os
 
 import numpy as np
 import torch
-import rclpy.duration
 from builtin_interfaces.msg import Duration as RosDuration
-from cv_bridge import CvBridge
-from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
-from rclpy.time import Time
-from sensor_msgs.msg import CameraInfo, Image
-from tf2_ros import Buffer, ExtrapolationException, LookupException, TransformListener
+from scipy.spatial.transform import Rotation as R
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
-from curobo._src.geom.types import SceneCfg, VoxelGrid
-# RobotSegmenter.from_robot_file does not forward ops_dtype to __init__,
-# so build Kinematics ourselves to override the default (bfloat16) which
-# mismatches the float32 robot_spheres tensor at runtime.
-from curobo._src.robot.kinematics.kinematics import Kinematics
-from curobo._src.types.robot import RobotCfg
-from curobo._src.util_file import get_robot_configs_path, join_path, load_yaml
 from curobo.motion_planner import MotionPlanner, MotionPlannerCfg
-from curobo.perception import FilterDepth, Mapper, MapperCfg, RobotSegmenter
-from curobo.types import CameraObservation, GoalToolPose, JointState as CuRoboJointState, Pose
+from curobo.types import GoalToolPose, JointState as CuRoboJointState
+from curobo.scene import Cuboid
+from curobo._src.geom.data.data_scene import SceneCfg
 
-OVERHEAD_DEPTH_TOPIC = '/camera/camera/depth/color/image_raw'
-OVERHEAD_INFO_TOPIC  = '/camera/camera/depth/color/camera_info'
-WRIST_DEPTH_TOPIC    = '/wrist_camera/wrist_camera/depth/color/image_raw'
-WRIST_INFO_TOPIC     = '/wrist_camera/wrist_camera/depth/color/camera_info'
-OVERHEAD_FRAME = 'camera_color_optical_frame'
-WRIST_FRAME    = 'wrist_camera_color_optical_frame'
-WORLD_FRAME    = 'world'
-MIN_FRAMES     = 5
-UR5_CONFIG     = '/ros2_ws/src/pipeline_orchestrator/config/ur5_curobo.yml'
-JOINT_NAMES    = [
-    'shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint',
-    'wrist_1_joint', 'wrist_2_joint', 'wrist_3_joint',
-]
+# Robot config: use the cuRobo built-in UR5 config (matches yeina).
+# The custom ur5_curobo.yml has 8 tool0 gripper spheres extending to z=0.18m
+# which cause false collision detections with scene cuboids during approach
+# trajectory planning.  The built-in config has a minimal tool0 model.
+UR5_CONFIG = 'ur5.yml'
+
+JOINT_NAMES = (
+    'shoulder_pan_joint',
+    'shoulder_lift_joint',
+    'elbow_joint',
+    'wrist_1_joint',
+    'wrist_2_joint',
+    'wrist_3_joint',
+)
+
+TOPK_GRASPS = 10
+INTERP_DT = 0.02
+
+# GraspGen TCP → UR5 tool0 distance along grasp +Z (robotiq_2f_140 checkpoint).
+GRIPPER_TCP_Z_OFFSET = 0.1034
+
+# Static scene obstacles in base_link (name, dims_xyz, pose_xyz_wxyz).
+# Conservative approximations around the audited world-model poses.
+_STATIC_CUBOIDS = (
+    ('table_top',                   [1.40, 0.90, 0.04], [0.45,  0.0,  -0.02, 1.0, 0.0, 0.0, 0.0]),
+    ('left_storage_basket_support', [0.34, 0.26, 0.12], [0.0,   0.55,  0.54, 1.0, 0.0, 0.0, 0.0]),
+    ('right_storage_basket_support',[0.34, 0.26, 0.12], [0.0,  -0.55,  0.54, 1.0, 0.0, 0.0, 0.0]),
+    ('workspace_basket_support',    [0.34, 0.30, 0.10], [0.55,  0.0,   0.46, 1.0, 0.0, 0.0, 0.0]),
+    ('bookshelf_lower_body',        [0.20, 0.70, 0.55], [0.95, -0.30,  0.28, 1.0, 0.0, 0.0, 0.0]),
+)
 
 
 class CuRobo:
-    """Dual-RGBD TSDF fusion + collision-aware UR5 motion planning via cuRoboV2."""
+    """UR5 motion planner (static-cuboid world, yeina-style pick pipeline)."""
 
-    def __init__(self, node, enable_viz=False):
-        self._node = node
-        self._logger = node.get_logger()
-        self._lock = threading.Lock()
-        self._frame_count = 0
-
-        # When enabled, _on_depth unprojects each frame into a world-frame
-        # point cloud and plan_trajectory snapshots the reconstructed TSDF
-        # surface voxels, so a viser front-end can render the perception
-        # state. Off by default to keep the orchestrator's hot path lean.
-        self._enable_viz = enable_viz
-        self._point_clouds: dict = {}   # cam_id -> (N, 3) np world points
-        self._tsdf_centers = None       # (M, 3) np surface voxel centres
-
-        self._cam_depth: dict = {}
-        self._cam_intrinsics: dict = {}
-        self._cam_pose: dict = {}
-        self._latest_joints = None   # sensor_msgs/JointState; needed by segmenter
-
-        self._tf_buffer = Buffer()
-        self._tf_listener = TransformListener(self._tf_buffer, node)
-        self._bridge = CvBridge()
-
-        self._mapper = Mapper(MapperCfg(
-            extent_meters_xyz=(2.0, 2.0, 1.5),
-            voxel_size=0.02,
-            esdf_voxel_size=0.05,
-            truncation_distance=0.1,
-            depth_minimum_distance=0.15,
-            depth_maximum_distance=2.0,
-            # 1.0 = cuRobo default, fine for offline static datasets, but for
-            # live noisy depth (Gazebo RealSense) it pins every noisy pixel
-            # in forever. 0.95 fades stale single-view noise over ~14 frames.
-            decay_factor=0.95,
-            frustum_decay_factor=1.0,
-            enable_static=False,
-            num_cameras=2,
-        ))
-        self._depth_filter = FilterDepth(
-            image_shape=(480, 640),
-            depth_minimum_distance=0.15,
-            depth_maximum_distance=2.0,
-            flying_pixel_threshold=0.5,
-            bilateral_kernel_size=3,
+    def __init__(self, logger):
+        self._logger = logger
+        cfg = MotionPlannerCfg.create(
+            robot=UR5_CONFIG,
+            max_goalset=TOPK_GRASPS,
+            collision_cache={'obb': 30},
         )
-        # cuRobo's TSDF integrator unconditionally calls rgb_image.reshape(),
-        # so CameraObservation needs an rgb_image even for depth-only mapping.
-        self._dummy_rgb = torch.zeros(
-            (2, 480, 640, 3), dtype=torch.uint8, device='cuda')
+        self._planner = MotionPlanner(cfg)
+        self._planner.warmup(enable_graph=True, num_warmup_iterations=5)
+        self._planner.update_world(SceneCfg(cuboid=_static_cuboids()))
+        self._logger.info('CuRobo: MotionPlanner ready (static-cuboid world).')
 
-        # Mask the robot's own body out of depth before integrating, so the
-        # ESDF never marks the arm itself as an obstacle. Build Kinematics
-        # manually to force ops_dtype=float32 -- the from_robot_file factory
-        # leaves it at bfloat16 default which mismatches robot_spheres.
-        robot_yaml = load_yaml(join_path(get_robot_configs_path(), UR5_CONFIG))
-        robot_cfg = RobotCfg.create(robot_yaml)
-        self._segmenter = RobotSegmenter(
-            Kinematics(robot_cfg.kinematics),
-            distance_threshold=0.05,
-            use_cuda_graph=False,
-            ops_dtype=torch.float32,
-        )
+    # ── public API ────────────────────────────────────────────────────────────
 
-        self._planner = self._build_planner()
-        self._subscriptions = []
-        self._subscribe_depth_streams(node)
-        self._logger.info('CuRobo: ready.')
+    def plan_pick(self, grasp_candidates, joint_states):
+        """3-phase pick plan: approach → grasp → lift.
 
-    def _subscribe_depth_streams(self, node: Node) -> None:
-        # Gazebo's realsense plugin publishes camera streams with BEST_EFFORT
-        # reliability; subscribers must match (qos_profile_sensor_data) or no
-        # data ever arrives.
-        #
-        # Register subscriptions only after planner warmup. cuRobo warmup uses
-        # CUDA graph capture, and depth callbacks also touch CUDA; running both
-        # concurrently can poison the capture and abort the process.
-        self._subscriptions.extend([
-            node.create_subscription(
-                Image,
-                OVERHEAD_DEPTH_TOPIC,
-                lambda msg: self._on_depth(msg, 'overhead', OVERHEAD_FRAME),
-                qos_profile_sensor_data,
-            ),
-            node.create_subscription(
-                CameraInfo,
-                OVERHEAD_INFO_TOPIC,
-                lambda msg: self._on_info(msg, 'overhead'),
-                qos_profile_sensor_data,
-            ),
-            node.create_subscription(
-                Image,
-                WRIST_DEPTH_TOPIC,
-                lambda msg: self._on_depth(msg, 'wrist', WRIST_FRAME),
-                qos_profile_sensor_data,
-            ),
-            node.create_subscription(
-                CameraInfo,
-                WRIST_INFO_TOPIC,
-                lambda msg: self._on_info(msg, 'wrist'),
-                qos_profile_sensor_data,
-            ),
-        ])
-
-    def update_joint_state(self, msg):
-        """Feed the latest /joint_states (called by the orchestrator).
-
-        The robot segmenter needs the live joints to mask the arm out of each
-        depth frame; the orchestrator owns the subscription and pushes them here.
+        grasp_candidates: iterable of dicts with key 'pose_4x4' ((4,4) ndarray,
+            GraspGen TCP pose in base_link, ordered best-first).
+        Returns a cuRobo GraspPlanResult on success, None on failure.
         """
-        with self._lock:
-            self._latest_joints = msg
-
-    # ── viz accessors (thread-safe snapshots for a viser front-end) ──────────
-
-    @property
-    def frame_count(self) -> int:
-        """Number of dual-camera frames integrated into the TSDF so far."""
-        with self._lock:
-            return self._frame_count
-
-    def get_point_clouds(self) -> dict:
-        """Latest per-camera world-frame point clouds: {cam_id: (N, 3) ndarray}.
-
-        Empty until enable_viz is set and depth frames have arrived.
-        """
-        with self._lock:
-            return dict(self._point_clouds)
-
-    def get_tsdf_centers(self):
-        """Reconstructed TSDF surface voxel centres as (M, 3) ndarray, or None.
-
-        Populated by plan_trajectory once the ESDF has been computed.
-        """
-        with self._lock:
-            return self._tsdf_centers
-
-    def get_latest_joints(self):
-        """Most recent sensor_msgs/JointState, or None."""
-        with self._lock:
-            return self._latest_joints
-
-    def _cache_viz_cloud(self, cam_id, depth, t, r, K):
-        """Unproject depth to a world-frame point cloud and cache it (numpy).
-
-        Mirrors the transform the Mapper does internally so the viser cloud
-        lines up with the reconstructed TSDF. Best-effort: failures never
-        disrupt perception.
-        """
-        from pipeline_orchestrator.live_viz_helpers import depth_to_xyz
         try:
-            xyz_cam = depth_to_xyz(depth, K)
-            qw, qx, qy, qz = float(r.w), float(r.x), float(r.y), float(r.z)
-            R = torch.tensor([
-                [1 - 2*(qy*qy + qz*qz), 2*(qx*qy - qw*qz),     2*(qx*qz + qw*qy)],
-                [2*(qx*qy + qw*qz),     1 - 2*(qx*qx + qz*qz), 2*(qy*qz - qw*qx)],
-                [2*(qx*qz - qw*qy),     2*(qy*qz + qw*qx),     1 - 2*(qx*qx + qy*qy)],
-            ], dtype=torch.float32, device=xyz_cam.device)
-            t_vec = torch.tensor(
-                [t.x, t.y, t.z], dtype=torch.float32, device=xyz_cam.device)
-            xyz_world = (xyz_cam @ R.T + t_vec).cpu().numpy()
+            current = self._ros_js_to_curobo(joint_states)
+            candidates = list(grasp_candidates)
+            collision_links = _pick_disable_collision_links(self._planner)
+            last_status = 'unknown'
+            for approach_offset in _pick_approach_offsets():
+                for ci, candidate in enumerate(candidates):
+                    goalset = self._grasps_to_goalset([candidate])
+                    result = self._planner.plan_grasp(
+                        grasp_poses=goalset,
+                        current_state=current,
+                        grasp_approach_offset=approach_offset,
+                        grasp_approach_in_tool_frame=True,
+                        grasp_lift_axis='z',
+                        grasp_lift_offset=_env_float(
+                            'PIPELINE_CUROBO_GRASP_LIFT_OFFSET', 0.10),
+                        grasp_lift_in_tool_frame=False,
+                        plan_approach_to_grasp=True,
+                        plan_grasp_to_lift=True,
+                        disable_collision_links=collision_links,
+                    )
+                    if _result_success(result):
+                        self._logger.info(
+                            f'CuRobo.plan_pick succeeded: '
+                            f'candidate={ci} approach={approach_offset:.3f}m'
+                        )
+                        return result
+                    last_status = getattr(result, 'status', 'unknown')
+                    self._logger.warn(
+                        f'CuRobo.plan_pick: failed ci={ci} '
+                        f'approach={approach_offset:.3f}m status={last_status}'
+                    )
+            self._logger.warn(
+                f'CuRobo.plan_pick: all attempts exhausted ({last_status})')
+            return None
         except Exception as exc:
-            self._logger.warning(
-                f'CuRobo: viz cloud failed for {cam_id}: '
-                f'{type(exc).__name__}: {exc}')
-            return
-        with self._lock:
-            self._point_clouds[cam_id] = xyz_world
+            self._logger.error(f'CuRobo.plan_pick error: {exc}')
+            return None
 
-    def _cache_viz_tsdf(self):
-        """Snapshot the reconstructed TSDF surface voxel centres (numpy)."""
+    def plan_trajectory(self, goal_pose, joint_states):
+        """Single-segment plan for place / home.
+
+        goal_pose: geometry_msgs/Pose (tool0 target in base_link).
+        Returns JointTrajectory or None.
+        """
         try:
-            centers, _ = self._mapper.integrator.extract_occupied_voxels(
-                surface_only=True)
-            tsdf_np = centers.cpu().numpy() if centers is not None else None
+            current = self._ros_js_to_curobo(joint_states)
+            p, o = goal_pose.position, goal_pose.orientation
+            goal = GoalToolPose(
+                tool_frames=self._planner.tool_frames,
+                position=torch.tensor(
+                    [p.x, p.y, p.z],
+                    device='cuda', dtype=torch.float32).view(1, 1, 1, 1, 3),
+                quaternion=torch.tensor(
+                    [o.w, o.x, o.y, o.z],
+                    device='cuda', dtype=torch.float32).view(1, 1, 1, 1, 4),
+            )
+            result = self._planner.plan_pose(goal, current)
+            if not _result_success(result):
+                self._logger.warn(
+                    f'CuRobo.plan_trajectory failed: '
+                    f'{getattr(result, "status", "unknown")}'
+                )
+                return None
+            return interp_traj_to_ros(result.get_interpolated_plan())
         except Exception as exc:
-            self._logger.warning(
-                f'CuRobo: extract_occupied_voxels failed: '
-                f'{type(exc).__name__}: {exc}')
-            return
-        with self._lock:
-            self._tsdf_centers = tsdf_np
+            self._logger.error(f'CuRobo.plan_trajectory error: {exc}')
+            return None
 
-    def _on_info(self, msg, cam_id: str):
-        K = torch.tensor([
-            [msg.k[0], 0.0,      msg.k[2]],
-            [0.0,      msg.k[4], msg.k[5]],
-            [0.0,      0.0,      1.0     ],
-        ], dtype=torch.float32, device='cuda')
-        with self._lock:
-            self._cam_intrinsics[cam_id] = K
+    # ── private helpers ───────────────────────────────────────────────────────
 
-    def _on_depth(self, msg, cam_id: str, frame: str):
-        with self._lock:
-            if cam_id not in self._cam_intrinsics:
-                return
-            K = self._cam_intrinsics[cam_id]
-
-        try:
-            # Use the latest available transform (Time() == 0) rather than the
-            # depth message's exact stamp: the wrist camera's TF (which moves
-            # with the arm) lags the depth stream by a few hundred ms, so an
-            # exact-stamp lookup throws "extrapolation into the future" and the
-            # wrist frame never integrates — stalling the whole dual-cam map.
-            transform = self._tf_buffer.lookup_transform(
-                WORLD_FRAME, frame, Time(),
-                timeout=rclpy.duration.Duration(seconds=0.1))
-        except Exception as e:
-            self._logger.warning(
-                f'CuRobo: TF lookup failed for {frame}: {e}',
-                throttle_duration_sec=2.0)
-            return
-
-        cv_img = self._bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
-        depth = torch.from_numpy(cv_img.astype(np.float32) / 1000.0).cuda()
-        depth = torch.nan_to_num(depth, nan=0.0)
-        filtered, _ = self._depth_filter(depth.unsqueeze(0))
-        depth = filtered[0]
-
-        t = transform.transform.translation
-        r = transform.transform.rotation
-        pose = Pose.from_numpy(
-            np.array([t.x, t.y, t.z], dtype=np.float32),
-            np.array([r.w, r.x, r.y, r.z], dtype=np.float32),
+    def _ros_js_to_curobo(self, joint_states) -> CuRoboJointState:
+        name_to_pos = dict(zip(joint_states.name, joint_states.position))
+        missing = [j for j in JOINT_NAMES if j not in name_to_pos]
+        if missing:
+            raise ValueError(f'CuRobo: /joint_states missing joints: {missing}')
+        pos = torch.tensor(
+            [[name_to_pos[j] for j in JOINT_NAMES]],
+            device='cuda', dtype=torch.float32,
         )
+        return CuRoboJointState.from_position(pos, joint_names=list(JOINT_NAMES))
 
-        # Snapshot the pre-segmenter cloud for viser (shows the robot/gripper
-        # too, since masking happens below only for the ESDF path).
-        if self._enable_viz:
-            self._cache_viz_cloud(cam_id, depth, t, r, K)
+    def _grasps_to_goalset(self, grasp_candidates) -> GoalToolPose:
+        """Top-K candidate dicts (pose_4x4) → GoalToolPose at tool0.
 
-        # Mask out pixels that hit the robot itself; otherwise the ESDF marks
-        # the arm/gripper as obstacles and the planner refuses every config.
-        # Skip silently if /joint_states hasn't arrived yet.
-        with self._lock:
-            js = self._latest_joints
-        if js is not None:
-            by_name = dict(zip(js.name, js.position))
-            ordered = [by_name[n] for n in JOINT_NAMES if n in by_name]
-            if len(ordered) == len(JOINT_NAMES):
-                cam_obs_single = CameraObservation(
-                    rgb_image=self._dummy_rgb[:1],
-                    depth_image=depth.unsqueeze(0),
-                    intrinsics=K.unsqueeze(0),
-                    pose=pose,
-                    # depth is already in metres; override the mm-default.
-                    depth_to_meter=1.0,
-                )
-                seg_js = CuRoboJointState.from_position(
-                    torch.tensor([ordered], dtype=torch.float32, device='cuda'),
-                    joint_names=JOINT_NAMES)
-                try:
-                    _, depth_masked = self._segmenter.get_robot_mask_from_active_js(
-                        cam_obs_single, seg_js)
-                    depth = depth_masked[0]
-                    # Flush segmenter ops before downstream Mapper kernels;
-                    # otherwise their async work can poison a later CUDA
-                    # graph capture in compute_esdf.
-                    torch.cuda.synchronize()
-                except Exception as exc:
-                    self._logger.warning(
-                        f'CuRobo: RobotSegmenter failed for {cam_id}: '
-                        f'{type(exc).__name__}: {exc}')
-
-        with self._lock:
-            self._cam_depth[cam_id] = depth
-            self._cam_pose[cam_id] = pose
-            self._cam_intrinsics[cam_id] = K
-            ready = ('overhead' in self._cam_depth and 'wrist' in self._cam_depth)
-            if ready:
-                batched = CameraObservation(
-                    rgb_image=self._dummy_rgb,
-                    depth_image=torch.stack([
-                        self._cam_depth['overhead'],
-                        self._cam_depth['wrist'],
-                    ]),
-                    intrinsics=torch.stack([
-                        self._cam_intrinsics['overhead'],
-                        self._cam_intrinsics['wrist'],
-                    ]),
-                    pose=Pose(
-                        position=torch.cat([
-                            self._cam_pose['overhead'].position,
-                            self._cam_pose['wrist'].position,
-                        ]),
-                        quaternion=torch.cat([
-                            self._cam_pose['overhead'].quaternion,
-                            self._cam_pose['wrist'].quaternion,
-                        ]),
-                    ),
-                    # depth is already in metres; override the mm-default so
-                    # the TSDF integrator doesn't scale every depth by 0.001.
-                    depth_to_meter=1.0,
-                )
-
-        if ready:
-            self._mapper.integrate(batched)
-            with self._lock:
-                self._frame_count += 1
-
-    def plan_trajectory(self, grasp_pose, joint_states):
-        with self._lock:
-            frame_count = self._frame_count
-
-        if frame_count >= MIN_FRAMES:
-            # Sync first so any pending Warp/segmenter ops complete before
-            # compute_esdf opens its CUDA graph capture; an error queued on a
-            # different stream otherwise invalidates the capture (Warp 901).
-            torch.cuda.synchronize()
-            voxel_grid = self._mapper.compute_esdf()
-            self._planner.update_world(SceneCfg(voxel=[voxel_grid]))
-            if self._enable_viz:
-                self._cache_viz_tsdf()
-        else:
-            self._logger.warning(
-                f'CuRobo: map not ready ({frame_count}/{MIN_FRAMES} frames), '
-                'planning in free space.')
-
-        by_name = dict(zip(joint_states.name, joint_states.position))
-        ordered = [by_name[n] for n in JOINT_NAMES if n in by_name]
-        positions = torch.tensor([ordered], dtype=torch.float32, device='cuda')
-        start = CuRoboJointState.from_position(positions, joint_names=JOINT_NAMES)
-
-        p = grasp_pose.position
-        o = grasp_pose.orientation
-        goal = GoalToolPose(
+        Applies the close-in bias: drives tool0 goal close to the GraspGen TCP
+        so the 2F-85 gripper (shorter than 2F-140) closes at the right depth.
+        """
+        mats = np.stack([g['pose_4x4'] for g in grasp_candidates])
+        t_tool_grasp = np.eye(4)
+        t_tool_grasp[2, 3] = _effective_gripper_tcp_z_offset()
+        inv = np.linalg.inv(t_tool_grasp)
+        tool = np.stack([m @ inv for m in mats])
+        pos = tool[:, :3, 3]
+        quat_xyzw = R.from_matrix(tool[:, :3, :3]).as_quat()   # scipy: xyzw
+        quat_wxyz = np.concatenate(
+            [quat_xyzw[:, 3:4], quat_xyzw[:, :3]], axis=1)
+        n = pos.shape[0]
+        return GoalToolPose(
             tool_frames=self._planner.tool_frames,
             position=torch.tensor(
-                [[[[[p.x, p.y, p.z]]]]], device='cuda', dtype=torch.float32),
+                pos, device='cuda', dtype=torch.float32).view(1, 1, 1, n, 3),
             quaternion=torch.tensor(
-                [[[[[o.w, o.x, o.y, o.z]]]]], device='cuda', dtype=torch.float32),
+                quat_wxyz, device='cuda', dtype=torch.float32).view(1, 1, 1, n, 4),
         )
 
-        result = self._planner.plan_pose(goal, start)
-        if result is None or not result.success.any():
-            self._logger.warning('CuRobo: planning failed.')
-            return None
 
-        return self._to_ros_trajectory(result)
+# ── module-level helpers (also used by curobo_service.py) ─────────────────────
 
-    def tool_pose(self, joint_states):
-        """Forward-kinematics tool pose for a joint state.
+def interp_traj_to_ros(interp_traj, dt: float = INTERP_DT,
+                       time_offset: float = 0.0) -> JointTrajectory:
+    """Convert a cuRobo interpolated trajectory to a ROS JointTrajectory.
 
-        Returns ((x, y, z), (w, x, y, z)) in the planner's base frame, or None
-        on failure. Useful for capturing the robot's current end-effector pose
-        (e.g. a "home" target to return to). Touches CUDA, so call it from the
-        same thread that runs plan_trajectory (the ROS executor).
-        """
-        try:
-            by_name = dict(zip(joint_states.name, joint_states.position))
-            ordered = [by_name[n] for n in JOINT_NAMES if n in by_name]
-            positions = torch.tensor([ordered], dtype=torch.float32, device='cuda')
-            cjs = CuRoboJointState.from_position(positions, joint_names=JOINT_NAMES)
-            tp = self._planner.compute_kinematics(cjs).tool_poses
-            pos = tp.position.reshape(-1)[:3].tolist()
-            quat = tp.quaternion.reshape(-1)[:4].tolist()
-            return tuple(pos), tuple(quat)
-        except Exception as exc:
-            self._logger.warning(
-                f'CuRobo: FK failed: {type(exc).__name__}: {exc}')
-            return None
+    time_offset: seconds to add to every time_from_start (for concatenation).
+    """
+    traj = interp_traj
+    # Squeeze the batch dimension cuRobo pads onto plan results.
+    if hasattr(traj, 'squeeze'):
+        traj = traj.squeeze(0)
+    pos_t = traj.position
+    while pos_t.dim() > 2:
+        pos_t = pos_t[0]
+    positions = pos_t.cpu().numpy()
 
-    def _to_ros_trajectory(self, result):
-        traj_msg = JointTrajectory()
-        traj_msg.joint_names = list(self._planner.joint_names)
+    velocities = None
+    vel_raw = getattr(traj, 'velocity', None)
+    if vel_raw is not None:
+        while vel_raw.dim() > 2:
+            vel_raw = vel_raw[0]
+        velocities = vel_raw.cpu().numpy()
 
-        plan = result.get_interpolated_plan()
-        # position may be (B, H, L, G, J) or (B, T, J); reduce to (T, J) so each
-        # waypoint row is a flat float sequence (ROS2 rejects nested lists).
-        pos_t = plan.position
-        while pos_t.dim() > 2:
-            pos_t = pos_t[0]
-        positions = pos_t.cpu().numpy()
-        if plan.velocity is not None:
-            vel_t = plan.velocity
-            while vel_t.dim() > 2:
-                vel_t = vel_t[0]
-            velocities = vel_t.cpu().numpy()
-        else:
-            velocities = None
-        dt = self._planner.trajopt_solver.config.interpolation_dt
+    jt = JointTrajectory()
+    jt.joint_names = list(JOINT_NAMES)
+    for i, pos in enumerate(positions):
+        pt = JointTrajectoryPoint()
+        pt.positions = [float(x) for x in pos]
+        if velocities is not None:
+            pt.velocities = [float(x) for x in velocities[i]]
+        t_sec = time_offset + (i + 1) * dt
+        pt.time_from_start = RosDuration(
+            sec=int(t_sec), nanosec=int((t_sec % 1.0) * 1_000_000_000))
+        jt.points.append(pt)
+    return jt
 
-        for i, pos in enumerate(positions):
-            pt = JointTrajectoryPoint()
-            pt.positions = pos.tolist()
-            if velocities is not None:
-                pt.velocities = velocities[i].tolist()
-            t_sec = i * dt
-            pt.time_from_start = RosDuration(
-                sec=int(t_sec),
-                nanosec=int((t_sec % 1) * 1e9))
-            traj_msg.points.append(pt)
 
-        return traj_msg
+def concat_trajectories(
+    traj_a: JointTrajectory, traj_b: JointTrajectory
+) -> JointTrajectory:
+    """Append traj_b after traj_a, adjusting traj_b timestamps to be monotonic."""
+    combined = JointTrajectory()
+    combined.joint_names = traj_a.joint_names
+    combined.points = list(traj_a.points)
+    if traj_a.points:
+        last = traj_a.points[-1].time_from_start
+        offset = last.sec + last.nanosec * 1e-9
+    else:
+        offset = 0.0
+    for pt in traj_b.points:
+        t = pt.time_from_start.sec + pt.time_from_start.nanosec * 1e-9 + offset
+        new_pt = JointTrajectoryPoint()
+        new_pt.positions = pt.positions
+        new_pt.velocities = pt.velocities
+        new_pt.accelerations = pt.accelerations
+        new_pt.time_from_start = RosDuration(
+            sec=int(t), nanosec=int((t % 1.0) * 1_000_000_000))
+        combined.points.append(new_pt)
+    return combined
 
-    def _build_planner(self):
-        # scene_model + a pre-allocated voxel collision cache are required so the
-        # planner builds a voxel scene_collision_checker; without them
-        # update_world(SceneCfg(voxel=...)) hits a None checker. cuRobo allocates
-        # a 128**3 ESDF tensor regardless of MapperCfg.extent_meters_xyz, so the
-        # 7 m / 0.05 m cache (140**3 slots) gives headroom over that.
-        collision_cache = {
-            'voxel': {
-                'layers': 1,
-                'dims': [7.0, 7.0, 7.0],
-                'voxel_size': 0.05,
-            }
-        }
-        config = MotionPlannerCfg.create(
-            robot=UR5_CONFIG,
-            scene_model='collision_test.yml',
-            collision_cache=collision_cache,
+
+# ── private module helpers ────────────────────────────────────────────────────
+
+def _static_cuboids():
+    return [Cuboid(name=n, dims=d, pose=p) for n, d, p in _STATIC_CUBOIDS]
+
+
+def _effective_gripper_tcp_z_offset() -> float:
+    """Close-in bias: reduce the TCP→tool0 back-off to compensate 2F-85 geometry.
+
+    Default close_extra=0.1025 → effective_offset=0.0009 m, meaning cuRobo's
+    tool0 goal is placed almost at the GraspGen TCP, driving the 2F-85 fingers
+    ~10 cm deeper than the 2F-140 checkpoint originally intended.
+    """
+    close_extra = _env_float('PIPELINE_CUROBO_GRASP_CLOSE_EXTRA_M', 0.1025)
+    if close_extra < 0.0:
+        raise ValueError('PIPELINE_CUROBO_GRASP_CLOSE_EXTRA_M must be non-negative')
+    offset = GRIPPER_TCP_Z_OFFSET - close_extra
+    if offset <= 0.0:
+        raise ValueError(
+            'PIPELINE_CUROBO_GRASP_CLOSE_EXTRA_M must be smaller than '
+            'GRIPPER_TCP_Z_OFFSET'
         )
-        planner = MotionPlanner(config)
-        planner.warmup(enable_graph=True, num_warmup_iterations=3)
-        return planner
+    return offset
+
+
+def _pick_approach_offsets() -> tuple:
+    """Ordered list of approach pre-grasp distances to try (negative = along -Z)."""
+    raw = os.environ.get('PIPELINE_CUROBO_GRASP_APPROACH_OFFSETS', '-0.035,-0.06,-0.10')
+    offsets = []
+    for item in raw.split(','):
+        item = item.strip()
+        if not item:
+            continue
+        value = float(item)
+        if abs(value) < 1e-6:
+            raise ValueError(
+                'PIPELINE_CUROBO_GRASP_APPROACH_OFFSETS values must be nonzero')
+        offsets.append(value)
+    if not offsets:
+        raise ValueError('PIPELINE_CUROBO_GRASP_APPROACH_OFFSETS must not be empty')
+    return tuple(offsets)
+
+
+def _pick_disable_collision_links(planner) -> list:
+    raw = os.environ.get('PIPELINE_CUROBO_GRASP_DISABLE_COLLISION_LINKS')
+    if raw is not None:
+        return [item.strip() for item in raw.split(',') if item.strip()]
+    try:
+        links = (
+            planner.kinematics.config.kinematics_config.grasp_contact_link_names
+        )
+    except Exception:  # noqa: BLE001
+        links = None
+    return list(links) if links else ['tool0']
+
+
+def _result_success(result) -> bool:
+    if result is None:
+        return False
+    s = getattr(result, 'success', None)
+    if s is None:
+        return False
+    try:
+        return bool(s.any())
+    except AttributeError:
+        return bool(s)
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw == '':
+        return float(default)
+    return float(raw)

@@ -59,28 +59,16 @@ robot_cfg:
         - center: [0, 0, 0.05]
           radius: 0.05
       tool0:
-        # Robotiq 85 gripper body, rigidly attached to tool0 (UR5 flange).
-        # The cuRobo config doesn't know the gripper joints, so we
-        # approximate the entire gripper with a sphere cluster anchored on
-        # tool0. Used by both RobotSegmenter (to mask gripper pixels out of
-        # depth before mapping) and the planner (as collision geometry);
-        # over-coverage is intentional to keep the gripper out of the ESDF.
-        - center: [0,  0,    0.02]
+        # Robotiq 85 gripper body: 3 spheres covering the flange and palm only.
+        # Finger spheres above z=0.10 were removed — they extended into the
+        # workspace envelope and caused false collision detections with the
+        # workspace_basket_support cuboid during approach trajectory planning.
+        - center: [0, 0, 0.02]
           radius: 0.05
-        - center: [0,  0,    0.06]
+        - center: [0, 0, 0.06]
           radius: 0.05
-        - center: [0,  0,    0.10]
+        - center: [0, 0, 0.10]
           radius: 0.05
-        - center: [0,  0,    0.13]
-          radius: 0.045
-        - center: [0,  0.04, 0.16]
-          radius: 0.03
-        - center: [0, -0.04, 0.16]
-          radius: 0.03
-        - center: [0,  0.04, 0.18]
-          radius: 0.025
-        - center: [0, -0.04, 0.18]
-          radius: 0.025
     self_collision_buffer:
       shoulder_link: 0.05
       upper_arm_link: 0.0

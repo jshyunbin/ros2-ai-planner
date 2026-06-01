@@ -1,6 +1,14 @@
+# Top-K GraspGen TCP poses for pick planning (ordered by confidence, best first).
+# When non-empty, the cuRobo service runs plan_pick() and returns approach_and_grasp
+# in `trajectory` plus `lift_trajectory` (execute: trajectory → close gripper → lift).
+geometry_msgs/Pose[] grasp_poses
+# Single goal for place/home planning (used when grasp_poses is empty).
 geometry_msgs/Pose grasp_pose
 sensor_msgs/JointState joint_state
 ---
 bool success
 string message
+# Approach-to-grasp trajectory (arm moves from current pose to grasp contact).
 trajectory_msgs/JointTrajectory trajectory
+# Lift trajectory (arm lifts after gripper closes). Only populated for plan_pick().
+trajectory_msgs/JointTrajectory lift_trajectory
