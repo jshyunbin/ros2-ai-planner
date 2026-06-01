@@ -5,28 +5,10 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
-from sensor_msgs.msg import PointCloud2, PointField
-from std_msgs.msg import Header
+from sensor_msgs.msg import PointCloud2
 from std_srvs.srv import Trigger
 
-
-def make_pointcloud2(points: np.ndarray, frame_id: str) -> PointCloud2:
-    xyz = np.asarray(points[:, :3], dtype=np.float32)
-    msg = PointCloud2()
-    msg.header = Header(frame_id=frame_id)
-    msg.height = 1
-    msg.width = len(xyz)
-    msg.fields = [
-        PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
-        PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
-        PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
-    ]
-    msg.is_bigendian = False
-    msg.point_step = 12
-    msg.row_step = 12 * len(xyz)
-    msg.data = xyz.tobytes()
-    msg.is_dense = True
-    return msg
+from pipeline_orchestrator.pipeline_utils import make_xyz_cloud
 
 
 class GraspGenServiceCaller(Node):
@@ -68,11 +50,11 @@ class GraspGenServiceCaller(Node):
             return 1
 
         segmented_points = np.load(segmented_path)
-        segmented_msg = make_pointcloud2(segmented_points, self._frame_id)
+        segmented_msg = make_xyz_cloud(segmented_points, self._frame_id)
 
         if background_path is not None:
             background_points = np.load(background_path)
-            background_msg = make_pointcloud2(background_points, self._frame_id)
+            background_msg = make_xyz_cloud(background_points, self._frame_id)
         else:
             background_msg = None
 

@@ -18,7 +18,6 @@ advertised while the planner initialises.
 
 import traceback
 import threading
-import os
 
 import numpy as np
 import rclpy
@@ -31,6 +30,8 @@ from pipeline_orchestrator.curobo import (
     concat_trajectories,
     interp_traj_to_ros,
 )
+from pipeline_orchestrator.pipeline_utils import as_bool as _as_bool
+from pipeline_orchestrator.pipeline_utils import env_float as _env_float
 from riro_srvs.srv import PlanTrajectory
 
 
@@ -224,14 +225,6 @@ def _poses_to_candidates(ros_poses) -> list[dict]:
     return candidates
 
 
-def _as_bool(value) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() in ('1', 'true', 'yes', 'on')
-    return bool(value)
-
-
 def _append_preclose_insertion_to_trajectory(trajectory):
     max_delta = _env_float('PIPELINE_GRASP_CLOSE_NUDGE_MAX_JOINT_DELTA_RAD', 0.04)
     if max_delta <= 0.0 or trajectory is None or len(trajectory.points) < 2:
@@ -284,13 +277,6 @@ def _trajectory_duration_sec(trajectory) -> float:
         return 0.0
     stamp = trajectory.points[-1].time_from_start
     return float(stamp.sec) + float(stamp.nanosec) * 1e-9
-
-
-def _env_float(name: str, default: float) -> float:
-    raw = os.environ.get(name)
-    if raw is None or raw == '':
-        return float(default)
-    return float(raw)
 
 
 def main(args=None) -> None:

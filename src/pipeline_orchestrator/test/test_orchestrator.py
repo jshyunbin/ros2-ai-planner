@@ -344,49 +344,6 @@ def _orchestrator_skeleton():
     return orch
 
 
-def test_orchestrator_execute_trajectory_sends_goal_to_arm_server():
-    from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
-    orch = _orchestrator_skeleton()
-    orch._arm_client = MagicMock()
-    orch._arm_client.wait_for_server.return_value = True
-
-    traj = JointTrajectory()
-    traj.joint_names = ['shoulder_pan_joint']
-    traj.points = [JointTrajectoryPoint()]
-
-    orch._execute_trajectory(traj)
-
-    orch._arm_client.send_goal_async.assert_called_once()
-    sent_goal = orch._arm_client.send_goal_async.call_args.args[0]
-    assert list(sent_goal.trajectory.joint_names) == ['shoulder_pan_joint']
-
-
-def test_orchestrator_execute_trajectory_returns_none_when_server_unavailable():
-    from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
-    orch = _orchestrator_skeleton()
-    orch._arm_client = MagicMock()
-    orch._arm_client.wait_for_server.return_value = False
-
-    traj = JointTrajectory()
-    traj.points = [JointTrajectoryPoint()]
-    result = orch._execute_trajectory(traj)
-
-    assert result is None
-    orch._arm_client.send_goal_async.assert_not_called()
-
-
-def test_orchestrator_execute_trajectory_refuses_empty():
-    from trajectory_msgs.msg import JointTrajectory
-    orch = _orchestrator_skeleton()
-    orch._arm_client = MagicMock()
-
-    result = orch._execute_trajectory(JointTrajectory())
-
-    assert result is None
-    orch._arm_client.wait_for_server.assert_not_called()
-    orch._arm_client.send_goal_async.assert_not_called()
-
-
 def test_orchestrator_caches_joints_without_touching_planner_runtime():
     orch = _orchestrator_skeleton()
     msg = MagicMock()

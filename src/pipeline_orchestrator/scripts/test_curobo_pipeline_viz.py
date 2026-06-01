@@ -106,8 +106,8 @@ def arm_joint_state(latest):
 def deploy_trajectory(arm_client, traj, timeout_sec: float = 2.0):
     """Send a planned JointTrajectory to the UR5 arm controller.
 
-    Mirrors PipelineOrchestrator._execute_trajectory: CuRobo only plans, the
-    driver (here the harness, in production the orchestrator) deploys.
+    CuRobo only plans; the driver (here the harness, in production the
+    orchestrator via its FollowJointTrajectory action clients) deploys.
     """
     if traj is None or not traj.points:
         return None

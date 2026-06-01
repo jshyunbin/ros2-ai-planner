@@ -11,7 +11,6 @@ MultiThreadedExecutor so spin_until_future_complete works inside callbacks.
 
 import json
 import math
-import os
 import threading
 
 try:  # pragma: no cover - runtime dependency
@@ -56,13 +55,8 @@ except ImportError:  # pragma: no cover - runtime dependency
     StringString = None
     PlanTrajectory = None
 
-
-def _as_bool(value) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() in ('1', 'true', 'yes', 'on')
-    return bool(value)
+from pipeline_orchestrator.pipeline_utils import as_bool as _as_bool
+from pipeline_orchestrator.pipeline_utils import env_float as _env_float
 
 
 # Robotiq 2F-85 gripper constants (from challenge_constants.py / yeina).
@@ -442,30 +436,6 @@ class PipelineOrchestrator(Node):
         except Exception as exc:
             self.get_logger().warn(f'{label} failed (non-fatal): {exc}')
 
-    # ── legacy single-pose execution (kept for place / home paths) ────────────
-
-    def _execute_trajectory(
-        self,
-        trajectory: 'JointTrajectory',
-        timeout_sec: float = 2.0,
-    ):
-        """Send a planned JointTrajectory to the UR5 arm controller (async)."""
-        if trajectory is None or not trajectory.points:
-            self.get_logger().warning('refusing to execute empty trajectory.')
-            return None
-        if self._arm_client is None:
-            self.get_logger().warning('arm action client is unavailable.')
-            return None
-        if not self._arm_client.wait_for_server(timeout_sec=timeout_sec):
-            self.get_logger().error(
-                'arm action server unavailable.')
-            return None
-        goal = FollowJointTrajectory.Goal()
-        goal.trajectory = trajectory
-        self.get_logger().info(
-            f'deploying {len(trajectory.points)}-point trajectory.')
-        return self._arm_client.send_goal_async(goal)
-
     # ── grasp-row conversion ──────────────────────────────────────────────────
 
     @staticmethod
@@ -578,13 +548,6 @@ def _trajectory_summary(trajectory) -> str:
         f'joints={joint_names} points={len(points)} '
         f'duration={duration_text} final_positions={positions}'
     )
-
-
-def _env_float(name: str, default: float) -> float:
-    raw = os.environ.get(name)
-    if raw is None or raw == '':
-        return float(default)
-    return float(raw)
 
 
 def main(args=None) -> None:

@@ -5,61 +5,49 @@ from pipeline_orchestrator.segmentation_utils import (
     build_overlay_image,
     compute_centroid,
     compute_mask_roi,
-    parse_sam3_polygons,
-    rasterize_polygons,
-    select_masked_points,
+    depth_to_masked_points,
+    resize_for_api,
     stable_downsample,
 )
 
 
-def test_parse_sam3_polygons_reads_prompt_results_shape():
-    payload = {
-        "prompt_results": [
-            {
-                "predictions": [
-                    {
-                        "label": "banana",
-                        "confidence": 0.97,
-                        "masks": [[[1, 1], [5, 1], [5, 5], [1, 5]]],
-                    }
-                ]
-            }
-        ]
-    }
-
-    polygons = parse_sam3_polygons(payload)
-
-    assert len(polygons) == 1
-    assert polygons[0].shape == (4, 2)
-
-
-def test_rasterize_polygons_and_roi():
-    polygon = np.asarray([[2, 2], [7, 2], [7, 8], [2, 8]], dtype=np.float32)
-    mask = rasterize_polygons([polygon], width=10, height=10)
-
-    assert mask.sum() > 0
-    assert compute_mask_roi(mask) == (2, 2, 7, 8)
-
-
-def test_select_masked_points_and_centroid():
-    xyz = np.zeros((3, 3, 3), dtype=np.float32)
-    xyz[:, :, 2] = 0.5
-    xyz[1, 1] = np.array([0.2, 0.3, 0.4], dtype=np.float32)
+def test_depth_to_masked_points_and_centroid():
+    depth = np.full((3, 3), 0.5, dtype=np.float32)
+    depth[1, 1] = 0.4
 
     mask = np.zeros((3, 3), dtype=bool)
     mask[1, 1] = True
 
-    object_points, background_points = select_masked_points(
-        xyz,
+    object_points, background_points = depth_to_masked_points(
+        depth,
         mask,
+        fx=1.0,
+        fy=1.0,
+        cx=1.0,
+        cy=1.0,
         min_depth_m=0.1,
         max_depth_m=1.0,
     )
 
     assert object_points.shape == (1, 3)
     assert background_points.shape == (8, 3)
+    # The masked pixel is at the principal point, so x=y=0 and z=depth.
+    assert np.allclose(object_points[0], [0.0, 0.0, 0.4])
     centroid = compute_centroid(object_points, surface_band_m=0.02)
     assert np.allclose(centroid, object_points[0])
+
+
+def test_compute_mask_roi():
+    mask = np.zeros((10, 10), dtype=bool)
+    mask[2:9, 2:8] = True
+    assert compute_mask_roi(mask) == (2, 2, 7, 8)
+
+
+def test_resize_for_api_keeps_small_images():
+    image = np.zeros((20, 30, 3), dtype=np.uint8)
+    resized, scale_x, scale_y = resize_for_api(image, max_dimension=64)
+    assert resized.shape == image.shape
+    assert scale_x == 1.0 and scale_y == 1.0
 
 
 def test_stable_downsample_preserves_order():

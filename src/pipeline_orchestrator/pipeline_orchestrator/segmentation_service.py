@@ -11,10 +11,10 @@ from PIL import Image as PILImage
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
-from sensor_msgs.msg import CameraInfo, Image, PointCloud2, PointField
-from std_msgs.msg import Header
+from sensor_msgs.msg import CameraInfo, Image, PointCloud2
 from tf2_ros import Buffer, TransformException, TransformListener
 
+from pipeline_orchestrator.pipeline_utils import make_xyz_cloud
 from pipeline_orchestrator.segmentation_utils import (
     build_overlay_image,
     compute_centroid,
@@ -60,25 +60,6 @@ PROMPT_SCHEMA = {
         "required": ["box_2d", "label"],
     },
 }
-
-
-def make_xyz_cloud(points: np.ndarray, frame_id: str) -> PointCloud2:
-    xyz = np.asarray(points[:, :3], dtype=np.float32)
-    msg = PointCloud2()
-    msg.header = Header(frame_id=frame_id)
-    msg.height = 1
-    msg.width = len(xyz)
-    msg.fields = [
-        PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
-        PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
-        PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
-    ]
-    msg.is_bigendian = False
-    msg.point_step = 12
-    msg.row_step = 12 * len(xyz)
-    msg.data = xyz.tobytes()
-    msg.is_dense = True
-    return msg
 
 
 def transform_to_matrix(msg) -> np.ndarray:
