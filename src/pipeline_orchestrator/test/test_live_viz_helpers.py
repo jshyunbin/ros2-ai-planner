@@ -99,4 +99,4 @@ def test_live_viz_script_constants(monkeypatch):
     assert mod.VIZ_HZ       == 10
     assert mod.GOAL_XYZ     == (0.3, 0.0, 0.4)
     assert mod.GOAL_QUAT    == (1.0, 0.0, 0.0, 0.0)
-    assert mod.WORLD_FRAME  == 'world'
+    assert mod.WORLD_FRAME  == 'base_link'

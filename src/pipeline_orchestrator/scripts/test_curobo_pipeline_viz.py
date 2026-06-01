@@ -55,7 +55,7 @@ GOAL_QUAT    = (1.0, 0.0, 0.0, 0.0)    # w x y z
 MIN_FRAMES   = 5
 REPLAN_EVERY = 10                       # frames between replans
 VIZ_HZ       = 10
-WORLD_FRAME  = 'world'
+WORLD_FRAME  = 'base_link'
 TICK_SEC     = 0.5                       # how often the plan timer checks in
 SETTLE_SEC   = 1.0                       # pause after a leg finishes before the next
 
@@ -329,7 +329,7 @@ def main() -> None:
     print('[3/4] Starting viser…')
     import viser
     server = viser.ViserServer(port=8080, verbose=False)
-    server.scene.add_frame('/world', axes_length=0.3, axes_radius=0.01)
+    server.scene.add_frame('/base_link', axes_length=0.3, axes_radius=0.01)
     server.scene.add_icosphere(
         '/target', radius=0.03, color=(255, 80, 80), position=GOAL_XYZ)
     print('  Viser running — open http://localhost:8080\n')

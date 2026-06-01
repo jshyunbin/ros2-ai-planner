@@ -16,6 +16,7 @@ def generate_launch_description() -> LaunchDescription:
     enable_motion_execution = LaunchConfiguration("enable_motion_execution")
     rgb_topic = LaunchConfiguration("rgb_topic")
     depth_topic = LaunchConfiguration("depth_topic")
+    camera_info_topic = LaunchConfiguration("camera_info_topic")
     segmented_point_cloud_topic = LaunchConfiguration("segmented_point_cloud_topic")
     background_point_cloud_topic = LaunchConfiguration("background_point_cloud_topic")
     segmentation_output_frame = LaunchConfiguration("segmentation_output_frame")
@@ -25,6 +26,7 @@ def generate_launch_description() -> LaunchDescription:
     graspgen_remove_outliers = LaunchConfiguration("graspgen_remove_outliers")
     graspgen_rank_mode = LaunchConfiguration("graspgen_rank_mode")
     graspgen_target_approach_dir = LaunchConfiguration("graspgen_target_approach_dir")
+    curobo_enable_viz = LaunchConfiguration("curobo_enable_viz")
     segmentation_debug_dir = LaunchConfiguration("segmentation_debug_dir")
     graspgen_debug_dir = LaunchConfiguration("graspgen_debug_dir")
 
@@ -45,18 +47,23 @@ def generate_launch_description() -> LaunchDescription:
                 "depth_topic", default_value="/wrist_camera/wrist_camera/depth/color/image_raw"
             ),
             DeclareLaunchArgument(
+                "camera_info_topic",
+                default_value="/wrist_camera/wrist_camera/depth/color/camera_info",
+            ),
+            DeclareLaunchArgument(
                 "segmented_point_cloud_topic", default_value="/graspgen/segmented_object"
             ),
             DeclareLaunchArgument(
                 "background_point_cloud_topic", default_value="/graspgen/background"
             ),
-            DeclareLaunchArgument("segmentation_output_frame", default_value="world"),
+            DeclareLaunchArgument("segmentation_output_frame", default_value="base_link"),
             DeclareLaunchArgument("overlay_topic", default_value="/segmentation/overlay"),
             DeclareLaunchArgument("mask_topic", default_value="/segmentation/mask"),
             DeclareLaunchArgument("auto_run_on_task_command", default_value="true"),
             DeclareLaunchArgument("graspgen_remove_outliers", default_value="false"),
             DeclareLaunchArgument("graspgen_rank_mode", default_value="approach_alignment"),
             DeclareLaunchArgument("graspgen_target_approach_dir", default_value="[0.0, 0.0, -1.0]"),
+            DeclareLaunchArgument("curobo_enable_viz", default_value="false"),
             DeclareLaunchArgument(
                 "segmentation_debug_dir",
                 default_value="/artifacts/segmentation_service",
@@ -86,6 +93,7 @@ def generate_launch_description() -> LaunchDescription:
                         "service_name": segmentation_service_name,
                         "rgb_topic": rgb_topic,
                         "depth_topic": depth_topic,
+                        "camera_info_topic": camera_info_topic,
                         "segmented_point_cloud_topic": segmented_point_cloud_topic,
                         "background_point_cloud_topic": background_point_cloud_topic,
                         "output_frame": segmentation_output_frame,
@@ -111,6 +119,7 @@ def generate_launch_description() -> LaunchDescription:
                         "remove_outliers": graspgen_remove_outliers,
                         "rank_mode": graspgen_rank_mode,
                         "target_approach_dir": graspgen_target_approach_dir,
+                        "expected_frame": segmentation_output_frame,
                         "debug_dir": graspgen_debug_dir,
                     }
                 ],
@@ -124,6 +133,7 @@ def generate_launch_description() -> LaunchDescription:
                     {
                         "use_sim_time": use_sim_time,
                         "service_name": curobo_service_name,
+                        "enable_viz": curobo_enable_viz,
                     }
                 ],
                 condition=IfCondition(enable_motion_execution),

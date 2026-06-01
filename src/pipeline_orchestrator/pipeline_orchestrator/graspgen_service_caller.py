@@ -41,7 +41,7 @@ class GraspGenServiceCaller(Node):
         self.declare_parameter("segmented_point_cloud_topic", "/graspgen/segmented_object")
         self.declare_parameter("background_point_cloud_topic", "/graspgen/background")
         self.declare_parameter("service_name", "/graspgen/infer")
-        self.declare_parameter("frame_id", "world")
+        self.declare_parameter("frame_id", "base_link")
 
         segmented_topic = str(self.get_parameter("segmented_point_cloud_topic").value)
         background_topic = str(self.get_parameter("background_point_cloud_topic").value)

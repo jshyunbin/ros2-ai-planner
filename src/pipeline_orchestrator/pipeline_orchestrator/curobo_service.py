@@ -18,6 +18,7 @@ advertised while the planner initialises.
 
 import traceback
 import threading
+import os
 
 import numpy as np
 import rclpy
@@ -42,6 +43,7 @@ class CuRoboService(Node):
         super().__init__('curobo_service')
 
         self.declare_parameter('service_name', '/curobo/plan_trajectory')
+        self.declare_parameter('enable_viz', False)
 
         self._latest_joints = None
         self._curobo: CuRobo | None = None
@@ -74,7 +76,10 @@ class CuRoboService(Node):
     def _init_curobo(self) -> None:
         self.get_logger().info('CuRobo initialisation started.')
         try:
-            curobo = CuRobo(self.get_logger())
+            curobo = CuRobo(
+                self,
+                enable_viz=_as_bool(self.get_parameter('enable_viz').value),
+            )
         except Exception as exc:
             with self._init_lock:
                 self._init_error = f'{type(exc).__name__}: {exc}'
@@ -84,12 +89,19 @@ class CuRoboService(Node):
             return
         with self._init_lock:
             self._curobo = curobo
+            latest_joints = self._latest_joints
+        if latest_joints is not None:
+            curobo.update_joint_state(latest_joints)
         self.get_logger().info('CuRobo initialisation complete; service is ready.')
 
     # ── joint state cache ─────────────────────────────────────────────────────
 
     def _cache_joints(self, msg: JointState) -> None:
         self._latest_joints = msg
+        with self._init_lock:
+            curobo = self._curobo
+        if curobo is not None:
+            curobo.update_joint_state(msg)
 
     # ── service handler ───────────────────────────────────────────────────────
 
@@ -107,7 +119,7 @@ class CuRoboService(Node):
             return response
         if curobo is None:
             response.success = False
-            response.message = 'CuRobo is still initialising.'
+            response.message = 'CuRobo is still initializing.'
             return response
 
         joint_state = request.joint_state
@@ -134,30 +146,46 @@ class CuRoboService(Node):
     def _handle_pick(self, curobo, request, joint_state, response):
         """Pick mode: plan_pick() → approach+grasp + lift."""
         candidates = _poses_to_candidates(request.grasp_poses)
+        curobo.update_joint_state(joint_state)
+
         result = curobo.plan_pick(candidates, joint_state)
         if result is None:
             response.success = False
             response.message = 'CuRobo.plan_pick failed for all candidates.'
             return response
 
-        approach_jt = interp_traj_to_ros(result.approach_interpolated_trajectory)
-        grasp_jt = interp_traj_to_ros(result.grasp_interpolated_trajectory)
-        lift_jt = interp_traj_to_ros(result.lift_interpolated_trajectory)
+        approach_jt = interp_traj_to_ros(
+            result.approach_interpolated_trajectory,
+            last_tstep=getattr(result, 'approach_interpolated_last_tstep', None),
+        )
+        grasp_jt, n_preclose = _append_preclose_insertion_to_trajectory(
+            interp_traj_to_ros(
+                result.grasp_interpolated_trajectory,
+                last_tstep=getattr(result, 'grasp_interpolated_last_tstep', None),
+            )
+        )
+        lift_jt = interp_traj_to_ros(
+            result.lift_interpolated_trajectory,
+            last_tstep=getattr(result, 'lift_interpolated_last_tstep', None),
+        )
 
         response.trajectory = concat_trajectories(approach_jt, grasp_jt)
         response.lift_trajectory = lift_jt
+        curobo.pause_mapping(_pick_mapping_pause_sec(response.trajectory, lift_jt))
         response.success = True
         n_approach = len(approach_jt.points)
         n_grasp = len(grasp_jt.points)
         n_lift = len(lift_jt.points)
         response.message = (
             f'CuRobo pick planned: '
-            f'approach={n_approach}pts grasp={n_grasp}pts lift={n_lift}pts'
+            f'approach={n_approach}pts grasp={n_grasp}pts '
+            f'preclose_insert={n_preclose}pts lift={n_lift}pts'
         )
         return response
 
     def _handle_single_pose(self, curobo, request, joint_state, response):
         """Single-pose mode: plan_trajectory() for place / home."""
+        curobo.update_joint_state(joint_state)
         trajectory = curobo.plan_trajectory(request.grasp_pose, joint_state)
         if trajectory is None or not trajectory.points:
             response.success = False
@@ -194,6 +222,75 @@ def _poses_to_candidates(ros_poses) -> list[dict]:
         ]
         candidates.append({'pose_4x4': mat})
     return candidates
+
+
+def _as_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ('1', 'true', 'yes', 'on')
+    return bool(value)
+
+
+def _append_preclose_insertion_to_trajectory(trajectory):
+    max_delta = _env_float('PIPELINE_GRASP_CLOSE_NUDGE_MAX_JOINT_DELTA_RAD', 0.04)
+    if max_delta <= 0.0 or trajectory is None or len(trajectory.points) < 2:
+        return trajectory, 0
+
+    first = np.asarray(trajectory.points[0].positions, dtype=np.float32)
+    prev = np.asarray(trajectory.points[-2].positions, dtype=np.float32)
+    final = np.asarray(trajectory.points[-1].positions, dtype=np.float32)
+    direction = final - prev
+    peak = float(np.max(np.abs(direction))) if direction.size else 0.0
+    if peak <= 1e-6:
+        direction = final - first
+        peak = float(np.max(np.abs(direction))) if direction.size else 0.0
+    if peak <= 1e-6:
+        return trajectory, 0
+
+    duration = max(
+        _env_float('PIPELINE_GRASP_CLOSE_NUDGE_DURATION_SEC', 0.60), 0.02)
+    steps = max(int(_env_float('PIPELINE_GRASP_CLOSE_NUDGE_STEPS', 4)), 1)
+    last_time = trajectory.points[-1].time_from_start
+    start_sec = last_time.sec + last_time.nanosec * 1e-9
+    full_delta = direction * (float(max_delta) / peak)
+
+    from builtin_interfaces.msg import Duration as RosDuration
+    from trajectory_msgs.msg import JointTrajectoryPoint
+
+    for index in range(steps):
+        alpha = float(index + 1) / float(steps)
+        nudge = final + full_delta * alpha
+        t_sec = start_sec + duration * alpha
+        pt = JointTrajectoryPoint()
+        pt.positions = [float(value) for value in nudge]
+        pt.time_from_start = RosDuration(
+            sec=int(t_sec),
+            nanosec=int((t_sec % 1.0) * 1_000_000_000),
+        )
+        trajectory.points.append(pt)
+    return trajectory, steps
+
+
+def _pick_mapping_pause_sec(approach_and_grasp, lift) -> float:
+    duration = _trajectory_duration_sec(approach_and_grasp)
+    duration += _trajectory_duration_sec(lift)
+    duration += _env_float('PIPELINE_GRASP_MAPPING_PAUSE_EXTRA_SEC', 2.0)
+    return max(duration, 0.0)
+
+
+def _trajectory_duration_sec(trajectory) -> float:
+    if trajectory is None or not trajectory.points:
+        return 0.0
+    stamp = trajectory.points[-1].time_from_start
+    return float(stamp.sec) + float(stamp.nanosec) * 1e-9
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw == '':
+        return float(default)
+    return float(raw)
 
 
 def main(args=None) -> None:

@@ -12,7 +12,7 @@ SAM2 (segment) -> pointcloud masking -> GraspGen (grasp pose) -> cuRobo (traject
 
 Current reality is still narrower than the final target architecture, but the prompted segmentation to GraspGen inference path is now working end-to-end inside the planner stack.
 
-**CuRobo owns the full depth pipeline.** It subscribes to both D435 depth streams internally, fuses them into a block-sparse TSDF/ESDF using cuRoboV2's built-in Mapper (GPU, no external nvblox node), and uses that map for collision-aware motion planning on every call.
+**CuRobo owns the full depth pipeline.** It subscribes to both D435 depth streams internally, fuses them into a block-sparse TSDF/ESDF in `base_link` using cuRoboV2's built-in Mapper (GPU, no external nvblox node), and uses that map for collision-aware motion planning on every call.
 
 ## Requirements
 
@@ -74,11 +74,11 @@ Current work is now split into seven practical layers:
 4. In-container GraspGen integration: done at image level
    Result: the `ros2-ai-planner` Docker image now includes ROS2 plus the forked `pianojay/GraspGen` `jaeuk` branch and a pinned GraspGen checkpoint set downloaded during image build.
 5. Prompted segmentation service path: implemented
-   Result: `segmentation_service` now performs `prompt -> Gemini bbox -> local Ultralytics SAM2 mask -> world-frame point-cloud masking`, publishes segmented/background clouds for GraspGen, and returns centroid/status to a ROS2 service caller.
+   Result: `segmentation_service` now performs `prompt -> Gemini bbox -> local Ultralytics SAM2 mask -> base_link point-cloud masking`, publishes segmented/background clouds for GraspGen, and returns centroid/status to a ROS2 service caller.
 6. GraspGen service path: implemented
    Result: `graspgen_service` now consumes segmented/background clouds, runs GraspGen inference, and returns ranked grasp candidates plus debug artifacts.
 7. Full live object pipeline: partially implemented
-   Missing pieces: better best-grasp filtering, actual arm/gripper execution, Gazebo grasp-success check, and replacing the remaining planner stubs (`curobo.py`, `moveit2.py`).
+   Missing pieces: better best-grasp filtering, full place sequencing, Gazebo grasp-success check, and replacing the remaining planner stubs (`moveit2.py`).
 
 The old NVIDIA driver mismatch was resolved by reboot. `nvidia-smi` is now healthy on driver `535.309.01`.
 
@@ -427,7 +427,7 @@ If the base image already exists locally, `build_image.sh` skips rebuilding it.
 
 The next milestone is grasp selection and execution:
 
-1. improve best-grasp filtering for vertical pickup in a world-frame interpretation
+1. improve best-grasp filtering for vertical pickup in a `base_link` frame interpretation
 2. reject obvious bad grasps using scene-specific geometric filters such as basket height
 3. connect the top-ranked grasp to actual arm and gripper execution
 4. verify grasp success in Gazebo

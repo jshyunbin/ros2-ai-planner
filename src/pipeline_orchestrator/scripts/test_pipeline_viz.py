@@ -149,8 +149,8 @@ def visualize(traj):
         print(f'  Robot model unavailable ({e}), showing end-effector frames only.')
         has_robot = False
 
-    # World frame origin
-    server.scene.add_frame('/world', axes_length=0.3, axes_radius=0.01)
+    # Planner frame origin
+    server.scene.add_frame('/base_link', axes_length=0.3, axes_radius=0.01)
 
     # Target position marker
     server.scene.add_icosphere(

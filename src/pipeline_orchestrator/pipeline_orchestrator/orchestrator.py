@@ -11,9 +11,12 @@ MultiThreadedExecutor so spin_until_future_complete works inside callbacks.
 
 import json
 import math
+import os
+import threading
 
 try:  # pragma: no cover - runtime dependency
     import rclpy
+    from action_msgs.msg import GoalStatus
     from rclpy.action import ActionClient
     from rclpy.node import Node
     from rclpy.executors import MultiThreadedExecutor
@@ -27,6 +30,7 @@ try:  # pragma: no cover - runtime dependency
 except ImportError:  # pragma: no cover - import-only test fallback
     rclpy = None
     ActionClient = None
+    GoalStatus = None
     JointState = None
     FollowJointTrajectory = None
     Pose = None
@@ -373,14 +377,52 @@ class PipelineOrchestrator(Node):
                 f'(waited {server_timeout_sec}s)')
         goal = FollowJointTrajectory.Goal()
         goal.trajectory = trajectory
+        timeout_sec = _action_timeout_sec(trajectory)
+        self.get_logger().info(
+            f'Sending {label} trajectory ({_trajectory_summary(trajectory)}); '
+            f'timeout={timeout_sec:.1f}s.')
         send_future = client.send_goal_async(goal)
-        rclpy.spin_until_future_complete(self, send_future)
-        handle = send_future.result()
+        handle = self._wait_for_future(
+            send_future, label, 'goal response', timeout_sec)
         if handle is None or not handle.accepted:
-            raise RuntimeError(f'{label} goal rejected by action server')
+            raise RuntimeError(
+                f'{label} goal rejected by action server '
+                f'({_trajectory_summary(trajectory)})')
         result_future = handle.get_result_async()
-        rclpy.spin_until_future_complete(self, result_future)
+        result_response = self._wait_for_future(
+            result_future, label, 'result', timeout_sec)
+        if result_response is None:
+            raise RuntimeError(f'{label} action returned no result')
+        if getattr(result_response, 'status', None) != _goal_status_succeeded():
+            if _is_nonfatal_gripper_cancel(label, result_response.status, trajectory):
+                self.get_logger().warn(
+                    'Treating canceled gripper close action as non-fatal; '
+                    'GazeboGraspFix can cancel after attaching the object.')
+                self.get_logger().info(f'{label} trajectory executed.')
+                return
+            raise RuntimeError(
+                f'{label} action failed with status {result_response.status}')
+        action_result = getattr(result_response, 'result', None)
+        if action_result is not None:
+            success_code = getattr(action_result, 'SUCCESSFUL', 0)
+            error_code = getattr(action_result, 'error_code', success_code)
+            if error_code != success_code:
+                detail = getattr(action_result, 'error_string', '')
+                raise RuntimeError(
+                    f'{label} trajectory failed with error_code '
+                    f'{error_code}: {detail}')
         self.get_logger().info(f'{label} trajectory executed.')
+
+    def _wait_for_future(self, future, label: str, phase: str, timeout_sec: float):
+        if not hasattr(future, 'add_done_callback'):
+            return future.result()
+        done = threading.Event()
+        future.add_done_callback(lambda _: done.set())
+        if hasattr(future, 'done') and future.done():
+            done.set()
+        if not done.wait(max(timeout_sec, 0.1)):
+            raise RuntimeError(f'Timed out waiting for {label} action {phase}')
+        return future.result()
 
     def _send_gripper(self, closed: bool) -> None:
         """Send open / close command to the gripper controller and wait."""
@@ -471,6 +513,78 @@ class PipelineOrchestrator(Node):
     def _reset_pipeline_state(self) -> None:
         self._pipeline_busy = False
         self._active_task = ''
+
+
+def _goal_status_succeeded() -> int:
+    if GoalStatus is None:
+        return 4
+    return int(getattr(GoalStatus, 'STATUS_SUCCEEDED', 4))
+
+
+def _is_nonfatal_gripper_cancel(label: str, status, trajectory) -> bool:
+    if GoalStatus is None:
+        canceled = 5
+    else:
+        canceled = getattr(GoalStatus, 'STATUS_CANCELED', 5)
+    return (
+        str(label).startswith('gripper_close')
+        and int(status) == int(canceled)
+        and _is_gripper_close_trajectory(trajectory)
+    )
+
+
+def _is_gripper_close_trajectory(trajectory) -> bool:
+    points = list(getattr(trajectory, 'points', []) or [])
+    if not points:
+        return False
+    positions = list(getattr(points[-1], 'positions', []) or [])
+    if not positions:
+        return False
+    return float(positions[0]) > 0.0
+
+
+def _action_timeout_sec(trajectory) -> float:
+    base = _env_float('PIPELINE_ACTION_TIMEOUT_SEC', 60.0)
+    duration = _trajectory_duration_sec(trajectory)
+    if duration is None:
+        return base
+    margin = _env_float('PIPELINE_ACTION_TIMEOUT_MARGIN_SEC', 15.0)
+    return max(base, duration + margin)
+
+
+def _trajectory_duration_sec(trajectory):
+    points = list(getattr(trajectory, 'points', []) or [])
+    if not points:
+        return None
+    stamp = getattr(points[-1], 'time_from_start', None)
+    if stamp is None:
+        return None
+    return (
+        float(getattr(stamp, 'sec', 0.0))
+        + float(getattr(stamp, 'nanosec', 0.0)) / 1e9
+    )
+
+
+def _trajectory_summary(trajectory) -> str:
+    joint_names = list(getattr(trajectory, 'joint_names', []) or [])
+    points = list(getattr(trajectory, 'points', []) or [])
+    if not points:
+        return f'joints={joint_names} points=0'
+    final = points[-1]
+    positions = [round(float(x), 4) for x in getattr(final, 'positions', [])]
+    duration = _trajectory_duration_sec(trajectory)
+    duration_text = 'unknown' if duration is None else f'{duration:.2f}s'
+    return (
+        f'joints={joint_names} points={len(points)} '
+        f'duration={duration_text} final_positions={positions}'
+    )
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw == '':
+        return float(default)
+    return float(raw)
 
 
 def main(args=None) -> None:

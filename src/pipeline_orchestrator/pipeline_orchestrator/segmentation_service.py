@@ -11,7 +11,7 @@ from PIL import Image as PILImage
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
-from sensor_msgs.msg import Image, PointCloud2, PointField
+from sensor_msgs.msg import CameraInfo, Image, PointCloud2, PointField
 from std_msgs.msg import Header
 from tf2_ros import Buffer, TransformException, TransformListener
 
@@ -111,13 +111,17 @@ class SegmentationService(Node):
         self.declare_parameter("service_name", "/segmentation/segment_prompt")
         self.declare_parameter("rgb_topic", "/wrist_camera/wrist_camera/color/image_raw")
         self.declare_parameter("depth_topic", "/wrist_camera/wrist_camera/depth/color/image_raw")
+        self.declare_parameter(
+            "camera_info_topic",
+            "/wrist_camera/wrist_camera/depth/color/camera_info",
+        )
         self.declare_parameter("segmented_point_cloud_topic", "/graspgen/segmented_object")
         self.declare_parameter("background_point_cloud_topic", "/graspgen/background")
         self.declare_parameter("overlay_topic", "/segmentation/overlay")
         self.declare_parameter("mask_topic", "/segmentation/mask")
         self.declare_parameter("gemini_model", "gemini-2.5-flash")
         self.declare_parameter("sam2_model", "/opt/models/sam2/sam2_t.pt")
-        self.declare_parameter("output_frame", "world")
+        self.declare_parameter("output_frame", "base_link")
         self.declare_parameter("max_api_image_dim", 1024)
         self.declare_parameter("min_depth_m", 0.05)
         self.declare_parameter("max_depth_m", 2.5)
@@ -137,8 +141,10 @@ class SegmentationService(Node):
         self._latest_depth_stamp = None
         self._latest_depth_stamp_ns = 0
         self._latest_frame_id = ""
+        self._latest_camera_info = None
         self._logged_first_rgb = False
         self._logged_first_depth = False
+        self._logged_first_camera_info = False
         self._debug_dir = Path(str(self.get_parameter("debug_dir").value))
         self._debug_dir.mkdir(parents=True, exist_ok=True)
 
@@ -168,6 +174,12 @@ class SegmentationService(Node):
             Image,
             str(self.get_parameter("depth_topic").value),
             self._depth_callback,
+            qos,
+        )
+        self.create_subscription(
+            CameraInfo,
+            str(self.get_parameter("camera_info_topic").value),
+            self._camera_info_callback,
             qos,
         )
 
@@ -221,6 +233,33 @@ class SegmentationService(Node):
             )
             self._logged_first_depth = True
 
+    def _camera_info_callback(self, msg: CameraInfo) -> None:
+        self._latest_camera_info = msg
+        if not self._logged_first_camera_info:
+            self.get_logger().info(
+                f"Received first CameraInfo fx={msg.k[0]:.3f} fy={msg.k[4]:.3f} "
+                f"cx={msg.k[2]:.3f} cy={msg.k[5]:.3f} frame={msg.header.frame_id}"
+            )
+            self._logged_first_camera_info = True
+
+    def _camera_intrinsics(self) -> tuple[float, float, float, float]:
+        info = self._latest_camera_info
+        if info is not None:
+            return (
+                float(info.k[0]),
+                float(info.k[4]),
+                float(info.k[2]),
+                float(info.k[5]),
+            )
+        self.get_logger().warn(
+            "No CameraInfo received yet; using configured camera intrinsics.")
+        return (
+            float(self.get_parameter("camera_fx").value),
+            float(self.get_parameter("camera_fy").value),
+            float(self.get_parameter("camera_cx").value),
+            float(self.get_parameter("camera_cy").value),
+        )
+
     def _handle_request(self, request: StringString.Request, response: StringString.Response):
         prompt = request.data.strip()
         if not prompt:
@@ -248,6 +287,7 @@ class SegmentationService(Node):
         try:
             rgb_bgr = self._latest_rgb.copy()
             depth_image = self._latest_depth.copy()
+            fx, fy, cx, cy = self._camera_intrinsics()
 
             api_image_bgr, scale_x, scale_y = resize_for_api(
                 rgb_bgr, int(self.get_parameter("max_api_image_dim").value)
@@ -268,10 +308,10 @@ class SegmentationService(Node):
             object_points, background_points = depth_to_masked_points(
                 depth_image,
                 mask,
-                fx=float(self.get_parameter("camera_fx").value),
-                fy=float(self.get_parameter("camera_fy").value),
-                cx=float(self.get_parameter("camera_cx").value),
-                cy=float(self.get_parameter("camera_cy").value),
+                fx=fx,
+                fy=fy,
+                cx=cx,
+                cy=cy,
                 min_depth_m=float(self.get_parameter("min_depth_m").value),
                 max_depth_m=float(self.get_parameter("max_depth_m").value),
             )
@@ -338,6 +378,12 @@ class SegmentationService(Node):
                 "background_point_count": int(len(background_points)),
                 "mask_area_ratio": round(float(mask.mean()), 6),
                 "processing_time_ms": elapsed_ms,
+                "camera_intrinsics": {
+                    "fx": round(float(fx), 5),
+                    "fy": round(float(fy), 5),
+                    "cx": round(float(cx), 5),
+                    "cy": round(float(cy), 5),
+                },
                 "gemini_bbox_xyxy": list(prompt_bbox),
                 "sam2_model": self._sam2_model_name,
                 "debug_dir": str(debug_path),

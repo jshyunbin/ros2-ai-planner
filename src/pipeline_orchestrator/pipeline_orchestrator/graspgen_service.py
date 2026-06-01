@@ -46,6 +46,7 @@ class GraspGenService(Node):
         self.declare_parameter("rank_mode", "approach_alignment")
         self.declare_parameter("target_approach_dir", [0.0, 0.0, -1.0])
         self.declare_parameter("max_returned_grasps", 5)
+        self.declare_parameter("expected_frame", "base_link")
         self.declare_parameter("enable_collision_check", False)
         self.declare_parameter("collision_threshold", 0.002)
         self.declare_parameter("collision_samples", 2000)
@@ -119,6 +120,28 @@ class GraspGenService(Node):
             return response
 
         segmented_cloud = self._latest_segmented_cloud
+        expected_frame = str(self.get_parameter("expected_frame").value)
+        if expected_frame and self._latest_segmented_frame != expected_frame:
+            response.success = False
+            response.message = (
+                "Segmented point cloud frame mismatch: "
+                f"got {self._latest_segmented_frame!r}, "
+                f"expected {expected_frame!r}."
+            )
+            return response
+        if (
+            self._latest_background_cloud is not None
+            and expected_frame
+            and self._latest_background_frame
+            and self._latest_background_frame != expected_frame
+        ):
+            response.success = False
+            response.message = (
+                "Background point cloud frame mismatch: "
+                f"got {self._latest_background_frame!r}, "
+                f"expected {expected_frame!r}."
+            )
+            return response
         debug_id = time.strftime("%Y%m%d-%H%M%S") + f"-{int(time.time_ns() % 1_000_000_000):09d}"
         debug_path = self._debug_dir / debug_id
         debug_path.mkdir(parents=True, exist_ok=True)
