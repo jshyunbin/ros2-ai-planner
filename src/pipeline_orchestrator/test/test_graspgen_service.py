@@ -76,3 +76,42 @@ def test_run_inference_without_cloud_fails_cleanly():
     result = svc._run_inference()
     assert result["success"] is False
     assert "No segmented point cloud" in result["error"]
+
+
+def test_maybe_publish_grasp_poses_builds_ranked_pose_array():
+    from unittest.mock import MagicMock
+    from builtin_interfaces.msg import Time
+
+    svc = GraspGenService.__new__(GraspGenService)
+    pub = MagicMock()
+    svc._grasp_poses_pub = pub
+    # Real Time() so PoseArray.header.stamp accepts the assignment.
+    svc.get_clock = MagicMock(
+        return_value=MagicMock(now=lambda: MagicMock(to_msg=lambda: Time()))
+    )
+
+    rows = [
+        {"translation": [0.1, 0.2, 0.3],
+         "rotation_matrix": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+         "confidence": 0.9},
+        {"translation": [0.4, 0.5, 0.6],
+         "rotation_matrix": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+         "confidence": 0.5},
+    ]
+    svc._maybe_publish_grasp_poses(rows, "base_link")
+
+    pub.publish.assert_called_once()
+    msg = pub.publish.call_args.args[0]
+    assert msg.header.frame_id == "base_link"
+    assert len(msg.poses) == 2
+    # Rank order preserved: first row maps to first pose.
+    assert msg.poses[0].position.x == pytest.approx(0.1)
+
+
+def test_maybe_publish_grasp_poses_noop_without_publisher():
+    svc = GraspGenService.__new__(GraspGenService)
+    svc._grasp_poses_pub = None
+    # Must not raise when publishing is disabled.
+    svc._maybe_publish_grasp_poses([{"translation": [0, 0, 0],
+                                     "rotation_matrix": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+                                     "confidence": 1.0}], "base_link")

@@ -10,10 +10,12 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
+from geometry_msgs.msg import PoseArray
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2
 
 from pipeline_orchestrator.graspgen_client import GraspGenClient
+from pipeline_orchestrator.pipeline_utils import pose_from_grasp_row
 
 try:  # pragma: no cover - runtime dependency
     from riro_srvs.srv import StringString
@@ -62,6 +64,8 @@ class GraspGenService(Node):
         self.declare_parameter("collision_samples", 2000)
         self.declare_parameter("debug_dir", "/artifacts/graspgen_service")
         self.declare_parameter("cloud_wait_sec", 5.0)
+        self.declare_parameter("publish_grasp_poses", False)
+        self.declare_parameter("grasp_poses_topic", "/graspgen/grasp_poses")
 
         # RELIABLE to match the segmentation publishers; the cloud is bulk
         # request/response data, not a high-rate stream.
@@ -105,6 +109,14 @@ class GraspGenService(Node):
             callback_group=cloud_group,
         )
         self.create_service(StringString, service_name, self._infer_callback)
+
+        self._grasp_poses_pub = None
+        if bool(self.get_parameter("publish_grasp_poses").value):
+            self._grasp_poses_pub = self.create_publisher(
+                PoseArray,
+                str(self.get_parameter("grasp_poses_topic").value),
+                qos,
+            )
 
         self.get_logger().info(
             f"Listening for segmented clouds on {segmented_topic}, background clouds on {background_topic}, "
@@ -302,7 +314,21 @@ class GraspGenService(Node):
             f"Returned {len(top_rows)} filtered grasps from {len(grasps)} raw grasps "
             f"for frame {segmented_frame}"
         )
+        self._maybe_publish_grasp_poses(top_rows, segmented_frame)
         return payload
+
+    def _maybe_publish_grasp_poses(self, rows: list[dict], frame_id: str) -> None:
+        """Publish ranked grasps as a PoseArray when debug viz is enabled."""
+        if self._grasp_poses_pub is None:
+            return
+        msg = PoseArray()
+        msg.header.frame_id = frame_id
+        msg.header.stamp = self.get_clock().now().to_msg()
+        for row in rows:
+            pose = pose_from_grasp_row(row)
+            if pose is not None:
+                msg.poses.append(pose)
+        self._grasp_poses_pub.publish(msg)
 
     def _infer_with_optional_retry(
         self,
