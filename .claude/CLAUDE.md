@@ -13,22 +13,20 @@ All three AI stages are implemented and run as **separate ROS2 nodes**, coordina
 ## Build & Run
 
 ```bash
-# Build image (first run ~20 min — downloads PyTorch CUDA 12.8 wheels)
+# Build the image (heavy layers cached after first run; ~20 min first time)
 docker compose build
 
-# Start container
+# Deploy mode: full pipeline, executes on the UR5, no visualization
 docker compose up
 
-# Interactive shell inside container
-docker compose run --rm ai_planner bash
+# Debug mode: same pipeline + viser visualization, src live-mounted
+docker compose -f docker-compose.yml -f docker-compose.debug.yml up
 
-# Rebuild ROS2 workspace inside container (after adding packages)
-docker compose run --rm ai_planner bash /ros2_ws/scripts/build.sh
-
-# Launch the full pipeline (segmentation + graspgen + orchestrator;
-# add enable_motion_execution:=true to also start curobo_service + execution)
-ros2 launch pipeline_orchestrator planner_pipeline.launch.py
+# Interactive shell (debug override gives the live-mounted src)
+docker compose -f docker-compose.yml -f docker-compose.debug.yml run --rm ai_planner bash
 ```
+
+> In debug mode `./src` is live-mounted, so Python edits to node code take effect on the next launch. Changes to `setup.py`, entry points, or `*.launch.py` files still require a workspace rebuild inside the container: `colcon build --packages-select pipeline_orchestrator` (from `/ros2_ws`), then relaunch.
 
 The container uses `network_mode: host` — all ROS2 topics from the host are immediately visible inside.
 
@@ -51,6 +49,7 @@ Nodes (each is a `console_scripts` entry point in `setup.py`):
 | `graspgen_client.py` | — | Minimal ZMQ client to the standalone GraspGen inference server. |
 | `segmentation_utils.py` | — | Pure helpers for segmentation (resize, depth back-projection, downsample, centroid, overlay). |
 | `live_viz_helpers.py` | — | Visualization helpers (point-cloud / TSDF). |
+| `debug_viz.py` | `debug_viz` | Hosts one viser server; subscribes to the segmented/background clouds, `/graspgen/grasp_poses`, and `/curobo/tsdf_voxels` and renders them (grasp frames colored by rank). Debug mode only. |
 | `graspgen_probe.py`, `graspgen_service_caller.py` | `graspgen_probe`, `graspgen_service_caller` | Standalone debugging utilities (not part of the runtime pipeline). |
 
 The orchestrator coordinates stages over **ROS2 services**, not in-process Python calls. Stages exchange point clouds over ROS2 topics; GraspGen talks to its heavy inference model over ZMQ in a separate process.
@@ -82,6 +81,8 @@ Internal:
 | `/graspgen/segmented_object`, `/graspgen/background` | `sensor_msgs/PointCloud2` | segmentation_service → graspgen_service |
 | `/graspgen/infer` | `riro_srvs/StringString` | orchestrator → graspgen_service (request = cloud-stamp token, response = JSON) |
 | `/curobo/plan_trajectory` | `riro_srvs/PlanTrajectory` | orchestrator → curobo_service |
+| `/graspgen/grasp_poses` | `geometry_msgs/PoseArray` | graspgen_service → debug_viz (debug only) |
+| `/curobo/tsdf_voxels` | `sensor_msgs/PointCloud2` | curobo_service → debug_viz (debug only) |
 
 ## Adding Dependencies
 
@@ -89,10 +90,10 @@ Pip dependencies live under `requirements/` (`sam2.txt`, `graspgen.txt`, `curobo
 
 ## Key Files
 
-- `Dockerfile` / `Dockerfile.base` — CUDA 12.8 + ROS2 Humble + PyTorch base image
-- `docker-compose.yml` — host networking, NVIDIA runtime (service: `ai_planner`); mounts `./artifacts` and `./config:ro`. **`src` is baked into the image at build time, not mounted** — code edits require a rebuild unless you use the dev override below.
-- `docker-compose.dev.yml` — override that live-mounts `./src` and `./scripts` into `/ros2_ws/` for iterative development. Must be passed explicitly: `docker compose -f docker-compose.yml -f docker-compose.dev.yml run --rm ai_planner …` (or set `COMPOSE_FILE=docker-compose.yml:docker-compose.dev.yml`).
-- `src/pipeline_orchestrator/launch/planner_pipeline.launch.py` — brings up the full pipeline
+- `Dockerfile` — single layer-ordered image (CUDA 12.8 + ROS2 Humble + PyTorch + SAM2/GraspGen/cuRobo + baked models; `COPY src` last). No separate base image.
+- `docker-compose.yml` — deploy mode (baked image, runs `deploy.launch.py`).
+- `docker-compose.debug.yml` — override that live-mounts `./src`/`./scripts`/`./config` and runs `debug.launch.py`.
+- `src/pipeline_orchestrator/launch/{pipeline_common,deploy,debug}.launch.py` — shared node graph + the two mode entry points.
 - `src/pipeline_orchestrator/pipeline_orchestrator/` — all pipeline nodes (see table above)
 - `src/utils/riro_srvs/srv/` — custom service definitions
 - `src/pipeline_orchestrator/config/ur5_curobo.yml` — cuRobo robot config (keep ASCII-only: cuRobo's `load_yaml` opens it with the container's default ASCII codec, so non-ASCII bytes crash it)
