@@ -26,12 +26,15 @@ from scipy.spatial.transform import Rotation as R
 from sensor_msgs.msg import JointState
 
 from pipeline_orchestrator.curobo import (
+    BASE_FRAME,
     CuRobo,
     concat_trajectories,
     interp_traj_to_ros,
 )
+from sensor_msgs.msg import PointCloud2
 from pipeline_orchestrator.pipeline_utils import as_bool as _as_bool
 from pipeline_orchestrator.pipeline_utils import env_float as _env_float
+from pipeline_orchestrator.pipeline_utils import make_xyz_cloud
 from riro_srvs.srv import PlanTrajectory
 
 
@@ -45,6 +48,7 @@ class CuRoboService(Node):
 
         self.declare_parameter('service_name', '/curobo/plan_trajectory')
         self.declare_parameter('enable_viz', False)
+        self.declare_parameter('tsdf_voxels_topic', '/curobo/tsdf_voxels')
 
         self._latest_joints = None
         self._curobo: CuRobo | None = None
@@ -64,6 +68,15 @@ class CuRoboService(Node):
             f'curobo_service advertised {service_name}; '
             'initialising CuRobo in background.'
         )
+
+        self._tsdf_pub = None
+        if _as_bool(self.get_parameter('enable_viz').value):
+            self._tsdf_pub = self.create_publisher(
+                PointCloud2,
+                str(self.get_parameter('tsdf_voxels_topic').value),
+                1,
+            )
+            self.create_timer(1.0, self._publish_tsdf_voxels)
 
         self._init_thread = threading.Thread(
             target=self._init_curobo,
@@ -103,6 +116,26 @@ class CuRoboService(Node):
             curobo = self._curobo
         if curobo is not None:
             curobo.update_joint_state(msg)
+
+    # ── TSDF voxel publisher ──────────────────────────────────────────────────
+
+    def _publish_tsdf_voxels(self) -> None:
+        """Publish occupied TSDF voxel centers as a PointCloud2 (debug viz)."""
+        if self._tsdf_pub is None:
+            return
+        with self._init_lock:
+            curobo = self._curobo
+        if curobo is None:
+            return
+        centers = curobo.get_tsdf_centers()
+        if centers is None or len(centers) == 0:
+            return
+        cloud = make_xyz_cloud(
+            centers,
+            BASE_FRAME,
+            self.get_clock().now().to_msg(),
+        )
+        self._tsdf_pub.publish(cloud)
 
     # ── service handler ───────────────────────────────────────────────────────
 

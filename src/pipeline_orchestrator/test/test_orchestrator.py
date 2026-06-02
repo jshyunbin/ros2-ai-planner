@@ -588,3 +588,60 @@ def test_orchestrator_does_not_import_nvblox():
         if isinstance(node, ast.ImportFrom) and node.names:
             imports.extend([n.name for n in node.names])
     assert not any('nvblox' in i.lower() for i in imports), f"Found nvblox import: {imports}"
+
+
+def test_curobo_service_publishes_tsdf_voxels_when_centers_present():
+    import threading
+    import numpy as np
+    from unittest.mock import MagicMock
+    from builtin_interfaces.msg import Time
+    from pipeline_orchestrator.curobo_service import CuRoboService
+
+    svc = CuRoboService.__new__(CuRoboService)
+    pub = MagicMock()
+    svc._tsdf_pub = pub
+    svc._init_lock = threading.Lock()
+    svc._curobo = MagicMock(
+        get_tsdf_centers=MagicMock(return_value=np.zeros((4, 3), dtype=np.float32))
+    )
+    svc.get_clock = MagicMock(
+        return_value=MagicMock(now=lambda: MagicMock(to_msg=lambda: Time()))
+    )
+
+    svc._publish_tsdf_voxels()
+
+    pub.publish.assert_called_once()
+    cloud = pub.publish.call_args.args[0]
+    assert cloud.width == 4
+    assert cloud.header.frame_id == "base_link"
+
+
+def test_curobo_service_tsdf_publish_noop_without_centers():
+    import threading
+    from unittest.mock import MagicMock
+    from pipeline_orchestrator.curobo_service import CuRoboService
+
+    svc = CuRoboService.__new__(CuRoboService)
+    pub = MagicMock()
+    svc._tsdf_pub = pub
+    svc._init_lock = threading.Lock()
+    svc._curobo = MagicMock(get_tsdf_centers=MagicMock(return_value=None))
+    svc._publish_tsdf_voxels()
+    pub.publish.assert_not_called()
+
+
+def test_curobo_service_tsdf_publish_noop_with_empty_centers():
+    import threading
+    import numpy as np
+    from unittest.mock import MagicMock
+    from pipeline_orchestrator.curobo_service import CuRoboService
+
+    svc = CuRoboService.__new__(CuRoboService)
+    pub = MagicMock()
+    svc._tsdf_pub = pub
+    svc._init_lock = threading.Lock()
+    svc._curobo = MagicMock(
+        get_tsdf_centers=MagicMock(return_value=np.zeros((0, 3), dtype=np.float32))
+    )
+    svc._publish_tsdf_voxels()
+    pub.publish.assert_not_called()
