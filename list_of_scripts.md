@@ -15,30 +15,41 @@ export FASTDDS_BUILTIN_TRANSPORTS=UDPv4
 ros2 service call /unpause_physics std_srvs/srv/Empty "{}"
 ```
 
-## Build Images
+## Build Image
 
 ```bash
 cp .env.example .env
 # Fill GEMINI_API_KEY in .env.
-./scripts/build_base_image.sh
-./scripts/build_image.sh
+docker compose build
 ```
 
 ## Open Docker
 
-Persistent container:
+Deploy mode (full pipeline, no visualization):
 
 ```bash
-docker compose run --name ai_planner_dev --service-ports ai_planner bash
+docker compose up
 ```
 
-Persistent development container with source mounts:
+Debug mode (same pipeline + viser visualization, `./src` live-mounted):
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.dev.yml run --name ai_planner_dev --service-ports ai_planner bash
+docker compose -f docker-compose.yml -f docker-compose.debug.yml up
 ```
 
-Extra shell:
+Interactive shell (debug override gives live-mounted src):
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.debug.yml run --rm ai_planner bash
+```
+
+Persistent interactive container:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.debug.yml run --name ai_planner_dev --service-ports ai_planner bash
+```
+
+Extra shell into running container:
 
 ```bash
 docker exec -it ai_planner_dev bash
@@ -73,35 +84,21 @@ source install/setup.bash
 
 ## Launch Pipeline
 
-Perception and grasp ranking only:
+The compose commands invoke the launch files automatically — you do not normally type `ros2 launch` by hand.
+
+Deploy mode (full pipeline, executes on the UR5, no visualization — runs `deploy.launch.py`):
 
 ```bash
-ros2 launch pipeline_orchestrator planner_pipeline.launch.py \
-  start_graspgen_server:=true \
-  auto_run_on_task_command:=true \
-  enable_motion_execution:=false \
-  use_sim_time:=true
+docker compose up
 ```
 
-Perception, grasp ranking, CuRobo service planning, and arm trajectory execution:
+Debug mode (same pipeline + viser visualization on port 8080, `./src` live-mounted — runs `debug.launch.py`):
 
 ```bash
-ros2 launch pipeline_orchestrator planner_pipeline.launch.py \
-  start_graspgen_server:=true \
-  auto_run_on_task_command:=true \
-  enable_motion_execution:=true \
-  use_sim_time:=true
+docker compose -f docker-compose.yml -f docker-compose.debug.yml up
 ```
 
-Launch without auto-running task commands:
-
-```bash
-ros2 launch pipeline_orchestrator planner_pipeline.launch.py \
-  start_graspgen_server:=true \
-  auto_run_on_task_command:=false \
-  enable_motion_execution:=false \
-  use_sim_time:=true
-```
+Both modes auto-start the embedded GraspGen server and run motion execution. Debug mode additionally enables grasp-pose and TSDF publishing and the `debug_viz` viser node.
 
 ## Publish Task
 

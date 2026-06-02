@@ -36,22 +36,21 @@ Important environment split:
 # Optional: create a local env file for ROS2 transport and API keys
 cp .env.example .env
 
-# Build the reusable ROS2/GraspGen base image once
-./scripts/build_base_image.sh
+# Build the single planner image (~20 min first time; heavy layers cached after)
+docker compose build
 
-# Build the planner image on top of that base
-./scripts/build_image.sh
-
-# Start the self-contained container
+# Deploy mode: full pipeline, executes on the UR5, no visualization
 docker compose up
+
+# Debug mode: same pipeline + viser visualization, ./src live-mounted
+docker compose -f docker-compose.yml -f docker-compose.debug.yml up
+
+# Interactive shell (debug override gives live-mounted src)
+docker compose -f docker-compose.yml -f docker-compose.debug.yml run --rm ai_planner bash
 ```
 
-The default `docker-compose.yml` is now the competition-oriented path: no source or model bind mounts.
-For local hot-reload development with bind mounts, use:
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.dev.yml up
-```
+Deploy mode uses the baked image and runs `deploy.launch.py` automatically.
+Debug mode live-mounts `./src` so Python node edits take effect on the next launch; changes to `setup.py`, entry points, or `*.launch.py` files still require a workspace rebuild inside the container (`colcon build --packages-select pipeline_orchestrator` from `/ros2_ws`), then relaunch.
 
 Container-side runtime environment expected by the planner:
 
@@ -113,22 +112,17 @@ These numbers are only for standalone GraspGen inference. They do not include se
 
 ## Planner Image Status
 
-The planner image is no longer just a lightweight ROS2 client image.
+The planner image is a single layer-ordered image built with `docker compose build`.
 
 Current Docker image behavior:
 
-- reusable heavy base image: `ros2-ai-planner-base:latest`
-- base image starts from public `nvcr.io/nvidia/pytorch:23.07-py3`
-- base image adds ROS2 Humble runtime, OpenCV, GraspGen source, and Python tooling
-- planner image then only copies `src/`, builds the ROS2 workspace, and installs entrypoint scripts
+- single `Dockerfile` (CUDA 12.8 + ROS2 Humble + PyTorch + SAM2/GraspGen/cuRobo + baked models; `COPY src` is last so node edits only invalidate the final layers)
 - required GraspGen model assets are downloaded from Hugging Face during image build and copied into the image
 
 Verified image-level checks:
 
-- `./scripts/build_base_image.sh` creates the reusable base image
-- `./scripts/build_image.sh` builds the thin planner image on top of it
 - `grasp_gen` imports successfully inside the planner container
-- `/start_graspgen_server.sh` resolves the embedded repo and the checkpoint downloaded into the image at build time
+- `scripts/start_graspgen_server.sh` resolves the embedded repo and the checkpoint downloaded into the image at build time
 - model load succeeds inside the planner container
 
 Pinned external sources used by the image build:
@@ -148,7 +142,6 @@ From the local `GraspGen` repo root:
 
 ```bash
 cd /home/user/JW/iir/GraspGen
-bash docker/build.sh
 MODELS_DIR=/home/user/JW/iir/GraspGenModels \
 docker compose -f docker/compose.serve.yml up --build
 ```
@@ -181,8 +174,8 @@ Launch the normal `manip_challenge` Gazebo/ROS2 stack on the host. The probe exp
 From this repo root:
 
 ```bash
-./scripts/build_image.sh
-docker compose run --rm ai_planner bash
+docker compose build
+docker compose -f docker-compose.yml -f docker-compose.debug.yml run --rm ai_planner bash
 ```
 
 Inside the container:
@@ -190,7 +183,6 @@ Inside the container:
 ```bash
 . /opt/ros/humble/setup.bash
 cd /ros2_ws
-colcon build --symlink-install
 source install/setup.bash
 ros2 run pipeline_orchestrator graspgen_probe
 ```
@@ -216,13 +208,12 @@ This probe still does not do segmentation, retargeting, collision filtering, or 
 
 ## Embedded GraspGen Path
 
-The planner image can also launch GraspGen internally instead of depending on a separate GraspGen container.
+The planner image launches GraspGen internally; no separate GraspGen container is needed. The embedded server is started automatically by the launch files in both deploy and debug modes.
 
-From this repo root:
+To start it manually in an interactive shell:
 
 ```bash
-./scripts/build_image.sh
-docker compose run --rm ai_planner bash
+docker compose -f docker-compose.yml -f docker-compose.debug.yml run --rm ai_planner bash
 ```
 
 Inside the container:
@@ -249,19 +240,16 @@ This embedded path is now used by the planner-side segmentation and grasp servic
 
 ## Single Launcher
 
-The planner-side stack can now be started with one ROS2 launch command.
+The compose commands start the full pipeline automatically — users normally do **not** type `ros2 launch` by hand.
 
-Inside the planner container:
+- **Deploy** (`docker compose up`) runs `deploy.launch.py`: full pipeline with motion execution, no visualization.
+- **Debug** (`docker compose -f docker-compose.yml -f docker-compose.debug.yml up`) runs `debug.launch.py`: same pipeline plus grasp-pose and TSDF publishing, and the `debug_viz` viser node (default port 8080).
 
-```bash
-source /opt/ros/humble/setup.bash
-cd /ros2_ws
-source install/setup.bash
-export GEMINI_API_KEY=...
-ros2 launch pipeline_orchestrator planner_pipeline.launch.py \
-  start_graspgen_server:=true \
-  auto_run_on_task_command:=true
-```
+Both modes auto-start the embedded GraspGen server and run motion execution. The three launch files are:
+
+- `src/pipeline_orchestrator/launch/pipeline_common.launch.py` — shared node graph behind mode toggles
+- `src/pipeline_orchestrator/launch/deploy.launch.py` — deploy entry point
+- `src/pipeline_orchestrator/launch/debug.launch.py` — debug entry point
 
 ## Ultralytics SAM2 Status
 
@@ -278,28 +266,18 @@ existing torch/CUDA stack.
 This is distinct from the official `facebookresearch/sam2` installation path, which
 has different version expectations and is not the integration target for this repo.
 
-What this starts:
+What the pipeline starts:
 
-- embedded GraspGen server when `start_graspgen_server:=true`
+- embedded GraspGen server (both modes)
 - `segmentation_service`
 - `graspgen_service`
 - `orchestrator`
-
-Useful overrides:
-
-```bash
-ros2 launch pipeline_orchestrator planner_pipeline.launch.py \
-  start_graspgen_server:=false \
-  graspgen_host:=127.0.0.1 \
-  graspgen_port:=5556 \
-  use_sim_time:=true \
-  auto_run_on_task_command:=false
-```
+- `curobo_service` (both modes; motion execution always active)
+- `debug_viz` viser node (debug mode only)
 
 Default topic wiring:
 
-- RGB: `/camera/camera/color/image_raw`
-- organized point cloud: `/camera/camera/depth/color/points`
+- RGB: `/wrist_camera/wrist_camera/color/image_raw`
 - segmentation service: `/segmentation/segment_prompt`
 - segmented object cloud: `/graspgen/segmented_object`
 - background cloud: `/graspgen/background`
@@ -362,7 +340,7 @@ This means `ros2-ai-planner` now has a runtime segmentation-to-GraspGen path, an
 
 ## Testing
 
-With the development override compose file, source edits in `src/` take effect immediately inside the container because of the volume mount plus `--symlink-install`.
+In debug mode (`docker-compose.debug.yml`), `./src` is live-mounted so Python node edits take effect immediately on the next launch. Changes to `setup.py`, entry points, or `*.launch.py` files require a rebuild inside the container first.
 
 ### Pipeline visualization (web-based, works over SSH)
 
@@ -387,28 +365,22 @@ docker compose run --rm ai_planner bash -c "
 
 ## Development
 
-To rebuild the ROS2 workspace inside the container:
+To rebuild the ROS2 workspace inside the container (needed after `setup.py`, entry-point, or `*.launch.py` changes in debug mode):
 
 ```bash
-docker compose run --rm ai_planner bash /ros2_ws/scripts/build.sh
+colcon build --packages-select pipeline_orchestrator
+source install/setup.bash
 ```
 
 To open an interactive shell:
 
 ```bash
-docker compose run --rm ai_planner bash
+docker compose -f docker-compose.yml -f docker-compose.debug.yml run --rm ai_planner bash
 ```
 
-## Build Speed Mitigation
+## Build Speed
 
-The slowest rebuild layer is installing ROS2 Humble and related apt packages. That layer is now split out into a reusable base image:
-
-- `./scripts/build_base_image.sh`
-  - rebuild only when ROS2/system Python/GraspGen base dependencies change
-- `./scripts/build_image.sh`
-  - reuses the base image and rebuilds only the planner workspace image
-
-If the base image already exists locally, `build_image.sh` skips rebuilding it.
+The single `Dockerfile` is layer-ordered so that the heaviest layers (ROS2 apt packages, PyTorch CUDA wheels, GraspGen/cuRobo source installs, model downloads) are near the top and are cached after the first build. The `COPY src` step is last, so node code changes only invalidate the final layer.
 
 ## Adding Dependencies
 
