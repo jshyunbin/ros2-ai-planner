@@ -49,7 +49,7 @@ class GraspGenService(Node):
         self.declare_parameter("background_point_cloud_topic", "/graspgen/background")
         self.declare_parameter("service_name", "/graspgen/infer")
         self.declare_parameter("server_host", "127.0.0.1")
-        self.declare_parameter("server_port", 5557)
+        self.declare_parameter("server_port", 5556)
         self.declare_parameter("num_grasps", 200)
         self.declare_parameter("topk_num_grasps", 100)
         self.declare_parameter("min_grasps", 20)
