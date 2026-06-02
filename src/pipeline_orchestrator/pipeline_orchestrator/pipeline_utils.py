@@ -40,11 +40,18 @@ def env_int(name: str, default: int) -> int:
     return int(raw)
 
 
-def make_xyz_cloud(points: np.ndarray, frame_id: str) -> PointCloud2:
-    """Build a dense XYZ ``sensor_msgs/PointCloud2`` from an (N, 3+) array."""
+def make_xyz_cloud(points: np.ndarray, frame_id: str, stamp=None) -> PointCloud2:
+    """Build a dense XYZ ``sensor_msgs/PointCloud2`` from an (N, 3+) array.
+
+    ``stamp`` is an optional ``builtin_interfaces/Time``; when supplied it is
+    written to the cloud header so downstream consumers can correlate the cloud
+    with the sensor frame it was built from.
+    """
     xyz = np.asarray(points[:, :3], dtype=np.float32)
     msg = PointCloud2()
     msg.header = Header(frame_id=frame_id)
+    if stamp is not None:
+        msg.header.stamp = stamp
     msg.height = 1
     msg.width = len(xyz)
     msg.fields = [

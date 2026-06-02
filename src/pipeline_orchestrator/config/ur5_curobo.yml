@@ -60,7 +60,7 @@ robot_cfg:
           radius: 0.05
       tool0:
         # Robotiq 85 gripper body: 3 spheres covering the flange and palm only.
-        # Finger spheres above z=0.10 were removed — they extended into the
+        # Finger spheres above z=0.10 were removed - they extended into the
         # workspace envelope and caused false collision detections with the
         # workspace_basket_support cuboid during approach trajectory planning.
         - center: [0, 0, 0.02]

@@ -21,7 +21,6 @@ try:  # pragma: no cover - runtime dependency
     from rclpy.executors import MultiThreadedExecutor
     from sensor_msgs.msg import JointState
     from std_msgs.msg import String
-    from std_srvs.srv import Trigger
     from control_msgs.action import FollowJointTrajectory
     from geometry_msgs.msg import Pose
     from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
@@ -43,10 +42,6 @@ except ImportError:  # pragma: no cover - import-only test fallback
 
     class String:  # type: ignore[override]
         pass
-
-    class Trigger:  # type: ignore[override]
-        class Request:
-            pass
 
 try:  # pragma: no cover - runtime dependency
     from riro_srvs.srv import StringString
@@ -117,7 +112,7 @@ class PipelineOrchestrator(Node):
         self._segmentation_client = self.create_client(
             StringString, self._segmentation_service_name)
         self._graspgen_client = self.create_client(
-            Trigger, self._graspgen_service_name)
+            StringString, self._graspgen_service_name)
 
         self._pipeline_busy = False
         self._active_task = ''
@@ -224,27 +219,25 @@ class PipelineOrchestrator(Node):
             self._reset_pipeline_state()
             return
 
-        future = self._graspgen_client.call_async(Trigger.Request())
+        request = StringString.Request()
+        # Token: the segmented cloud's stamp, so GraspGen infers on this run's
+        # cloud (empty string falls back to "use latest").
+        request.data = str(self._latest_segmentation.get('cloud_stamp_ns', ''))
+        future = self._graspgen_client.call_async(request)
         future.add_done_callback(self._on_graspgen_done)
 
     def _on_graspgen_done(self, future) -> None:
         try:
             result = future.result()
+            payload = json.loads(result.data)
         except Exception as exc:
             self.get_logger().error(f'GraspGen service call failed: {exc}')
             self._reset_pipeline_state()
             return
 
-        if not result.success:
-            self.get_logger().warn(f'GraspGen failed: {result.message}')
-            self._reset_pipeline_state()
-            return
-
-        try:
-            payload = json.loads(result.message)
-        except json.JSONDecodeError:
+        if not payload.get('success'):
             self.get_logger().warn(
-                f'GraspGen returned non-JSON payload: {result.message}')
+                f"GraspGen failed: {payload.get('error', payload)}")
             self._reset_pipeline_state()
             return
 

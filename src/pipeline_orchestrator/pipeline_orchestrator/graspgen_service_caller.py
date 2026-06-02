@@ -6,7 +6,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import PointCloud2
-from std_srvs.srv import Trigger
+from riro_srvs.srv import StringString
 
 from pipeline_orchestrator.pipeline_utils import make_xyz_cloud
 
@@ -30,12 +30,13 @@ class GraspGenServiceCaller(Node):
         self._service_name = str(self.get_parameter("service_name").value)
         self._frame_id = str(self.get_parameter("frame_id").value)
 
+        # RELIABLE to match the graspgen_service subscriptions.
         qos = QoSProfile(depth=10)
-        qos.reliability = ReliabilityPolicy.BEST_EFFORT
+        qos.reliability = ReliabilityPolicy.RELIABLE
 
         self._segmented_pub = self.create_publisher(PointCloud2, segmented_topic, qos)
         self._background_pub = self.create_publisher(PointCloud2, background_topic, qos)
-        self._client = self.create_client(Trigger, self._service_name)
+        self._client = self.create_client(StringString, self._service_name)
 
     def run(self) -> int:
         segmented_path = Path(str(self.get_parameter("segmented_object_file").value))
@@ -75,20 +76,25 @@ class GraspGenServiceCaller(Node):
             self.get_logger().error(f"Service not available: {self._service_name}")
             return 1
 
-        future = self._client.call_async(Trigger.Request())
+        request = StringString.Request()
+        request.data = ""  # empty token: infer on the latest published cloud
+        future = self._client.call_async(request)
         rclpy.spin_until_future_complete(self, future, timeout_sec=120.0)
         if not future.done() or future.result() is None:
             self.get_logger().error("Service call failed or timed out.")
             return 1
 
         result = future.result()
-        self.get_logger().info(f"service_success={result.success}")
         try:
-            parsed = json.loads(result.message)
-            print(json.dumps(parsed, indent=2))
+            parsed = json.loads(result.data)
         except json.JSONDecodeError:
-            print(result.message)
-        return 0 if result.success else 1
+            self.get_logger().error("Service returned a non-JSON payload.")
+            print(result.data)
+            return 1
+        success = bool(parsed.get("success"))
+        self.get_logger().info(f"service_success={success}")
+        print(json.dumps(parsed, indent=2))
+        return 0 if success else 1
 
 
 def main(args=None):

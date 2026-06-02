@@ -148,6 +148,12 @@ class SegmentationService(Node):
         qos = QoSProfile(depth=10)
         qos.reliability = ReliabilityPolicy.BEST_EFFORT
 
+        # Cloud topics are request/response-style bulk data (not a high-rate
+        # stream); RELIABLE prevents the one cloud GraspGen needs from being
+        # silently dropped. Must match GraspGen's subscription QoS.
+        cloud_qos = QoSProfile(depth=10)
+        cloud_qos.reliability = ReliabilityPolicy.RELIABLE
+
         self.create_subscription(
             Image, str(self.get_parameter("rgb_topic").value), self._rgb_callback, qos
         )
@@ -165,10 +171,10 @@ class SegmentationService(Node):
         )
 
         self._segmented_pub = self.create_publisher(
-            PointCloud2, str(self.get_parameter("segmented_point_cloud_topic").value), qos
+            PointCloud2, str(self.get_parameter("segmented_point_cloud_topic").value), cloud_qos
         )
         self._background_pub = self.create_publisher(
-            PointCloud2, str(self.get_parameter("background_point_cloud_topic").value), qos
+            PointCloud2, str(self.get_parameter("background_point_cloud_topic").value), cloud_qos
         )
         self._overlay_pub = self.create_publisher(
             Image, str(self.get_parameter("overlay_topic").value), qos
@@ -330,9 +336,12 @@ class SegmentationService(Node):
             assert roi is not None
             x_min, y_min, x_max, y_max = roi
 
-            self._segmented_pub.publish(make_xyz_cloud(object_points, output_frame))
+            cloud_stamp = self._latest_depth_stamp
+            self._segmented_pub.publish(
+                make_xyz_cloud(object_points, output_frame, stamp=cloud_stamp))
             if len(background_points) > 0:
-                self._background_pub.publish(make_xyz_cloud(background_points, output_frame))
+                self._background_pub.publish(
+                    make_xyz_cloud(background_points, output_frame, stamp=cloud_stamp))
 
             overlay = build_overlay_image(
                 rgb_bgr,
@@ -352,6 +361,7 @@ class SegmentationService(Node):
                 "label": prompt_result["label"],
                 "frame_id": output_frame,
                 "source_frame_id": source_frame,
+                "cloud_stamp_ns": int(self._latest_depth_stamp_ns),
                 "centroid": [round(float(v), 5) for v in centroid],
                 "roi_xyxy": [x_min, y_min, x_max, y_max],
                 "mask_pixel_count": int(mask.sum()),

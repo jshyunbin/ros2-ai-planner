@@ -45,7 +45,7 @@ Nodes (each is a `console_scripts` entry point in `setup.py`):
 |---|---|---|
 | `orchestrator.py` | `orchestrator` | Drives the pipeline: subscribes `/task_commands`, calls the segmentation, GraspGen, and cuRobo services in turn, then executes the trajectory via FollowJointTrajectory actions. |
 | `segmentation_service.py` | `segmentation_service` | `StringString` service `/segmentation/segment_prompt`. Localizes the prompt with Gemini, refines with SAM2, back-projects depth, and **publishes** the segmented + background point clouds (in `base_link`). |
-| `graspgen_service.py` | `graspgen_service` | `Trigger` service `/graspgen/infer`. Runs GraspGen on the latest segmented cloud (via a ZMQ client to a separate inference server), applies kinematic/collision filtering and ranking, returns ranked grasp poses as JSON. |
+| `graspgen_service.py` | `graspgen_service` | `StringString` service `/graspgen/infer`. The request carries a cloud-stamp token (empty = latest); GraspGen waits for the matching segmented cloud, runs inference (via a ZMQ client to a separate inference server), applies kinematic/collision filtering and ranking, and returns ranked grasp poses as JSON (with a `success` field). |
 | `curobo_service.py` | `curobo_service` | `PlanTrajectory` service `/curobo/plan_trajectory`. Wraps the long-lived `CuRobo` planner; plans pick (approach+grasp / lift) or single-pose (place/home). |
 | `curobo.py` | — | `CuRobo` class: dual-RGBD TSDF occupancy mapping + cuRobo motion planning. Owns only depth/CameraInfo/TF; fed joints via `update_joint_state()`. |
 | `graspgen_client.py` | — | Minimal ZMQ client to the standalone GraspGen inference server. |
@@ -80,7 +80,7 @@ Internal:
 |---|---|---|
 | `/segmentation/segment_prompt` | `riro_srvs/StringString` | orchestrator → segmentation_service |
 | `/graspgen/segmented_object`, `/graspgen/background` | `sensor_msgs/PointCloud2` | segmentation_service → graspgen_service |
-| `/graspgen/infer` | `std_srvs/Trigger` | orchestrator → graspgen_service |
+| `/graspgen/infer` | `riro_srvs/StringString` | orchestrator → graspgen_service (request = cloud-stamp token, response = JSON) |
 | `/curobo/plan_trajectory` | `riro_srvs/PlanTrajectory` | orchestrator → curobo_service |
 
 ## Adding Dependencies
@@ -90,8 +90,9 @@ Pip dependencies live under `requirements/` (`sam2.txt`, `graspgen.txt`, `curobo
 ## Key Files
 
 - `Dockerfile` / `Dockerfile.base` — CUDA 12.8 + ROS2 Humble + PyTorch base image
-- `docker-compose.yml` — host networking, NVIDIA runtime, live `src` volume mount (service: `ai_planner`)
+- `docker-compose.yml` — host networking, NVIDIA runtime (service: `ai_planner`); mounts `./artifacts` and `./config:ro`. **`src` is baked into the image at build time, not mounted** — code edits require a rebuild unless you use the dev override below.
+- `docker-compose.dev.yml` — override that live-mounts `./src` and `./scripts` into `/ros2_ws/` for iterative development. Must be passed explicitly: `docker compose -f docker-compose.yml -f docker-compose.dev.yml run --rm ai_planner …` (or set `COMPOSE_FILE=docker-compose.yml:docker-compose.dev.yml`).
 - `src/pipeline_orchestrator/launch/planner_pipeline.launch.py` — brings up the full pipeline
 - `src/pipeline_orchestrator/pipeline_orchestrator/` — all pipeline nodes (see table above)
 - `src/utils/riro_srvs/srv/` — custom service definitions
-- `config/ur5_curobo.yml` — cuRobo robot config
+- `src/pipeline_orchestrator/config/ur5_curobo.yml` — cuRobo robot config (keep ASCII-only: cuRobo's `load_yaml` opens it with the container's default ASCII codec, so non-ASCII bytes crash it)

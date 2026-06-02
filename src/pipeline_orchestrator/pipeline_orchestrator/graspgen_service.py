@@ -1,17 +1,24 @@
 import json
 import os
 from pathlib import Path
+import threading
 import time
 
 import numpy as np
 import rclpy
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2
-from std_srvs.srv import Trigger
 
 from pipeline_orchestrator.graspgen_client import GraspGenClient
+
+try:  # pragma: no cover - runtime dependency
+    from riro_srvs.srv import StringString
+except ImportError:  # pragma: no cover - runtime dependency
+    StringString = None
 
 try:
     from grasp_gen.robot import get_gripper_info
@@ -31,6 +38,9 @@ class GraspGenService(Node):
     """Serve filtered GraspGen results for the latest segmented point cloud."""
 
     def __init__(self):
+        if StringString is None:
+            raise ImportError("riro_srvs is required for graspgen_service.")
+
         super().__init__("graspgen_service")
 
         self.declare_parameter("segmented_point_cloud_topic", "/graspgen/segmented_object")
@@ -51,14 +61,23 @@ class GraspGenService(Node):
         self.declare_parameter("collision_threshold", 0.002)
         self.declare_parameter("collision_samples", 2000)
         self.declare_parameter("debug_dir", "/artifacts/graspgen_service")
+        self.declare_parameter("cloud_wait_sec", 5.0)
 
+        # RELIABLE to match the segmentation publishers; the cloud is bulk
+        # request/response data, not a high-rate stream.
         qos = QoSProfile(depth=10)
-        qos.reliability = ReliabilityPolicy.BEST_EFFORT
+        qos.reliability = ReliabilityPolicy.RELIABLE
 
+        self._cloud_wait_sec = float(self.get_parameter("cloud_wait_sec").value)
+        # _cloud_cv guards the latest-cloud state and is notified whenever a new
+        # segmented cloud arrives, so the service handler can wait for the cloud
+        # that matches its request token.
+        self._cloud_cv = threading.Condition()
         self._latest_segmented_cloud = None
         self._latest_background_cloud = None
         self._latest_segmented_frame = ""
         self._latest_background_frame = ""
+        self._latest_segmented_stamp_ns = 0
         self._debug_dir = Path(str(self.get_parameter("debug_dir").value))
         self._debug_dir.mkdir(parents=True, exist_ok=True)
 
@@ -73,13 +92,19 @@ class GraspGenService(Node):
         background_topic = str(self.get_parameter("background_point_cloud_topic").value)
         service_name = str(self.get_parameter("service_name").value)
 
+        # Cloud subscriptions live in their own reentrant group so they can be
+        # serviced (under the MultiThreadedExecutor in main()) while the service
+        # handler is blocked waiting for the cloud that matches its token.
+        cloud_group = ReentrantCallbackGroup()
         self.create_subscription(
-            PointCloud2, segmented_topic, self._segmented_cloud_callback, qos
+            PointCloud2, segmented_topic, self._segmented_cloud_callback, qos,
+            callback_group=cloud_group,
         )
         self.create_subscription(
-            PointCloud2, background_topic, self._background_cloud_callback, qos
+            PointCloud2, background_topic, self._background_cloud_callback, qos,
+            callback_group=cloud_group,
         )
-        self.create_service(Trigger, service_name, self._infer_callback)
+        self.create_service(StringString, service_name, self._infer_callback)
 
         self.get_logger().info(
             f"Listening for segmented clouds on {segmented_topic}, background clouds on {background_topic}, "
@@ -90,15 +115,42 @@ class GraspGenService(Node):
         cloud = self._pointcloud2_to_xyz(msg)
         if len(cloud) == 0:
             return
-        self._latest_segmented_cloud = cloud
-        self._latest_segmented_frame = msg.header.frame_id
+        with self._cloud_cv:
+            self._latest_segmented_cloud = cloud
+            self._latest_segmented_frame = msg.header.frame_id
+            self._latest_segmented_stamp_ns = self._stamp_to_ns(msg.header.stamp)
+            self._cloud_cv.notify_all()
 
     def _background_cloud_callback(self, msg: PointCloud2) -> None:
         cloud = self._pointcloud2_to_xyz(msg)
         if len(cloud) == 0:
             return
-        self._latest_background_cloud = cloud
-        self._latest_background_frame = msg.header.frame_id
+        with self._cloud_cv:
+            self._latest_background_cloud = cloud
+            self._latest_background_frame = msg.header.frame_id
+
+    @staticmethod
+    def _stamp_to_ns(stamp) -> int:
+        return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+
+    @staticmethod
+    def _parse_token(data: str):
+        """Parse the request token into a nanosecond stamp, or None for 'latest'."""
+        text = (data or "").strip()
+        if not text:
+            return None
+        return int(text)
+
+    def _wait_for_cloud(self, requested_ns: int) -> bool:
+        """Block until a segmented cloud at >= requested_ns is cached, or timeout."""
+        deadline = time.monotonic() + self._cloud_wait_sec
+        with self._cloud_cv:
+            while self._latest_segmented_stamp_ns < requested_ns:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    return False
+                self._cloud_cv.wait(timeout=remaining)
+            return True
 
     def _pointcloud2_to_xyz(self, msg: PointCloud2) -> np.ndarray:
         points = point_cloud2.read_points_numpy(msg, field_names=("x", "y", "z"))
@@ -112,36 +164,67 @@ class GraspGenService(Node):
         finite_mask = np.isfinite(points).all(axis=1)
         return points[finite_mask]
 
-    def _infer_callback(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
-        del request
-        if self._latest_segmented_cloud is None:
-            response.success = False
-            response.message = "No segmented point cloud received yet."
+    def _infer_callback(self, request, response):
+        """StringString service: request.data is the cloud token, response.data is JSON.
+
+        An empty token means "use the latest cloud"; a nanosecond stamp means
+        "wait for the segmented cloud with that stamp, then infer".
+        """
+        try:
+            requested_ns = self._parse_token(request.data)
+        except (TypeError, ValueError):
+            response.data = json.dumps({
+                "success": False,
+                "error": f"Invalid request token (expected nanosecond stamp): {request.data!r}",
+            })
             return response
 
-        segmented_cloud = self._latest_segmented_cloud
+        if requested_ns is not None and not self._wait_for_cloud(requested_ns):
+            response.data = json.dumps({
+                "success": False,
+                "error": (
+                    f"Timed out waiting for segmented cloud stamp {requested_ns} "
+                    f"(waited {self._cloud_wait_sec:.1f}s)."
+                ),
+            })
+            return response
+
+        response.data = json.dumps(self._run_inference())
+        return response
+
+    def _run_inference(self) -> dict:
+        with self._cloud_cv:
+            segmented_cloud = self._latest_segmented_cloud
+            segmented_frame = self._latest_segmented_frame
+            background_cloud = self._latest_background_cloud
+            background_frame = self._latest_background_frame
+
+        if segmented_cloud is None:
+            return {"success": False, "error": "No segmented point cloud received yet."}
+
         expected_frame = str(self.get_parameter("expected_frame").value)
-        if expected_frame and self._latest_segmented_frame != expected_frame:
-            response.success = False
-            response.message = (
-                "Segmented point cloud frame mismatch: "
-                f"got {self._latest_segmented_frame!r}, "
-                f"expected {expected_frame!r}."
-            )
-            return response
+        if expected_frame and segmented_frame != expected_frame:
+            return {
+                "success": False,
+                "error": (
+                    "Segmented point cloud frame mismatch: "
+                    f"got {segmented_frame!r}, expected {expected_frame!r}."
+                ),
+            }
         if (
-            self._latest_background_cloud is not None
+            background_cloud is not None
             and expected_frame
-            and self._latest_background_frame
-            and self._latest_background_frame != expected_frame
+            and background_frame
+            and background_frame != expected_frame
         ):
-            response.success = False
-            response.message = (
-                "Background point cloud frame mismatch: "
-                f"got {self._latest_background_frame!r}, "
-                f"expected {expected_frame!r}."
-            )
-            return response
+            return {
+                "success": False,
+                "error": (
+                    "Background point cloud frame mismatch: "
+                    f"got {background_frame!r}, expected {expected_frame!r}."
+                ),
+            }
+
         debug_id = time.strftime("%Y%m%d-%H%M%S") + f"-{int(time.time_ns() % 1_000_000_000):09d}"
         debug_path = self._debug_dir / debug_id
         debug_path.mkdir(parents=True, exist_ok=True)
@@ -152,44 +235,41 @@ class GraspGenService(Node):
                 remove_outliers=remove_outliers,
             )
         except Exception as exc:
-            response.success = False
-            response.message = f"GraspGen inference failed: {exc}"
+            error = f"GraspGen inference failed: {exc}"
             self._save_debug_artifacts(
                 debug_path,
                 segmented_cloud=segmented_cloud,
-                background_cloud=self._latest_background_cloud,
-                response_payload={"success": False, "error": response.message},
+                background_cloud=background_cloud,
+                response_payload={"success": False, "error": error},
                 grasps=None,
                 confidences=None,
             )
-            return response
+            return {"success": False, "error": error, "debug_dir": str(debug_path)}
 
         if len(grasps) == 0:
-            response.success = False
-            response.message = "No grasps returned."
+            error = "No grasps returned."
             self._save_debug_artifacts(
                 debug_path,
                 segmented_cloud=segmented_cloud,
-                background_cloud=self._latest_background_cloud,
-                response_payload={"success": False, "error": response.message},
+                background_cloud=background_cloud,
+                response_payload={"success": False, "error": error},
                 grasps=np.asarray(grasps, dtype=np.float32),
                 confidences=np.asarray(confidences, dtype=np.float32),
             )
-            return response
+            return {"success": False, "error": error, "debug_dir": str(debug_path)}
 
         grasps, confidences = self._kinematic_filter(grasps, confidences)
         if len(grasps) == 0:
-            response.success = False
-            response.message = "All grasps filtered by kinematic reachability (reach/table gate)."
+            error = "All grasps filtered by kinematic reachability (reach/table gate)."
             self._save_debug_artifacts(
                 debug_path,
                 segmented_cloud=segmented_cloud,
-                background_cloud=self._latest_background_cloud,
-                response_payload={"success": False, "error": response.message},
+                background_cloud=background_cloud,
+                response_payload={"success": False, "error": error},
                 grasps=np.empty((0, 4, 4), dtype=np.float32),
                 confidences=np.empty((0,), dtype=np.float32),
             )
-            return response
+            return {"success": False, "error": error, "debug_dir": str(debug_path)}
 
         collision_free_mask = self._compute_collision_free_mask(grasps)
         filtered_rows = self._rank_grasps(grasps, confidences, collision_free_mask)
@@ -197,7 +277,8 @@ class GraspGenService(Node):
         top_rows = filtered_rows[:max_returned]
 
         payload = {
-            "frame_id": self._latest_segmented_frame,
+            "success": len(top_rows) > 0,
+            "frame_id": segmented_frame,
             "num_input_points": int(len(segmented_cloud)),
             "num_grasps": int(len(grasps)),
             "num_collision_free_grasps": int(np.sum(collision_free_mask))
@@ -207,21 +288,21 @@ class GraspGenService(Node):
             "top_grasps": top_rows,
             "debug_dir": str(debug_path),
         }
-        response.success = len(top_rows) > 0
-        response.message = json.dumps(payload)
+        if not payload["success"]:
+            payload["error"] = "No grasps survived ranking."
         self._save_debug_artifacts(
             debug_path,
             segmented_cloud=segmented_cloud,
-            background_cloud=self._latest_background_cloud,
+            background_cloud=background_cloud,
             response_payload=payload,
             grasps=self._rows_to_grasps(top_rows),
             confidences=self._rows_to_confidences(top_rows),
         )
         self.get_logger().info(
             f"Returned {len(top_rows)} filtered grasps from {len(grasps)} raw grasps "
-            f"for frame {self._latest_segmented_frame}"
+            f"for frame {segmented_frame}"
         )
-        return response
+        return payload
 
     def _infer_with_optional_retry(
         self,
@@ -411,8 +492,12 @@ class GraspGenService(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = GraspGenService()
+    # MultiThreadedExecutor so the service handler can block in _wait_for_cloud
+    # while the cloud subscription (separate callback group) keeps delivering.
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
