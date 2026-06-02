@@ -10,7 +10,6 @@ MultiThreadedExecutor so spin_until_future_complete works inside callbacks.
 """
 
 import json
-import math
 import threading
 
 try:  # pragma: no cover - runtime dependency
@@ -52,6 +51,7 @@ except ImportError:  # pragma: no cover - runtime dependency
 
 from pipeline_orchestrator.pipeline_utils import as_bool as _as_bool
 from pipeline_orchestrator.pipeline_utils import env_float as _env_float
+from pipeline_orchestrator.pipeline_utils import pose_from_grasp_row as _pose_from_grasp_row_util
 
 
 # Robotiq 2F-85 gripper constants (from challenge_constants.py / yeina).
@@ -263,7 +263,7 @@ class PipelineOrchestrator(Node):
 
         # Build geometry_msgs/Pose for every ranked grasp candidate.
         grasp_poses = [
-            self._pose_from_grasp_row(row)
+            _pose_from_grasp_row_util(row)
             for row in top_grasps
         ]
         grasp_poses = [p for p in grasp_poses if p is not None]
@@ -428,50 +428,6 @@ class PipelineOrchestrator(Node):
             self._send_and_wait(self._gripper_client, jt, label)
         except Exception as exc:
             self.get_logger().warn(f'{label} failed (non-fatal): {exc}')
-
-    # ── grasp-row conversion ──────────────────────────────────────────────────
-
-    @staticmethod
-    def _pose_from_grasp_row(row: dict):
-        """Build geometry_msgs/Pose from a GraspGen rank row dict."""
-        if Pose is None:
-            return None
-        translation = row.get('translation')
-        rotation = row.get('rotation_matrix')
-        if translation is None or rotation is None:
-            return None
-        if len(translation) != 3 or len(rotation) != 3:
-            return None
-        quat = PipelineOrchestrator._quat_from_rotation_matrix(rotation)
-        pose = Pose()
-        pose.position.x = float(translation[0])
-        pose.position.y = float(translation[1])
-        pose.position.z = float(translation[2])
-        pose.orientation.w = quat[0]
-        pose.orientation.x = quat[1]
-        pose.orientation.y = quat[2]
-        pose.orientation.z = quat[3]
-        return pose
-
-    @staticmethod
-    def _quat_from_rotation_matrix(
-        rotation,
-    ) -> tuple[float, float, float, float]:
-        r00, r01, r02 = [float(v) for v in rotation[0]]
-        r10, r11, r12 = [float(v) for v in rotation[1]]
-        r20, r21, r22 = [float(v) for v in rotation[2]]
-        trace = r00 + r11 + r22
-        if trace > 0.0:
-            s = math.sqrt(trace + 1.0) * 2.0
-            return (0.25 * s, (r21 - r12) / s, (r02 - r20) / s, (r10 - r01) / s)
-        if r00 > r11 and r00 > r22:
-            s = math.sqrt(1.0 + r00 - r11 - r22) * 2.0
-            return ((r21 - r12) / s, 0.25 * s, (r01 + r10) / s, (r02 + r20) / s)
-        if r11 > r22:
-            s = math.sqrt(1.0 + r11 - r00 - r22) * 2.0
-            return ((r02 - r20) / s, (r01 + r10) / s, 0.25 * s, (r12 + r21) / s)
-        s = math.sqrt(1.0 + r22 - r00 - r11) * 2.0
-        return ((r10 - r01) / s, (r02 + r20) / s, (r12 + r21) / s, 0.25 * s)
 
     def _reset_pipeline_state(self) -> None:
         self._pipeline_busy = False

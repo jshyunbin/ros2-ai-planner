@@ -1,14 +1,21 @@
 """Small shared helpers used across the pipeline_orchestrator nodes.
 
 Kept dependency-light so it can be imported by every node (env parsing, bool
-coercion, and the XYZ PointCloud2 builder).
+coercion, the XYZ PointCloud2 builder, and the grasp-row pose /
+rotation-to-quaternion helpers).
 """
 
+import math
 import os
 
 import numpy as np
 from sensor_msgs.msg import PointCloud2, PointField
 from std_msgs.msg import Header
+
+try:  # pragma: no cover - geometry_msgs only present in the ROS runtime
+    from geometry_msgs.msg import Pose
+except ImportError:  # pragma: no cover - import-only test fallback
+    Pose = None
 
 
 def as_bool(value) -> bool:
@@ -65,3 +72,48 @@ def make_xyz_cloud(points: np.ndarray, frame_id: str, stamp=None) -> PointCloud2
     msg.data = xyz.tobytes()
     msg.is_dense = True
     return msg
+
+
+def quat_from_rotation_matrix(rotation) -> tuple[float, float, float, float]:
+    """Convert a 3x3 rotation matrix to a (w, x, y, z) quaternion."""
+    r00, r01, r02 = [float(v) for v in rotation[0]]
+    r10, r11, r12 = [float(v) for v in rotation[1]]
+    r20, r21, r22 = [float(v) for v in rotation[2]]
+    trace = r00 + r11 + r22
+    if trace > 0.0:
+        s = math.sqrt(trace + 1.0) * 2.0
+        return (0.25 * s, (r21 - r12) / s, (r02 - r20) / s, (r10 - r01) / s)
+    if r00 > r11 and r00 > r22:
+        s = math.sqrt(1.0 + r00 - r11 - r22) * 2.0
+        return ((r21 - r12) / s, 0.25 * s, (r01 + r10) / s, (r02 + r20) / s)
+    if r11 > r22:
+        s = math.sqrt(1.0 + r11 - r00 - r22) * 2.0
+        return ((r02 - r20) / s, (r01 + r10) / s, 0.25 * s, (r12 + r21) / s)
+    s = math.sqrt(1.0 + r22 - r00 - r11) * 2.0
+    return ((r10 - r01) / s, (r02 + r20) / s, (r12 + r21) / s, 0.25 * s)
+
+
+def pose_from_grasp_row(row: dict):
+    """Build a geometry_msgs/Pose from a GraspGen rank row dict.
+
+    Returns None when geometry_msgs is unavailable or the row lacks a valid
+    3-vector translation / 3x3 rotation matrix.
+    """
+    if Pose is None:
+        return None
+    translation = row.get("translation")
+    rotation = row.get("rotation_matrix")
+    if translation is None or rotation is None:
+        return None
+    if len(translation) != 3 or len(rotation) != 3:
+        return None
+    w, x, y, z = quat_from_rotation_matrix(rotation)
+    pose = Pose()
+    pose.position.x = float(translation[0])
+    pose.position.y = float(translation[1])
+    pose.position.z = float(translation[2])
+    pose.orientation.w = w
+    pose.orientation.x = x
+    pose.orientation.y = y
+    pose.orientation.z = z
+    return pose
