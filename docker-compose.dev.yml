@@ -1,5 +1,0 @@
-services:
-  ai_planner:
-    volumes:
-      - ./src:/ros2_ws/src
-      - ./scripts:/ros2_ws/scripts

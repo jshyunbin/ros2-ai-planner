@@ -1,0 +1,8 @@
+services:
+  ai_planner:
+    volumes:
+      - ./src:/ros2_ws/src
+      - ./scripts:/ros2_ws/scripts
+      - ./config:/ros2_ws/config:ro
+      - ./artifacts:/artifacts
+    command: ["ros2", "launch", "pipeline_orchestrator", "debug.launch.py"]
