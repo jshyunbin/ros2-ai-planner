@@ -836,14 +836,17 @@ def _candidate_pose_4x4(candidate) -> np.ndarray:
 
 
 def _effective_gripper_tcp_z_offset() -> float:
-    close_extra = _env_float('PIPELINE_CUROBO_GRASP_CLOSE_EXTRA_M', 0.06)
+    close_extra = _env_float('PIPELINE_CUROBO_GRASP_CLOSE_EXTRA_M', 0.110)
     if close_extra < 0.0:
         raise ValueError('PIPELINE_CUROBO_GRASP_CLOSE_EXTRA_M must be non-negative')
     offset = GRIPPER_TCP_Z_OFFSET - close_extra
-    if offset <= 0.0:
+    # A small negative offset is allowed: tool0 then sits just past the GraspGen
+    # grasp point (driven deeper onto the object). Floor it to catch gross
+    # misconfig that would ram the wrist well past the target.
+    if offset < -0.05:
         raise ValueError(
-            'PIPELINE_CUROBO_GRASP_CLOSE_EXTRA_M must be smaller than '
-            'GRIPPER_TCP_Z_OFFSET'
+            'PIPELINE_CUROBO_GRASP_CLOSE_EXTRA_M too large: tool0 would be '
+            'driven more than 5cm past the grasp point'
         )
     return offset
 
