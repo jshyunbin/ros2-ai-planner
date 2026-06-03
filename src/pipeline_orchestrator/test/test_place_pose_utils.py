@@ -75,3 +75,9 @@ def test_resolve_bookshelf_returns_pre_insert(tmp_path):
     data = load_place_poses(_write(tmp_path, _YAML))
     pose = resolve_target_pose(data, "bookshelf_floor1")
     assert pose.position.z == pytest.approx(0.55)
+
+
+def test_resolve_unknown_target_raises_keyerror(tmp_path):
+    data = load_place_poses(_write(tmp_path, _YAML))
+    with pytest.raises(KeyError):
+        resolve_target_pose(data, "nonexistent")

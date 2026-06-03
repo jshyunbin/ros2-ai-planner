@@ -5,6 +5,7 @@ geometry_msgs import) so it can be unit-tested without a live ROS graph,
 mirroring pipeline_utils.py.
 """
 
+from os import PathLike
 from pathlib import Path
 
 import yaml
@@ -19,7 +20,7 @@ SIMPLE_TARGETS = ("home", "storage_1", "storage_2")
 BOOKSHELF_TARGETS = ("bookshelf_floor1", "bookshelf_floor2")
 
 
-def load_place_poses(path) -> dict:
+def load_place_poses(path: "str | PathLike") -> dict:
     """Parse place_poses.yml into a plain dict, validating its structure.
 
     Raises ValueError if a required key is missing or malformed.
@@ -43,6 +44,7 @@ def load_place_poses(path) -> dict:
 
 
 def _validate_xyzquat(entry, label) -> None:
+    """Raise ValueError if *entry* lacks a valid xyz (3) / quat_xyzw (4) pair."""
     if not isinstance(entry, dict):
         raise ValueError(f"place_poses: '{label}' must be a mapping")
     xyz = entry.get("xyz")
