@@ -98,7 +98,7 @@ class DebugVizNode(Node):
         self.declare_parameter('tsdf_voxels_topic', '/curobo/tsdf_voxels')
         self.declare_parameter('grasp_frame_axes_length', 0.05)
         self.declare_parameter('point_size', 0.003)
-        self.declare_parameter('tsdf_voxel_size', 0.02)
+        self.declare_parameter('tsdf_voxel_size', 0.015)
 
         self._server = viser.ViserServer(port=int(self.get_parameter('viser_port').value))
         self.get_logger().info(

@@ -16,8 +16,9 @@ CuRobo warmup runs in a background thread so the service is immediately
 advertised while the planner initialises.
 """
 
-import traceback
 import threading
+import time
+import traceback
 
 import numpy as np
 import rclpy
@@ -36,6 +37,12 @@ from pipeline_orchestrator.pipeline_utils import as_bool as _as_bool
 from pipeline_orchestrator.pipeline_utils import env_float as _env_float
 from pipeline_orchestrator.pipeline_utils import make_xyz_cloud
 from riro_srvs.srv import PlanTrajectory
+
+
+# Debug-viz clouds are published from a dedicated thread (see _viz_publish_loop)
+# rather than ROS timers, so a long blocking plan_trajectory call on the
+# single-threaded executor can't starve them. Republishing cached numpy is cheap.
+_VIZ_PUBLISH_HZ = 5.0
 
 
 class CuRoboService(Node):
@@ -89,8 +96,15 @@ class CuRoboService(Node):
                 str(self.get_parameter('overhead_cloud_topic').value),
                 1,
             )
-            self.create_timer(1.0, self._publish_tsdf_voxels)
-            self.create_timer(1.0, self._publish_overhead_cloud)
+            # Publish from a dedicated thread, NOT executor timers: planning
+            # runs on (and blocks) the single-threaded executor, which would
+            # otherwise starve the timers and make the clouds update in bursts
+            # only after each plan returns. The loop just reads cached CPU numpy
+            # (no CUDA), so it's safe to run alongside the executor.
+            self._viz_stop = threading.Event()
+            self._viz_thread = threading.Thread(
+                target=self._viz_publish_loop, daemon=True)
+            self._viz_thread.start()
 
         self._init_thread = threading.Thread(
             target=self._init_curobo,
@@ -139,6 +153,26 @@ class CuRoboService(Node):
             curobo.update_joint_state(msg)
 
     # ── TSDF voxel publisher ──────────────────────────────────────────────────
+
+    def _viz_publish_loop(self) -> None:
+        """Publish debug clouds at _VIZ_PUBLISH_HZ off the ROS executor.
+
+        Mirrors the live-viz test script: a free-running thread refreshes the
+        viz at a steady cadence regardless of what the executor (planning) is
+        doing, so the clouds no longer freeze during a plan and then arrive in a
+        burst when it finishes.
+        """
+        period = 1.0 / _VIZ_PUBLISH_HZ
+        while rclpy.ok() and not self._viz_stop.is_set():
+            start = time.monotonic()
+            try:
+                self._publish_tsdf_voxels()
+                self._publish_overhead_cloud()
+            except Exception as exc:
+                self.get_logger().warning(
+                    f'viz publish failed: {type(exc).__name__}: {exc}',
+                    throttle_duration_sec=5.0)
+            self._viz_stop.wait(max(0.0, period - (time.monotonic() - start)))
 
     def _publish_tsdf_voxels(self) -> None:
         """Publish occupied TSDF voxel centers as a PointCloud2 (debug viz)."""

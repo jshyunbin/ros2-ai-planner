@@ -88,10 +88,18 @@ class CuRobo:
         self._tf_listener = TransformListener(self._tf_buffer, node)
         self._bridge = CvBridge()
 
+        # Map is centered on base_link in xy, but offset up in z so it spans
+        # base_link z in [-0.1, 0.75]: the table surface sits at z~=0, so the
+        # -0.1 floor keeps the tabletop plane as an obstacle while dropping the
+        # ~0.65m of empty grid that used to extend below the table (centered
+        # extent would put the floor at -0.75). Cuts wasted voxels from both the
+        # collision world and the debug viz.
         self._mapper = Mapper(MapperCfg(
-            extent_meters_xyz=(2.0, 2.0, 1.5),
-            voxel_size=0.02,
-            esdf_voxel_size=0.05,
+            extent_meters_xyz=(2.0, 2.0, 0.85),
+            grid_center=torch.tensor(
+                [0.0, 0.0, 0.325], dtype=torch.float32, device='cuda'),
+            voxel_size=0.015,
+            esdf_voxel_size=0.015,
             truncation_distance=0.1,
             depth_minimum_distance=0.15,
             depth_maximum_distance=2.0,
@@ -328,6 +336,9 @@ class CuRobo:
                     torch.cuda.synchronize()
                     with self._lock:
                         self._frame_count += 1
+                        frame_count = self._frame_count
+                    if self._enable_viz and frame_count % 10 == 0:
+                        self._cache_viz_tsdf()
         except Exception as exc:
             self._logger.error(
                 f'CuRobo: depth integration failed for {cam_id}: '
@@ -606,8 +617,8 @@ class CuRobo:
         collision_cache = {
             'voxel': {
                 'layers': 1,
-                'dims': [7.0, 7.0, 7.0],
-                'voxel_size': 0.05,
+                'dims': [3.0, 3.0, 3.0],
+                'voxel_size': 0.015,
             }
         }
         config = MotionPlannerCfg.create(
