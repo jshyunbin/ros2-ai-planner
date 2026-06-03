@@ -836,7 +836,7 @@ def _candidate_pose_4x4(candidate) -> np.ndarray:
 
 
 def _effective_gripper_tcp_z_offset() -> float:
-    close_extra = _env_float('PIPELINE_CUROBO_GRASP_CLOSE_EXTRA_M', 0.0)
+    close_extra = _env_float('PIPELINE_CUROBO_GRASP_CLOSE_EXTRA_M', 0.06)
     if close_extra < 0.0:
         raise ValueError('PIPELINE_CUROBO_GRASP_CLOSE_EXTRA_M must be non-negative')
     offset = GRIPPER_TCP_Z_OFFSET - close_extra

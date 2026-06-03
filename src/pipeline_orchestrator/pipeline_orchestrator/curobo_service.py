@@ -59,6 +59,11 @@ class CuRoboService(Node):
         self.declare_parameter('init_wait_sec', 120.0)
 
         self._latest_joints = None
+        # Set while a plan is in flight so the debug viz thread pauses its
+        # cloud publishing. rclpy PointCloud2 serialization is pure-Python and
+        # GIL-heavy; with a populated map it otherwise starves the (single-
+        # threaded) planner of the GIL and stretches a ~3s plan into minutes.
+        self._planning = threading.Event()
         self._curobo: CuRobo | None = None
         self._init_error = ''
         self._init_done = False
@@ -164,6 +169,11 @@ class CuRoboService(Node):
         period = 1.0 / _VIZ_PUBLISH_HZ
         while rclpy.ok() and not self._viz_stop.is_set():
             start = time.monotonic()
+            if self._planning.is_set():
+                # Don't serialize clouds while a plan is running: the GIL must
+                # stay with the planner thread (see self._planning).
+                self._viz_stop.wait(period)
+                continue
             try:
                 self._publish_tsdf_voxels()
                 self._publish_overhead_cloud()
@@ -258,6 +268,7 @@ class CuRoboService(Node):
                 'No joint state supplied and no /joint_states received yet.')
             return response
 
+        self._planning.set()
         try:
             if request.grasp_poses:
                 return self._handle_pick(curobo, request, joint_state, response)
@@ -269,6 +280,8 @@ class CuRoboService(Node):
             self.get_logger().error(response.message)
             self.get_logger().debug(traceback.format_exc())
             return response
+        finally:
+            self._planning.clear()
 
     def _handle_pick(self, curobo, request, joint_state, response):
         """Pick mode: plan_pick() → approach+grasp + lift."""
