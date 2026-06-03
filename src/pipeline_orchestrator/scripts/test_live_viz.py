@@ -70,7 +70,7 @@ WRIST_DEPTH_TOPIC    = '/wrist_camera/wrist_camera/depth/color/image_raw'
 WRIST_INFO_TOPIC     = '/wrist_camera/wrist_camera/depth/color/camera_info'
 OVERHEAD_FRAME       = 'camera_color_optical_frame'
 WRIST_FRAME          = 'wrist_camera_color_optical_frame'
-WORLD_FRAME          = 'world'
+WORLD_FRAME          = 'base_link'
 
 
 # ── shared state ──────────────────────────────────────────────────────────────
@@ -225,7 +225,7 @@ class LiveVizNode(Node):
 
         K = self._cam_intrinsics[cam_id]
 
-        # TF lookup: world ← camera_optical_frame (latest available transform)
+        # TF lookup: base_link ← camera_optical_frame (latest available transform)
         try:
             transform = self._tf_buffer.lookup_transform(
                 WORLD_FRAME, frame, rclpy.time.Time(),
@@ -251,7 +251,7 @@ class LiveVizNode(Node):
         # the live cloud would also lose those pixels.
         depth_for_viz = depth.clone()
 
-        # Camera pose in world frame (w, x, y, z quaternion convention)
+        # Camera pose in base_link frame (w, x, y, z quaternion convention)
         t = transform.transform.translation
         r = transform.transform.rotation
         pose = Pose.from_numpy(
@@ -294,7 +294,7 @@ class LiveVizNode(Node):
                         throttle_duration_sec=5.0)
 
         # Unproject the *unmasked* depth to XYZ in camera frame, then transform
-        # to world frame for viser display, so the camera POV shows the robot
+        # to base_link frame for viser display, so the camera POV shows the robot
         # too. (Mapper does its own transform internally using the pose we
         # pass, so its ESDF — built from the masked `depth` — is independent.)
         xyz_cam = depth_to_xyz(depth_for_viz, K)
@@ -605,7 +605,7 @@ def main() -> None:
     server = viser.ViserServer(port=8080, verbose=False)
     print('  Viser running — open http://localhost:8080\n')
 
-    server.scene.add_frame('/world', axes_length=0.3, axes_radius=0.01)
+    server.scene.add_frame('/base_link', axes_length=0.3, axes_radius=0.01)
     server.scene.add_icosphere(
         '/target', radius=0.03, color=(255, 80, 80), position=GOAL_XYZ)
 

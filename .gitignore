@@ -9,8 +9,10 @@ __pycache__/
 *.egg-info/
 .eggs/
 
-# Docker
-.dockerignore
+# Local environment / secrets
+.env
+artifacts/*
+!artifacts/.gitkeep
 
 # Editor
 .vscode/

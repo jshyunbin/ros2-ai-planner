@@ -9,10 +9,17 @@
 
   <depend>rclpy</depend>
   <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
   <depend>sensor_msgs</depend>
+  <depend>sensor_msgs_py</depend>
   <depend>geometry_msgs</depend>
+  <depend>tf2_ros</depend>
   <depend>trajectory_msgs</depend>
   <depend>control_msgs</depend>
+  <depend>cv_bridge</depend>
+  <depend>launch</depend>
+  <depend>launch_ros</depend>
+  <depend>riro_srvs</depend>
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>

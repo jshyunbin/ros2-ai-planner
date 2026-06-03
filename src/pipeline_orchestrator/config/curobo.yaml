@@ -10,7 +10,7 @@ mapper:
 tf:
   overhead_frame: camera_color_optical_frame
   wrist_frame: wrist_camera_color_optical_frame
-  world_frame: world
+  world_frame: base_link
 
 motion_planner:
   robot_config: /ros2_ws/src/pipeline_orchestrator/config/ur5_curobo.yml

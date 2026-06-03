@@ -1,7 +1,7 @@
 # nvblox Integration Design
 
-**Date:** 2026-05-25  
-**Branch:** nvblox  
+**Date:** 2026-05-25
+**Branch:** nvblox
 **Status:** Approved
 
 ## Goal
@@ -89,16 +89,16 @@ Python-side dependencies for nvblox integration (e.g. `nvblox-torch` if used for
 
 ## Key Design Decisions
 
-**Why nvblox for both collision and GraspGen input?**  
+**Why nvblox for both collision and GraspGen input?**
 Running two separate depth fusion systems (nvblox for cuRobo + teammate's fusion for GraspGen) would produce inconsistent scene representations. Using nvblox as the single source of truth means cuRobo and GraspGen always agree on where objects are, and the map is automatically correct after each pick-and-place cycle.
 
-**Why Gemini in parallel with nvblox?**  
+**Why Gemini in parallel with nvblox?**
 Both are I/O-bound on the first call (~1–2s each). Running them concurrently keeps pipeline latency at `max(t_gemini, t_nvblox)` rather than their sum.
 
-**Why not nvblox for GraspGen directly?**  
+**Why not nvblox for GraspGen directly?**
 GraspGen needs an object-centric point cloud, not the full scene ESDF. SAM2 provides the 2D segmentation mask to carve out just the target object from the nvblox mesh surface — the two work together.
 
-**Wrist camera at planning time**  
+**Wrist camera at planning time**
 Both cameras feed nvblox continuously. The wrist depth improves map quality from multiple viewpoints, but the wrist camera pose must be resolved via TF (FK from joint states). This is already available since joint states are published.
 
 ## What Is Not Changing

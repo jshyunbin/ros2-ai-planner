@@ -1,6 +1,6 @@
-# GraspGen dependencies
-# Ref: diffusion-based grasp pose generation model
-# Fill in when implementing graspgen_node
-# torch>=2.3.1    # already installed in Dockerfile
-# open3d
-# trimesh
+# GraspGen remote inference client dependencies
+# These are enough for ros2-ai-planner to send point clouds to the
+# standalone GraspGen ZMQ server without importing the model itself.
+msgpack
+msgpack-numpy
+pyzmq

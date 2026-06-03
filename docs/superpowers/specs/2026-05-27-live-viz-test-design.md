@@ -1,7 +1,7 @@
 # Live Visualization Test Script — Design
 
-**Date:** 2026-05-27  
-**Branch:** nvblox  
+**Date:** 2026-05-27
+**Branch:** nvblox
 **File to create:** `src/pipeline_orchestrator/scripts/test_live_viz.py`
 
 ---
@@ -61,22 +61,22 @@ TF frames used: `camera_color_optical_frame` and `wrist_camera_color_optical_fra
 
 ## Background Thread — ROS2 Node
 
-**`_on_info(msg, cam_id)`**  
+**`_on_info(msg, cam_id)`**
 Exactly as in `curobo.py`: build a `(3,3)` float32 CUDA tensor from `msg.k` and store in `_cam_intrinsics[cam_id]`.
 
-**`_on_depth(msg, cam_id, frame)`**  
-1. Guard: skip if intrinsics not yet received for this camera.  
-2. TF lookup (`tf2_ros.Buffer.lookup_transform`) from `world` → `frame` at message stamp with 0.1 s timeout; log warning and skip on failure.  
-3. `CvBridge.imgmsg_to_cv2` → float32 metres tensor (÷ 1000).  
-4. `FilterDepth` (bilateral, min/max clamp).  
-5. Unproject depth → XYZ point cloud using K; store in `_point_clouds[cam_id]`.  
-6. `Mapper.integrate(CameraObservation(...))` when both cameras have data.  
+**`_on_depth(msg, cam_id, frame)`**
+1. Guard: skip if intrinsics not yet received for this camera.
+2. TF lookup (`tf2_ros.Buffer.lookup_transform`) from `world` → `frame` at message stamp with 0.1 s timeout; log warning and skip on failure.
+3. `CvBridge.imgmsg_to_cv2` → float32 metres tensor (÷ 1000).
+4. `FilterDepth` (bilateral, min/max clamp).
+5. Unproject depth → XYZ point cloud using K; store in `_point_clouds[cam_id]`.
+6. `Mapper.integrate(CameraObservation(...))` when both cameras have data.
 7. Increment `_frame_count`; every 10 frames call `_replan()`.
 
-**`_replan()`**  
-1. `voxel_grid = mapper.compute_esdf()`; store in `_voxel_grid`.  
-2. Build `start` from `_latest_joints` if available, else fall back to `HOME_CFG`.  
-3. `planner.plan_pose(goal=(0.3, 0.0, 0.4), start)`.  
+**`_replan()`**
+1. `voxel_grid = mapper.compute_esdf()`; store in `_voxel_grid`.
+2. Build `start` from `_latest_joints` if available, else fall back to `HOME_CFG`.
+3. `planner.plan_pose(goal=(0.3, 0.0, 0.4), start)`.
 4. On success: store trajectory in `_traj`. On failure: keep previous trajectory (or home pose if no prior success).
 
 ---
