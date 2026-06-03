@@ -34,6 +34,7 @@ from pipeline_orchestrator.curobo import (
 )
 from sensor_msgs.msg import PointCloud2
 from pipeline_orchestrator.pipeline_utils import as_bool as _as_bool
+from pipeline_orchestrator.pipeline_utils import cloud_to_xyz as _cloud_to_xyz
 from pipeline_orchestrator.pipeline_utils import env_float as _env_float
 from pipeline_orchestrator.pipeline_utils import make_xyz_cloud
 from riro_srvs.srv import PlanTrajectory
@@ -57,9 +58,15 @@ class CuRoboService(Node):
         self.declare_parameter('enable_viz', False)
         self.declare_parameter('tsdf_voxels_topic', '/curobo/tsdf_voxels')
         self.declare_parameter('overhead_cloud_topic', '/curobo/overhead_cloud')
+        self.declare_parameter('segmented_object_topic', '/graspgen/segmented_object')
         self.declare_parameter('init_wait_sec', 120.0)
 
         self._latest_joints = None
+        # Latest segmented grasp-target cloud (base_link, (N,3) numpy). Fed to
+        # CuRobo before a pick so it can carve the target out of the TSDF
+        # collision world (the live TSDF fuses the object itself, which would
+        # otherwise block the grasp insertion).
+        self._latest_object_points = None
         self._curobo: CuRobo | None = None
         self._init_error = ''
         self._init_done = False
@@ -73,6 +80,12 @@ class CuRoboService(Node):
             JointState,
             self.JOINT_STATES_TOPIC,
             self._cache_joints,
+            10,
+        )
+        self.create_subscription(
+            PointCloud2,
+            str(self.get_parameter('segmented_object_topic').value),
+            self._cache_object_cloud,
             10,
         )
 
@@ -151,6 +164,16 @@ class CuRoboService(Node):
             curobo = self._curobo
         if curobo is not None:
             curobo.update_joint_state(msg)
+
+    def _cache_object_cloud(self, msg: PointCloud2) -> None:
+        try:
+            points = _cloud_to_xyz(msg)
+        except Exception as exc:
+            self.get_logger().warning(
+                f'Failed to decode segmented object cloud: '
+                f'{type(exc).__name__}: {exc}')
+            return
+        self._latest_object_points = points if len(points) else None
 
     # ── TSDF voxel publisher ──────────────────────────────────────────────────
 
@@ -275,6 +298,9 @@ class CuRoboService(Node):
         """Pick mode: plan_pick() → approach+grasp + lift."""
         candidates = _poses_to_candidates(request.grasp_poses)
         curobo.update_joint_state(joint_state)
+        # Carve the grasp target out of the TSDF collision world so the grasp
+        # insertion isn't blocked by the object's own fused voxels.
+        curobo.set_grasp_object_points(self._latest_object_points)
 
         result = curobo.plan_pick(candidates, joint_state)
         if result is None:

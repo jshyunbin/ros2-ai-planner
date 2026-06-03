@@ -78,6 +78,10 @@ class CuRobo:
         self._enable_viz = enable_viz
         self._point_clouds: dict = {}
         self._tsdf_centers = None
+        # Inflated AABB (min_xyz, max_xyz) of the current grasp target in
+        # base_link, or None. When set, _update_world_from_tsdf carves these
+        # voxels free so the object's own fused TSDF can't block the grasp.
+        self._grasp_object_aabb = None
 
         self._cam_depth: dict = {}
         self._cam_intrinsics: dict = {}
@@ -165,6 +169,23 @@ class CuRobo:
     def update_joint_state(self, msg):
         with self._lock:
             self._latest_joints = msg
+
+    def set_grasp_object_points(self, points) -> None:
+        """Set (or clear) the grasp target whose voxels to carve from the world.
+
+        ``points`` is an (N,3) array in base_link, or None/empty to clear.  The
+        target is stored as an inflated AABB and the collision-world cache is
+        invalidated so the next plan re-integrates the carved voxel grid.
+        """
+        aabb = None
+        if points is not None and len(points):
+            pts = np.asarray(points, dtype=np.float32).reshape(-1, 3)
+            margin = _grasp_object_carve_margin()
+            aabb = (pts.min(axis=0) - margin, pts.max(axis=0) + margin)
+        with self._lock:
+            self._grasp_object_aabb = aabb
+            # Force the next _update_world_from_tsdf to rebuild + re-carve.
+            self._last_world_update_frame = -1
 
     def pause_mapping(self, seconds: float) -> None:
         if seconds <= 0.0:
@@ -528,6 +549,7 @@ class CuRobo:
 
         torch.cuda.synchronize()
         voxel_grid = self._mapper.compute_esdf()
+        self._carve_grasp_object(voxel_grid)
         try:
             self._planner.clear_scene_cache()
         except Exception:
@@ -541,6 +563,60 @@ class CuRobo:
         self._logger.info(
             f'CuRobo: updated TSDF collision world from {frame_count} frames.')
         return True
+
+    def _carve_grasp_object(self, voxel_grid) -> None:
+        """Mark grasp-target voxels free so they don't block the grasp.
+
+        The live dual-RGBD TSDF fuses the target object itself; without this the
+        grasp insertion collides with the object's own voxels (yeina's static-
+        cuboid world avoided this by leaving object collision to GraspGen). We
+        set the ESDF feature of every voxel whose center falls inside the
+        inflated object AABB to the grid's free (minimum) value. No-op when no
+        target is set or the grid is empty.
+        """
+        with self._lock:
+            aabb = self._grasp_object_aabb
+        if aabb is None:
+            return
+        feature = getattr(voxel_grid, 'feature_tensor', None)
+        if feature is None or feature.numel() == 0:
+            return
+        try:
+            xyzr = voxel_grid.create_xyzr_tensor(transform_to_origin=True)
+        except Exception as exc:
+            self._logger.warning(
+                'CuRobo: grasp-object carve skipped (xyzr build failed): '
+                f'{type(exc).__name__}: {exc}')
+            return
+        # Clone: feature_tensor aliases the integrator's persistent ESDF field
+        # (recomputed each compute_esdf); carve a copy so we never mutate it.
+        feature_flat = feature.reshape(-1).clone()
+        # create_xyzr_tensor may place centers on CPU; match the feature device
+        # so the boolean index below stays on one device.
+        centers = xyzr[:, :3].to(feature_flat.device)
+        if centers.shape[0] != feature_flat.shape[0]:
+            self._logger.warning(
+                'CuRobo: grasp-object carve skipped (voxel/feature length '
+                f'mismatch {centers.shape[0]} vs {feature_flat.shape[0]}).')
+            return
+        lo = torch.as_tensor(aabb[0], device=centers.device, dtype=centers.dtype)
+        hi = torch.as_tensor(aabb[1], device=centers.device, dtype=centers.dtype)
+        inside = ((centers >= lo) & (centers <= hi)).all(dim=1)
+        carved = int(inside.sum().item())
+        if carved == 0:
+            self._logger.warning(
+                'CuRobo: grasp-object carve matched 0 voxels '
+                f'(aabb min={aabb[0].tolist()} max={aabb[1].tolist()}).')
+            return
+        # Free = a feature well below the occupancy threshold (-0.5*voxel_size);
+        # the ESDF is in metres, so -1.0 m (or the field min, whichever is more
+        # free) is unambiguously empty for the collision checker.
+        free_val = min(float(feature_flat.min().item()), -1.0)
+        feature_flat[inside] = free_val
+        voxel_grid.feature_tensor = feature_flat.reshape(feature.shape)
+        self._logger.info(
+            f'CuRobo: carved {carved} grasp-target voxels free from the '
+            'collision world.')
 
     def _clear_collision_world(self) -> None:
         try:
@@ -777,6 +853,11 @@ def _pick_approach_offsets() -> tuple:
         'PIPELINE_CUROBO_GRASP_APPROACH_OFFSETS', '-0.035,-0.06,-0.10')
     return _parse_nonzero_float_list(
         raw, 'PIPELINE_CUROBO_GRASP_APPROACH_OFFSETS')
+
+
+def _grasp_object_carve_margin() -> float:
+    """Metres to inflate the grasp-target AABB before carving it from the world."""
+    return max(_env_float('PIPELINE_CUROBO_GRASP_CARVE_MARGIN_M', 0.03), 0.0)
 
 
 def _pick_lift_offset() -> float:
