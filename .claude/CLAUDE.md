@@ -49,7 +49,7 @@ Nodes (each is a `console_scripts` entry point in `setup.py`):
 | `graspgen_client.py` | — | Minimal ZMQ client to the standalone GraspGen inference server. |
 | `segmentation_utils.py` | — | Pure helpers for segmentation (resize, depth back-projection, downsample, centroid, overlay). |
 | `live_viz_helpers.py` | — | Visualization helpers (point-cloud / TSDF). |
-| `debug_viz.py` | `debug_viz` | Hosts one viser server; subscribes to the segmented/background clouds, `/graspgen/grasp_poses`, and `/curobo/tsdf_voxels` and renders them (grasp frames colored by rank). Debug mode only. |
+| `debug_viz.py` | `debug_viz` | Hosts one viser server; subscribes to the segmented/background/overhead clouds, `/graspgen/grasp_poses`, and `/curobo/tsdf_voxels` and renders them (grasp frames colored by rank; TSDF as voxel-sized squares colored by height; a "Layers" GUI folder toggles each layer's visibility). Debug mode only. |
 | `graspgen_probe.py`, `graspgen_service_caller.py` | `graspgen_probe`, `graspgen_service_caller` | Standalone debugging utilities (not part of the runtime pipeline). |
 
 The orchestrator coordinates stages over **ROS2 services**, not in-process Python calls. Stages exchange point clouds over ROS2 topics; GraspGen talks to its heavy inference model over ZMQ in a separate process.
@@ -83,6 +83,7 @@ Internal:
 | `/curobo/plan_trajectory` | `riro_srvs/PlanTrajectory` | orchestrator → curobo_service |
 | `/graspgen/grasp_poses` | `geometry_msgs/PoseArray` | graspgen_service → debug_viz (debug only) |
 | `/curobo/tsdf_voxels` | `sensor_msgs/PointCloud2` | curobo_service → debug_viz (debug only) |
+| `/curobo/overhead_cloud` | `sensor_msgs/PointCloud2` | curobo_service → debug_viz (overhead depth back-projection, debug only) |
 
 ## Adding Dependencies
 

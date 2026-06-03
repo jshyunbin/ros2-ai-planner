@@ -49,6 +49,7 @@ class CuRoboService(Node):
         self.declare_parameter('service_name', '/curobo/plan_trajectory')
         self.declare_parameter('enable_viz', False)
         self.declare_parameter('tsdf_voxels_topic', '/curobo/tsdf_voxels')
+        self.declare_parameter('overhead_cloud_topic', '/curobo/overhead_cloud')
         self.declare_parameter('init_wait_sec', 120.0)
 
         self._latest_joints = None
@@ -76,13 +77,20 @@ class CuRoboService(Node):
         )
 
         self._tsdf_pub = None
+        self._overhead_pub = None
         if _as_bool(self.get_parameter('enable_viz').value):
             self._tsdf_pub = self.create_publisher(
                 PointCloud2,
                 str(self.get_parameter('tsdf_voxels_topic').value),
                 1,
             )
+            self._overhead_pub = self.create_publisher(
+                PointCloud2,
+                str(self.get_parameter('overhead_cloud_topic').value),
+                1,
+            )
             self.create_timer(1.0, self._publish_tsdf_voxels)
+            self.create_timer(1.0, self._publish_overhead_cloud)
 
         self._init_thread = threading.Thread(
             target=self._init_curobo,
@@ -149,6 +157,24 @@ class CuRoboService(Node):
             self.get_clock().now().to_msg(),
         )
         self._tsdf_pub.publish(cloud)
+
+    def _publish_overhead_cloud(self) -> None:
+        """Publish the overhead camera's back-projected cloud (debug viz)."""
+        if self._overhead_pub is None:
+            return
+        with self._init_cv:
+            curobo = self._curobo
+        if curobo is None:
+            return
+        points = curobo.get_point_clouds().get('overhead')
+        if points is None or len(points) == 0:
+            return
+        cloud = make_xyz_cloud(
+            points,
+            BASE_FRAME,
+            self.get_clock().now().to_msg(),
+        )
+        self._overhead_pub.publish(cloud)
 
     # ── init gating ───────────────────────────────────────────────────────────
 

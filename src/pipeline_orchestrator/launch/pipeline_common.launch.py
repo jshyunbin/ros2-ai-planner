@@ -31,6 +31,7 @@ def generate_launch_description() -> LaunchDescription:
     background_point_cloud_topic = "/graspgen/background"
     grasp_poses_topic = "/graspgen/grasp_poses"
     tsdf_voxels_topic = "/curobo/tsdf_voxels"
+    overhead_cloud_topic = "/curobo/overhead_cloud"
     segmentation_output_frame = "base_link"
 
     return LaunchDescription(
@@ -106,6 +107,7 @@ def generate_launch_description() -> LaunchDescription:
                         "service_name": curobo_service_name,
                         "enable_viz": enable_viz,
                         "tsdf_voxels_topic": tsdf_voxels_topic,
+                        "overhead_cloud_topic": overhead_cloud_topic,
                     }
                 ],
                 condition=IfCondition(enable_motion_execution),
@@ -136,6 +138,7 @@ def generate_launch_description() -> LaunchDescription:
                         "use_sim_time": use_sim_time,
                         "segmented_point_cloud_topic": segmented_point_cloud_topic,
                         "background_point_cloud_topic": background_point_cloud_topic,
+                        "overhead_cloud_topic": overhead_cloud_topic,
                         "grasp_poses_topic": grasp_poses_topic,
                         "tsdf_voxels_topic": tsdf_voxels_topic,
                     }
