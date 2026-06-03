@@ -177,3 +177,10 @@ def main(args=None) -> None:
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
+
+
+# Allows running without a colcon rebuild via `python3 -m
+# pipeline_orchestrator.pose_probe` (the entrypoint puts src on PYTHONPATH),
+# which is convenient for the live-sim tuning loop.
+if __name__ == "__main__":
+    main()
