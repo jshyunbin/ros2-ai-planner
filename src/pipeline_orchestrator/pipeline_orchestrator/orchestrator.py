@@ -323,8 +323,12 @@ class PipelineOrchestrator(Node):
 
         self.get_logger().info(result.message)
 
-        # 3-phase pick execution: approach+grasp → close gripper → lift.
+        # 4-phase pick execution: open gripper → approach+grasp → close → lift.
+        # Opening first is essential: the planned grasp pose assumes open
+        # fingers, so a gripper left closed from a prior cycle would collide
+        # with the object during the approach instead of enclosing it.
         try:
+            self._send_gripper(closed=False)
             self._send_and_wait(
                 self._arm_client, result.trajectory, 'approach_and_grasp')
             self._send_gripper(closed=True)
