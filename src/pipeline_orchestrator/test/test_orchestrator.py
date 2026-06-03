@@ -543,7 +543,9 @@ def test_curobo_service_plans_with_supplied_joint_state():
     node.get_logger = lambda: MagicMock()
     node._curobo = MagicMock()
     node._init_error = ""
-    node._init_lock = threading.Lock()
+    node._init_done = True
+    node._init_cv = threading.Condition()
+    node._init_wait_sec = 5.0
     node._latest_joints = None
     request = MagicMock()
     request.grasp_poses = []
@@ -561,20 +563,23 @@ def test_curobo_service_plans_with_supplied_joint_state():
     assert result.trajectory is trajectory
 
 
-def test_curobo_service_reports_initializing_before_planner_ready():
+def test_curobo_service_waits_then_reports_timeout_before_planner_ready():
     from pipeline_orchestrator.curobo_service import CuRoboService
 
     node = CuRoboService.__new__(CuRoboService)
+    node.get_logger = lambda: MagicMock()
     node._curobo = None
     node._init_error = ""
-    node._init_lock = threading.Lock()
+    node._init_done = False
+    node._init_cv = threading.Condition()
+    node._init_wait_sec = 0.1
     request = MagicMock()
     response = MagicMock()
 
     result = node._handle_plan(request, response)
 
     assert result.success is False
-    assert result.message == "CuRobo is still initializing."
+    assert "still initializing" in result.message
 
 
 def test_orchestrator_does_not_import_nvblox():
@@ -600,7 +605,7 @@ def test_curobo_service_publishes_tsdf_voxels_when_centers_present():
     svc = CuRoboService.__new__(CuRoboService)
     pub = MagicMock()
     svc._tsdf_pub = pub
-    svc._init_lock = threading.Lock()
+    svc._init_cv = threading.Condition()
     svc._curobo = MagicMock(
         get_tsdf_centers=MagicMock(return_value=np.zeros((4, 3), dtype=np.float32))
     )
@@ -624,7 +629,7 @@ def test_curobo_service_tsdf_publish_noop_without_centers():
     svc = CuRoboService.__new__(CuRoboService)
     pub = MagicMock()
     svc._tsdf_pub = pub
-    svc._init_lock = threading.Lock()
+    svc._init_cv = threading.Condition()
     svc._curobo = MagicMock(get_tsdf_centers=MagicMock(return_value=None))
     svc._publish_tsdf_voxels()
     pub.publish.assert_not_called()
@@ -639,7 +644,7 @@ def test_curobo_service_tsdf_publish_noop_with_empty_centers():
     svc = CuRoboService.__new__(CuRoboService)
     pub = MagicMock()
     svc._tsdf_pub = pub
-    svc._init_lock = threading.Lock()
+    svc._init_cv = threading.Condition()
     svc._curobo = MagicMock(
         get_tsdf_centers=MagicMock(return_value=np.zeros((0, 3), dtype=np.float32))
     )

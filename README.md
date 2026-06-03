@@ -52,6 +52,12 @@ docker compose -f docker-compose.yml -f docker-compose.debug.yml run --rm ai_pla
 Deploy mode uses the baked image and runs `deploy.launch.py` automatically.
 Debug mode live-mounts `./src` so Python node edits take effect on the next launch; changes to `setup.py`, entry points, or `*.launch.py` files still require a workspace rebuild inside the container (`colcon build --packages-select pipeline_orchestrator` from `/ros2_ws`), then relaunch.
 
+Kick off a pick by publishing a task command (the orchestrator runs the full pipeline on receipt). cuRobo's planner finishes initialising in the background, but a request that arrives before it is ready now blocks until init completes rather than failing, so you can fire this immediately after launch:
+
+```bash
+ros2 topic pub --once /task_commands std_msgs/String "{data: 'pick up the red block'}"
+```
+
 Container-side runtime environment expected by the planner:
 
 - `ROS_DOMAIN_ID=0`

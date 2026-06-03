@@ -49,11 +49,17 @@ class CuRoboService(Node):
         self.declare_parameter('service_name', '/curobo/plan_trajectory')
         self.declare_parameter('enable_viz', False)
         self.declare_parameter('tsdf_voxels_topic', '/curobo/tsdf_voxels')
+        self.declare_parameter('init_wait_sec', 120.0)
 
         self._latest_joints = None
         self._curobo: CuRobo | None = None
         self._init_error = ''
-        self._init_lock = threading.Lock()
+        self._init_done = False
+        # Condition guards _curobo/_init_error/_init_done and lets a plan
+        # request block until the background initialiser finishes, instead of
+        # failing if it arrives before the planner is ready.
+        self._init_cv = threading.Condition()
+        self._init_wait_sec = float(self.get_parameter('init_wait_sec').value)
 
         self.create_subscription(
             JointState,
@@ -89,21 +95,28 @@ class CuRoboService(Node):
 
     def _init_curobo(self) -> None:
         self.get_logger().info('CuRobo initialisation started.')
+        curobo: CuRobo | None = None
+        init_error = ''
         try:
             curobo = CuRobo(
                 self,
                 enable_viz=_as_bool(self.get_parameter('enable_viz').value),
             )
         except Exception as exc:
-            with self._init_lock:
-                self._init_error = f'{type(exc).__name__}: {exc}'
-            self.get_logger().error(
-                f'CuRobo initialisation failed: {self._init_error}')
+            init_error = f'{type(exc).__name__}: {exc}'
+            self.get_logger().error(f'CuRobo initialisation failed: {init_error}')
             self.get_logger().debug(traceback.format_exc())
-            return
-        with self._init_lock:
+
+        # Publish the outcome and wake any plan request blocked in _wait_for_init.
+        with self._init_cv:
             self._curobo = curobo
+            self._init_error = init_error
+            self._init_done = True
             latest_joints = self._latest_joints
+            self._init_cv.notify_all()
+
+        if curobo is None:
+            return
         if latest_joints is not None:
             curobo.update_joint_state(latest_joints)
         self.get_logger().info('CuRobo initialisation complete; service is ready.')
@@ -112,7 +125,7 @@ class CuRoboService(Node):
 
     def _cache_joints(self, msg: JointState) -> None:
         self._latest_joints = msg
-        with self._init_lock:
+        with self._init_cv:
             curobo = self._curobo
         if curobo is not None:
             curobo.update_joint_state(msg)
@@ -123,7 +136,7 @@ class CuRoboService(Node):
         """Publish occupied TSDF voxel centers as a PointCloud2 (debug viz)."""
         if self._tsdf_pub is None:
             return
-        with self._init_lock:
+        with self._init_cv:
             curobo = self._curobo
         if curobo is None:
             return
@@ -137,6 +150,27 @@ class CuRoboService(Node):
         )
         self._tsdf_pub.publish(cloud)
 
+    # ── init gating ───────────────────────────────────────────────────────────
+
+    def _wait_for_init(self, timeout_sec: float):
+        """Block until background CuRobo init finishes (or fails), or timeout.
+
+        Returns ``(curobo, init_error)``.  A plan request that arrives before
+        the planner is ready waits here instead of failing immediately, so the
+        orchestrator can fire as soon as the service is advertised.  Init runs
+        on its own thread and does not depend on the executor spinning, so
+        parking the (single-threaded) executor here is safe; planning itself
+        still runs on the executor thread once this returns.
+        """
+        with self._init_cv:
+            if not self._init_done:
+                self.get_logger().info(
+                    'Plan request received before CuRobo finished initialising; '
+                    f'waiting up to {timeout_sec:.1f}s.')
+                self._init_cv.wait_for(
+                    lambda: self._init_done, timeout=max(timeout_sec, 0.0))
+            return self._curobo, self._init_error
+
     # ── service handler ───────────────────────────────────────────────────────
 
     def _handle_plan(
@@ -144,16 +178,16 @@ class CuRoboService(Node):
         request: PlanTrajectory.Request,
         response: PlanTrajectory.Response,
     ) -> PlanTrajectory.Response:
-        with self._init_lock:
-            curobo = self._curobo
-            init_error = self._init_error
+        curobo, init_error = self._wait_for_init(self._init_wait_sec)
         if init_error:
             response.success = False
             response.message = f'CuRobo init failed: {init_error}'
             return response
         if curobo is None:
             response.success = False
-            response.message = 'CuRobo is still initializing.'
+            response.message = (
+                f'CuRobo still initializing after waiting '
+                f'{self._init_wait_sec:.1f}s.')
             return response
 
         joint_state = request.joint_state
