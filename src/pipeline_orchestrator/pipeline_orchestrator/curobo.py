@@ -408,7 +408,17 @@ class CuRobo:
             self.update_joint_state(joint_states)
             self._update_world_from_tsdf()
             current = self._ros_js_to_curobo(joint_states)
-            candidates = list(grasp_candidates)
+            # cuRobo's idiomatic pattern (getting_started/motion_planning.py and
+            # test_motion_planner_grasp_goalset.py): pass ALL candidates as one
+            # goal set in a SINGLE plan_grasp call and let the planner pick the
+            # best reachable grasp (goalset_index). The old per-candidate loop
+            # (one plan_grasp per candidate) is what corrupted the planner across
+            # calls — the first failed call poisoned every later goalset IK.
+            candidates = list(grasp_candidates)[:TOPK_GRASPS]
+            if not candidates:
+                self._logger.warn('CuRobo.plan_pick: no grasp candidates given.')
+                return None
+            goalset = self._grasps_to_goalset(candidates)
             collision_links = _pick_disable_collision_links(self._planner)
             last_status = 'unknown'
 
@@ -420,53 +430,51 @@ class CuRobo:
                         'TSDF may have blocked a grasp segment.')
                 lift_offset = _pick_lift_offset()
                 for approach_offset in _pick_approach_offsets():
-                    for candidate_index, candidate in enumerate(candidates):
-                        goalset = self._grasps_to_goalset([candidate])
-                        _reset_planner_seed(self._planner)
-                        result = self._planner.plan_grasp(
-                            grasp_poses=goalset,
-                            current_state=current,
-                            grasp_approach_offset=approach_offset,
-                            grasp_approach_in_tool_frame=True,
-                            grasp_lift_axis='z',
-                            grasp_lift_offset=lift_offset,
-                            grasp_lift_in_tool_frame=False,
-                            plan_approach_to_grasp=True,
-                            plan_grasp_to_lift=True,
-                            disable_collision_links=collision_links,
-                        )
-                        if _result_success(result):
-                            torch.cuda.synchronize()
-                            self._logger.info(
-                                'CuRobo.plan_pick succeeded: '
-                                f'world={world_mode} '
-                                f'candidate={candidate_index} '
-                                f'approach={approach_offset:.3f}m '
-                                f'lift={lift_offset:.3f}m'
-                            )
-                            return result
-                        last_status = getattr(result, 'status', 'unknown')
-                        torch.cuda.synchronize()
-                        self._logger.warn(
-                            'CuRobo.plan_pick failed: '
+                    _reset_planner_seed(self._planner)
+                    result = self._planner.plan_grasp(
+                        grasp_poses=goalset,
+                        current_state=current,
+                        grasp_approach_offset=approach_offset,
+                        grasp_approach_in_tool_frame=True,
+                        grasp_lift_axis='z',
+                        grasp_lift_offset=lift_offset,
+                        grasp_lift_in_tool_frame=False,
+                        plan_approach_to_grasp=True,
+                        plan_grasp_to_lift=True,
+                        disable_collision_links=collision_links,
+                    )
+                    torch.cuda.synchronize()
+                    if _result_success(result):
+                        self._logger.info(
+                            'CuRobo.plan_pick succeeded: '
                             f'world={world_mode} '
-                            f'candidate={candidate_index} '
+                            f'candidates={len(candidates)} '
+                            f'chosen_goalset_index={_goalset_index(result)} '
                             f'approach={approach_offset:.3f}m '
-                            f'lift={lift_offset:.3f}m '
-                            f'status={last_status}'
+                            f'lift={lift_offset:.3f}m'
                         )
-                        self._logger.warn(
-                            'CuRobo.plan_pick diagnostics: '
-                            + _pick_failure_diagnostics(
-                                result,
-                                [candidate],
-                                world_mode=world_mode,
-                                candidate_index=candidate_index,
-                                approach_offset=approach_offset,
-                                lift_offset=lift_offset,
-                                disabled_collision_links=collision_links,
-                            )
+                        return result
+                    last_status = getattr(result, 'status', 'unknown')
+                    self._logger.warn(
+                        'CuRobo.plan_pick failed: '
+                        f'world={world_mode} '
+                        f'candidates={len(candidates)} '
+                        f'approach={approach_offset:.3f}m '
+                        f'lift={lift_offset:.3f}m '
+                        f'status={last_status}'
+                    )
+                    self._logger.warn(
+                        'CuRobo.plan_pick diagnostics: '
+                        + _pick_failure_diagnostics(
+                            result,
+                            candidates,
+                            world_mode=world_mode,
+                            candidate_index=_goalset_index(result),
+                            approach_offset=approach_offset,
+                            lift_offset=lift_offset,
+                            disabled_collision_links=collision_links,
                         )
+                    )
 
             self._logger.warn(
                 f'CuRobo.plan_pick: all attempts exhausted ({last_status})')
@@ -1072,3 +1080,16 @@ def _reset_planner_seed(planner) -> None:
         planner.reset_seed()
     except Exception:
         pass
+    # plan_grasp leaves solver batch/warm-start state that reset_seed() does not
+    # clear; a subsequent plan_grasp then returns "Goalset planning returned
+    # None" because IK finds no seeds. reset_shape() drops those cached batch
+    # tensors so the next solve re-allocates clean ones. Best-effort: it's a
+    # private solver method and a no-op (re-setup on next solve) when present.
+    for solver_attr in ('ik_solver', 'trajopt_solver'):
+        solver = getattr(planner, solver_attr, None)
+        reset_shape = getattr(solver, 'reset_shape', None)
+        if reset_shape is not None:
+            try:
+                reset_shape()
+            except Exception:
+                pass
