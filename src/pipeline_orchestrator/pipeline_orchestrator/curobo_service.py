@@ -16,8 +16,9 @@ CuRobo warmup runs in a background thread so the service is immediately
 advertised while the planner initialises.
 """
 
-import traceback
 import threading
+import time
+import traceback
 
 import numpy as np
 import rclpy
@@ -29,13 +30,18 @@ from pipeline_orchestrator.curobo import (
     BASE_FRAME,
     CuRobo,
     concat_trajectories,
-    interp_traj_to_ros,
 )
 from sensor_msgs.msg import PointCloud2
 from pipeline_orchestrator.pipeline_utils import as_bool as _as_bool
 from pipeline_orchestrator.pipeline_utils import env_float as _env_float
 from pipeline_orchestrator.pipeline_utils import make_xyz_cloud
 from riro_srvs.srv import PlanTrajectory
+
+
+# Debug-viz clouds are published from a dedicated thread (see _viz_publish_loop)
+# rather than ROS timers, so a long blocking plan_trajectory call on the
+# single-threaded executor can't starve them. Republishing cached numpy is cheap.
+_VIZ_PUBLISH_HZ = 5.0
 
 
 class CuRoboService(Node):
@@ -49,9 +55,15 @@ class CuRoboService(Node):
         self.declare_parameter('service_name', '/curobo/plan_trajectory')
         self.declare_parameter('enable_viz', False)
         self.declare_parameter('tsdf_voxels_topic', '/curobo/tsdf_voxels')
+        self.declare_parameter('overhead_cloud_topic', '/curobo/overhead_cloud')
         self.declare_parameter('init_wait_sec', 120.0)
 
         self._latest_joints = None
+        # Set while a plan is in flight so the debug viz thread pauses its
+        # cloud publishing. rclpy PointCloud2 serialization is pure-Python and
+        # GIL-heavy; with a populated map it otherwise starves the (single-
+        # threaded) planner of the GIL and stretches a ~3s plan into minutes.
+        self._planning = threading.Event()
         self._curobo: CuRobo | None = None
         self._init_error = ''
         self._init_done = False
@@ -76,13 +88,27 @@ class CuRoboService(Node):
         )
 
         self._tsdf_pub = None
+        self._overhead_pub = None
         if _as_bool(self.get_parameter('enable_viz').value):
             self._tsdf_pub = self.create_publisher(
                 PointCloud2,
                 str(self.get_parameter('tsdf_voxels_topic').value),
                 1,
             )
-            self.create_timer(1.0, self._publish_tsdf_voxels)
+            self._overhead_pub = self.create_publisher(
+                PointCloud2,
+                str(self.get_parameter('overhead_cloud_topic').value),
+                1,
+            )
+            # Publish from a dedicated thread, NOT executor timers: planning
+            # runs on (and blocks) the single-threaded executor, which would
+            # otherwise starve the timers and make the clouds update in bursts
+            # only after each plan returns. The loop just reads cached CPU numpy
+            # (no CUDA), so it's safe to run alongside the executor.
+            self._viz_stop = threading.Event()
+            self._viz_thread = threading.Thread(
+                target=self._viz_publish_loop, daemon=True)
+            self._viz_thread.start()
 
         self._init_thread = threading.Thread(
             target=self._init_curobo,
@@ -132,6 +158,31 @@ class CuRoboService(Node):
 
     # ── TSDF voxel publisher ──────────────────────────────────────────────────
 
+    def _viz_publish_loop(self) -> None:
+        """Publish debug clouds at _VIZ_PUBLISH_HZ off the ROS executor.
+
+        Mirrors the live-viz test script: a free-running thread refreshes the
+        viz at a steady cadence regardless of what the executor (planning) is
+        doing, so the clouds no longer freeze during a plan and then arrive in a
+        burst when it finishes.
+        """
+        period = 1.0 / _VIZ_PUBLISH_HZ
+        while rclpy.ok() and not self._viz_stop.is_set():
+            start = time.monotonic()
+            if self._planning.is_set():
+                # Don't serialize clouds while a plan is running: the GIL must
+                # stay with the planner thread (see self._planning).
+                self._viz_stop.wait(period)
+                continue
+            try:
+                self._publish_tsdf_voxels()
+                self._publish_overhead_cloud()
+            except Exception as exc:
+                self.get_logger().warning(
+                    f'viz publish failed: {type(exc).__name__}: {exc}',
+                    throttle_duration_sec=5.0)
+            self._viz_stop.wait(max(0.0, period - (time.monotonic() - start)))
+
     def _publish_tsdf_voxels(self) -> None:
         """Publish occupied TSDF voxel centers as a PointCloud2 (debug viz)."""
         if self._tsdf_pub is None:
@@ -149,6 +200,24 @@ class CuRoboService(Node):
             self.get_clock().now().to_msg(),
         )
         self._tsdf_pub.publish(cloud)
+
+    def _publish_overhead_cloud(self) -> None:
+        """Publish the overhead camera's back-projected cloud (debug viz)."""
+        if self._overhead_pub is None:
+            return
+        with self._init_cv:
+            curobo = self._curobo
+        if curobo is None:
+            return
+        points = curobo.get_point_clouds().get('overhead')
+        if points is None or len(points) == 0:
+            return
+        cloud = make_xyz_cloud(
+            points,
+            BASE_FRAME,
+            self.get_clock().now().to_msg(),
+        )
+        self._overhead_pub.publish(cloud)
 
     # ── init gating ───────────────────────────────────────────────────────────
 
@@ -199,6 +268,7 @@ class CuRoboService(Node):
                 'No joint state supplied and no /joint_states received yet.')
             return response
 
+        self._planning.set()
         try:
             if request.grasp_poses:
                 return self._handle_pick(curobo, request, joint_state, response)
@@ -210,32 +280,23 @@ class CuRoboService(Node):
             self.get_logger().error(response.message)
             self.get_logger().debug(traceback.format_exc())
             return response
+        finally:
+            self._planning.clear()
 
     def _handle_pick(self, curobo, request, joint_state, response):
         """Pick mode: plan_pick() → approach+grasp + lift."""
         candidates = _poses_to_candidates(request.grasp_poses)
         curobo.update_joint_state(joint_state)
 
-        result = curobo.plan_pick(candidates, joint_state)
-        if result is None:
+        plan = curobo.plan_pick(candidates, joint_state)
+        if plan is None:
             response.success = False
             response.message = 'CuRobo.plan_pick failed for all candidates.'
             return response
 
-        approach_jt = interp_traj_to_ros(
-            result.approach_interpolated_trajectory,
-            last_tstep=getattr(result, 'approach_interpolated_last_tstep', None),
-        )
-        grasp_jt, n_preclose = _append_preclose_insertion_to_trajectory(
-            interp_traj_to_ros(
-                result.grasp_interpolated_trajectory,
-                last_tstep=getattr(result, 'grasp_interpolated_last_tstep', None),
-            )
-        )
-        lift_jt = interp_traj_to_ros(
-            result.lift_interpolated_trajectory,
-            last_tstep=getattr(result, 'lift_interpolated_last_tstep', None),
-        )
+        approach_jt = plan.approach
+        grasp_jt, n_preclose = _append_preclose_insertion_to_trajectory(plan.grasp)
+        lift_jt = plan.lift
 
         response.trajectory = concat_trajectories(approach_jt, grasp_jt)
         response.lift_trajectory = lift_jt

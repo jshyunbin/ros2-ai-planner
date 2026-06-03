@@ -63,6 +63,22 @@ INTERP_DT = 0.02
 GRIPPER_TCP_Z_OFFSET = 0.1034
 
 
+class PickPlan:
+    """Three deployable ROS trajectories for a pick: approach (to the
+    pre-grasp pose, planned against the TSDF), grasp (the collision-off descent
+    onto the object), and lift (the collision-off retreat after the gripper
+    closes). ``goalset_index`` is the chosen grasp candidate.
+    """
+
+    __slots__ = ('approach', 'grasp', 'lift', 'goalset_index')
+
+    def __init__(self, approach, grasp, lift, goalset_index):
+        self.approach = approach
+        self.grasp = grasp
+        self.lift = lift
+        self.goalset_index = goalset_index
+
+
 class CuRobo:
     """Dual-RGBD TSDF fusion plus Yeina-style UR5 trajectory planning."""
 
@@ -88,10 +104,18 @@ class CuRobo:
         self._tf_listener = TransformListener(self._tf_buffer, node)
         self._bridge = CvBridge()
 
+        # Map is centered on base_link in xy, but offset up in z so it spans
+        # base_link z in [-0.1, 0.75]: the table surface sits at z~=0, so the
+        # -0.1 floor keeps the tabletop plane as an obstacle while dropping the
+        # ~0.65m of empty grid that used to extend below the table (centered
+        # extent would put the floor at -0.75). Cuts wasted voxels from both the
+        # collision world and the debug viz.
         self._mapper = Mapper(MapperCfg(
-            extent_meters_xyz=(2.0, 2.0, 1.5),
-            voxel_size=0.02,
-            esdf_voxel_size=0.05,
+            extent_meters_xyz=(2.0, 2.0, 0.85),
+            grid_center=torch.tensor(
+                [0.0, 0.0, 0.325], dtype=torch.float32, device='cuda'),
+            voxel_size=0.015,
+            esdf_voxel_size=0.015,
             truncation_distance=0.1,
             depth_minimum_distance=0.15,
             depth_maximum_distance=2.0,
@@ -328,6 +352,9 @@ class CuRobo:
                     torch.cuda.synchronize()
                     with self._lock:
                         self._frame_count += 1
+                        frame_count = self._frame_count
+                    if self._enable_viz and frame_count % 10 == 0:
+                        self._cache_viz_tsdf()
         except Exception as exc:
             self._logger.error(
                 f'CuRobo: depth integration failed for {cam_id}: '
@@ -373,75 +400,128 @@ class CuRobo:
 
     def _plan_pick_locked(self, grasp_candidates, joint_states):
         try:
+            t0 = time.perf_counter()
             self.update_joint_state(joint_states)
             self._update_world_from_tsdf()
+            t_world = time.perf_counter()
             current = self._ros_js_to_curobo(joint_states)
-            candidates = list(grasp_candidates)
+            candidates = list(grasp_candidates)[:TOPK_GRASPS]
+            if not candidates:
+                self._logger.warn('CuRobo.plan_pick: no grasp candidates given.')
+                return None
+
+            # Stage 1 — plan to the PRE-GRASP goal set against the live TSDF.
+            # This is exactly the phase plan_grasp solves reliably (plan_pose on
+            # a goalset, picking goalset_index), but we stop here: we never call
+            # plan_grasp's linear grasp phase, which fails in free space AND
+            # leaves the planner's tool-pose criteria stuck on linear_motion —
+            # the P1 corruption that poisoned every later goalset solve.
+            standoff = _pick_pregrasp_standoff()
+            pregrasp = self._grasps_to_goalset(candidates, tool_z_offset=-standoff)
             collision_links = _pick_disable_collision_links(self._planner)
-            last_status = 'unknown'
+            _reset_planner_seed(self._planner)
+            self._planner.disable_link_collision(collision_links)
+            try:
+                approach = self._planner.plan_pose(pregrasp, current)
+            finally:
+                self._planner.enable_link_collision(collision_links)
+            torch.cuda.synchronize()
+            if not _result_success(approach):
+                status = getattr(approach, 'status', 'unknown')
+                self._logger.warn(
+                    'CuRobo.plan_pick: pre-grasp goalset planning failed '
+                    f'(candidates={len(candidates)} standoff={standoff:.3f}m '
+                    f'status={status}).')
+                return None
 
-            for world_mode in self._pick_world_modes():
-                if world_mode == 'relaxed':
-                    self._clear_collision_world()
-                    self._logger.warn(
-                        'CuRobo.plan_pick retrying with relaxed collision world; '
-                        'TSDF may have blocked a grasp segment.')
-                lift_offset = _pick_lift_offset()
-                for approach_offset in _pick_approach_offsets():
-                    for candidate_index, candidate in enumerate(candidates):
-                        goalset = self._grasps_to_goalset([candidate])
-                        _reset_planner_seed(self._planner)
-                        result = self._planner.plan_grasp(
-                            grasp_poses=goalset,
-                            current_state=current,
-                            grasp_approach_offset=approach_offset,
-                            grasp_approach_in_tool_frame=True,
-                            grasp_lift_axis='z',
-                            grasp_lift_offset=lift_offset,
-                            grasp_lift_in_tool_frame=False,
-                            plan_approach_to_grasp=True,
-                            plan_grasp_to_lift=True,
-                            disable_collision_links=collision_links,
-                        )
-                        if _result_success(result):
-                            torch.cuda.synchronize()
-                            self._logger.info(
-                                'CuRobo.plan_pick succeeded: '
-                                f'world={world_mode} '
-                                f'candidate={candidate_index} '
-                                f'approach={approach_offset:.3f}m '
-                                f'lift={lift_offset:.3f}m'
-                            )
-                            return result
-                        last_status = getattr(result, 'status', 'unknown')
-                        torch.cuda.synchronize()
-                        self._logger.warn(
-                            'CuRobo.plan_pick failed: '
-                            f'world={world_mode} '
-                            f'candidate={candidate_index} '
-                            f'approach={approach_offset:.3f}m '
-                            f'lift={lift_offset:.3f}m '
-                            f'status={last_status}'
-                        )
-                        self._logger.warn(
-                            'CuRobo.plan_pick diagnostics: '
-                            + _pick_failure_diagnostics(
-                                result,
-                                [candidate],
-                                world_mode=world_mode,
-                                candidate_index=candidate_index,
-                                approach_offset=approach_offset,
-                                lift_offset=lift_offset,
-                                disabled_collision_links=collision_links,
-                            )
-                        )
+            t_pre = time.perf_counter()
+            idx = _goalset_index(approach)
+            if idx is None:
+                idx = 0
+            chosen = candidates[idx]
+            approach_jt = interp_traj_to_ros(
+                approach.get_interpolated_plan(),
+                last_tstep=getattr(approach, 'interpolated_last_tstep', None),
+            )
 
-            self._logger.warn(
-                f'CuRobo.plan_pick: all attempts exhausted ({last_status})')
-            return None
+            # Stage 2 — descent (pre-grasp -> grasp) and Stage 3 — lift, planned
+            # against a CLEARED world. The gripper is committing to / holding the
+            # object, so its own fused voxels (which can't be removed from a
+            # single TSDF voxel grid) must not block these intentional-contact
+            # motions.
+            grasp_tool = _tool_pose_from_grasp_tcp(_candidate_pose_4x4(chosen))
+            lift_offset = _pick_lift_offset()
+            lift_tool = grasp_tool.copy()
+            lift_tool[:3, 3] += np.array([0.0, 0.0, lift_offset], dtype=np.float32)
+
+            self._clear_collision_world()
+            t_clear = time.perf_counter()
+            grasp_jt = self._plan_pose_segment(
+                grasp_tool, self._final_joint_state(approach_jt), 'grasp descent')
+            if grasp_jt is None:
+                return None
+            t_grasp = time.perf_counter()
+            lift_jt = self._plan_pose_segment(
+                lift_tool, self._final_joint_state(grasp_jt), 'lift')
+            if lift_jt is None:
+                return None
+            t_lift = time.perf_counter()
+
+            self._logger.info(
+                'CuRobo.plan_pick succeeded: '
+                f'candidates={len(candidates)} chosen_goalset_index={idx} '
+                f'standoff={standoff:.3f}m lift={lift_offset:.3f}m '
+                f'(approach={len(approach_jt.points)}pts '
+                f'grasp={len(grasp_jt.points)}pts lift={len(lift_jt.points)}pts) '
+                f'timing[s]: world={t_world - t0:.2f} pregrasp={t_pre - t_world:.2f} '
+                f'clear={t_clear - t_pre:.2f} descent={t_grasp - t_clear:.2f} '
+                f'lift={t_lift - t_grasp:.2f} total={t_lift - t0:.2f}')
+            return PickPlan(
+                approach=approach_jt, grasp=grasp_jt, lift=lift_jt,
+                goalset_index=idx)
         except Exception as exc:
             self._logger.error(f'CuRobo.plan_pick error: {exc}')
             return None
+
+    def _plan_pose_segment(self, goal_mat, current_state, name):
+        """Collision-off ``plan_pose`` to a single tool0 pose (4x4 in base_link).
+
+        The caller is responsible for clearing the collision world first; this
+        only resets the seed and plans. Returns a ROS ``JointTrajectory`` or
+        ``None`` on failure.
+        """
+        _reset_planner_seed(self._planner)
+        result = self._planner.plan_pose(
+            self._tool_goal_from_matrix(goal_mat), current_state)
+        torch.cuda.synchronize()
+        if not _result_success(result):
+            status = getattr(result, 'status', 'unknown')
+            self._logger.warn(
+                f'CuRobo.plan_pick: {name} planning failed (status={status}).')
+            return None
+        return interp_traj_to_ros(
+            result.get_interpolated_plan(),
+            last_tstep=getattr(result, 'interpolated_last_tstep', None),
+        )
+
+    def _tool_goal_from_matrix(self, mat) -> GoalToolPose:
+        """Single-goal GoalToolPose from a 4x4 tool0 pose in base_link."""
+        mat = np.asarray(mat, dtype=np.float32)
+        quat_xyzw = R.from_matrix(mat[:3, :3]).as_quat()
+        quat_wxyz = [quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]]
+        return GoalToolPose(
+            tool_frames=self._planner.tool_frames,
+            position=torch.tensor(
+                mat[:3, 3], device='cuda', dtype=torch.float32).view(1, 1, 1, 1, 3),
+            quaternion=torch.tensor(
+                quat_wxyz, device='cuda', dtype=torch.float32).view(1, 1, 1, 1, 4),
+        )
+
+    def _final_joint_state(self, jt) -> CuRoboJointState:
+        """CuRoboJointState from the last point of a ROS JointTrajectory."""
+        pos = torch.tensor(
+            [list(jt.points[-1].positions)], device='cuda', dtype=torch.float32)
+        return CuRoboJointState.from_position(pos, joint_names=list(JOINT_NAMES))
 
     def plan_trajectory(self, goal_pose, joint_states):
         """Plan a single tool0 trajectory for place/home style targets."""
@@ -563,11 +643,18 @@ class CuRobo:
         return CuRoboJointState.from_position(
             pos, joint_names=list(JOINT_NAMES))
 
-    def _grasps_to_goalset(self, grasp_candidates) -> GoalToolPose:
+    def _grasps_to_goalset(
+        self, grasp_candidates, tool_z_offset: float = 0.0
+    ) -> GoalToolPose:
         mats = np.stack([_candidate_pose_4x4(g) for g in grasp_candidates])
         t_tool_grasp = np.eye(4, dtype=np.float32)
         t_tool_grasp[2, 3] = _effective_gripper_tcp_z_offset()
         tool = np.stack([m @ np.linalg.inv(t_tool_grasp) for m in mats])
+        # Back the goal off along each tool's own +z (toward the object) by
+        # ``tool_z_offset`` — negative values yield the pre-grasp stand-off.
+        if abs(tool_z_offset) > 1e-9:
+            t_off = _translation_matrix(0.0, 0.0, tool_z_offset)
+            tool = np.stack([t @ t_off for t in tool])
         pos = tool[:, :3, 3]
         quat_xyzw = R.from_matrix(tool[:, :3, :3]).as_quat()
         quat_wxyz = np.concatenate(
@@ -606,8 +693,8 @@ class CuRobo:
         collision_cache = {
             'voxel': {
                 'layers': 1,
-                'dims': [7.0, 7.0, 7.0],
-                'voxel_size': 0.05,
+                'dims': [3.0, 3.0, 3.0],
+                'voxel_size': 0.015,
             }
         }
         config = MotionPlannerCfg.create(
@@ -749,16 +836,28 @@ def _candidate_pose_4x4(candidate) -> np.ndarray:
 
 
 def _effective_gripper_tcp_z_offset() -> float:
-    close_extra = _env_float('PIPELINE_CUROBO_GRASP_CLOSE_EXTRA_M', 0.1025)
+    close_extra = _env_float('PIPELINE_CUROBO_GRASP_CLOSE_EXTRA_M', 0.110)
     if close_extra < 0.0:
         raise ValueError('PIPELINE_CUROBO_GRASP_CLOSE_EXTRA_M must be non-negative')
     offset = GRIPPER_TCP_Z_OFFSET - close_extra
-    if offset <= 0.0:
+    # A small negative offset is allowed: tool0 then sits just past the GraspGen
+    # grasp point (driven deeper onto the object). Floor it to catch gross
+    # misconfig that would ram the wrist well past the target.
+    if offset < -0.05:
         raise ValueError(
-            'PIPELINE_CUROBO_GRASP_CLOSE_EXTRA_M must be smaller than '
-            'GRIPPER_TCP_Z_OFFSET'
+            'PIPELINE_CUROBO_GRASP_CLOSE_EXTRA_M too large: tool0 would be '
+            'driven more than 5cm past the grasp point'
         )
     return offset
+
+
+def _pick_pregrasp_standoff() -> float:
+    """Metres to back the pre-grasp goal off the grasp pose along tool +z."""
+    value = _env_float('PIPELINE_CUROBO_GRASP_PREGRASP_STANDOFF_M', 0.05)
+    if value <= 0.0:
+        raise ValueError(
+            'PIPELINE_CUROBO_GRASP_PREGRASP_STANDOFF_M must be positive')
+    return value
 
 
 def _pick_approach_offsets() -> tuple:
@@ -976,6 +1075,11 @@ def _min_tsdf_frames() -> int:
 
 
 def _reset_planner_seed(planner) -> None:
+    # Only the cheap RNG-seed reset. We deliberately do NOT call reset_shape():
+    # it dropped the solver's cached batch tensors, forcing a full (~200s)
+    # re-setup on the next solve. It existed only to clear the warm-start state
+    # plan_grasp corrupted (P1); since the pick path no longer calls plan_grasp,
+    # there is nothing to clear and the re-setup is pure overhead.
     try:
         planner.reset_seed()
     except Exception:

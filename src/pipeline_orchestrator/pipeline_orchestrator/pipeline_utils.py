@@ -74,6 +74,23 @@ def make_xyz_cloud(points: np.ndarray, frame_id: str, stamp=None) -> PointCloud2
     return msg
 
 
+def cloud_to_xyz(msg: PointCloud2) -> np.ndarray:
+    """Decode a ``sensor_msgs/PointCloud2`` into an (N, 3) float32 array.
+
+    Assumes X, Y, Z are the first three float32 fields (byte offsets 0/4/8);
+    any trailing fields in ``point_step`` are ignored. Every producer in this
+    package (``make_xyz_cloud``, the segmentation clouds, the TSDF voxels)
+    satisfies that layout.
+    """
+    if msg.width * msg.height == 0:
+        return np.empty((0, 3), dtype=np.float32)
+    raw = np.frombuffer(bytes(msg.data), dtype=np.uint8)
+    raw = raw.reshape(msg.height * msg.width, msg.point_step)
+    # .copy(): the column slice is non-contiguous; make it contiguous before .view().
+    xyz = raw[:, 0:12].copy().view(np.float32).reshape(-1, 3)
+    return np.nan_to_num(xyz, nan=0.0)
+
+
 def quat_from_rotation_matrix(rotation) -> tuple[float, float, float, float]:
     """Convert a 3x3 rotation matrix to a (w, x, y, z) quaternion."""
     r00, r01, r02 = [float(v) for v in rotation[0]]
