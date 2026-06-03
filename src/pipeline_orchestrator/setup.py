@@ -27,6 +27,7 @@ setup(
     entry_points={
         'console_scripts': [
             'orchestrator = pipeline_orchestrator.orchestrator:main',
+            'pose_probe = pipeline_orchestrator.pose_probe:main',
             'curobo_service = pipeline_orchestrator.curobo_service:main',
             'debug_viz = pipeline_orchestrator.debug_viz:main',
             'graspgen_probe = pipeline_orchestrator.graspgen_probe:main',
