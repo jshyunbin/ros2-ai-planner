@@ -44,6 +44,7 @@ class PoseProbe(Node):
         self.declare_parameter("base_frame", "base_link")
         self.declare_parameter("tool_frame", "tool0")
         self.declare_parameter("service_timeout_sec", 120.0)
+        self.declare_parameter("execute_timeout_sec", 60.0)
 
         self._poses_file = str(self.get_parameter("poses_file").value)
         self._target = str(self.get_parameter("target").value)
@@ -51,6 +52,10 @@ class PoseProbe(Node):
         self._service_name = str(self.get_parameter("service_name").value)
         self._service_timeout = float(
             self.get_parameter("service_timeout_sec").value)
+        self._execute_timeout = float(
+            self.get_parameter("execute_timeout_sec").value)
+        self._base_frame = str(self.get_parameter("base_frame").value)
+        self._tool_frame = str(self.get_parameter("tool_frame").value)
 
         self._latest_joints = None
         self.create_subscription(
@@ -129,21 +134,25 @@ class PoseProbe(Node):
         goal.trajectory = trajectory
         send_future = self._arm.send_goal_async(goal)
         rclpy.spin_until_future_complete(self, send_future, timeout_sec=10.0)
+        if not send_future.done() or send_future.result() is None:
+            self.get_logger().error("Arm goal-send timed out.")
+            return False
         handle = send_future.result()
-        if handle is None or not handle.accepted:
+        if not handle.accepted:
             self.get_logger().error("Arm goal rejected by action server.")
             return False
         result_future = handle.get_result_async()
-        rclpy.spin_until_future_complete(self, result_future, timeout_sec=60.0)
-        if result_future.result() is None:
+        rclpy.spin_until_future_complete(
+            self, result_future, timeout_sec=self._execute_timeout)
+        if not result_future.done() or result_future.result() is None:
             self.get_logger().error("Arm action returned no result.")
             return False
         self.get_logger().info("Trajectory executed.")
         return True
 
     def _report_tool_pose(self) -> None:
-        base = str(self.get_parameter("base_frame").value)
-        tool = str(self.get_parameter("tool_frame").value)
+        base = self._base_frame
+        tool = self._tool_frame
         for _ in range(10):              # let TF accumulate a couple of frames
             rclpy.spin_once(self, timeout_sec=0.1)
         try:
