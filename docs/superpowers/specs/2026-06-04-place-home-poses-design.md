@@ -57,6 +57,30 @@ contract; `BASE_FRAME = 'base_link'`, planner targets `tool0`).
 - **Horizontal-into-shelf** orientation (bookshelf): `tool0` +z = world +x
   (gripper points into the shelf). Exact quaternion determined during validation.
 
+## Planning constraint while carrying an object
+
+cuRobo cannot account for the held object during planning: we don't have its
+ground-truth mesh, and cuRobo does not support attaching an arbitrary object
+to a single TSDF voxel map. Collision-aware planning therefore protects only the
+**arm** against the mapped scene — the **carried object is invisible to
+collision** and can swing into baskets, the shelf, or other objects even when the
+planner reports success.
+
+Consequence: motion to a place destination while carrying an object must be
+**rule-based, not collision-aware for the object**. The rule is a **safe transit
+height** (`transit_z`): lift the object straight up to `transit_z`, traverse
+laterally to above the destination at that height (where the dangling object
+clears everything mapped), and only then descend / insert. The descent and the
+bookshelf +x push are collision-off straight-line moves (same mechanism the pick
+path uses), since by then we are deliberately approaching a surface.
+
+This shapes *which* poses we record (we need a `transit_z` and the place targets
+must be reachable via a high approach). It does not change pose *finding*:
+`pose_probe.py` validates each target with an **empty gripper**, so ordinary
+collision-aware `plan_trajectory` is fine for confirming reachability. The
+rule-based transit routing is exercised at orchestrator-integration time (later
+spec).
+
 ## Artifact
 
 New config file: `src/pipeline_orchestrator/config/place_poses.yml`
@@ -65,6 +89,8 @@ A named-pose config holding cartesian `tool0`-in-`base_link` poses plus scalar
 insertion params. Schema:
 
 ```yaml
+transit_z: 0.80                                                 # safe height for carrying an object laterally
+
 home:      {xyz: [0.55, 0.07, 0.90], quat_xyzw: [1, 0, 0, 0]}   # wrist-cam over basket
 storage_1: {xyz: [0.0,  0.55, 0.85], quat_xyzw: [1, 0, 0, 0]}   # left basket, drop above
 storage_2: {xyz: [0.0, -0.55, 0.85], quat_xyzw: [1, 0, 0, 0]}   # right basket, drop above
@@ -96,10 +122,15 @@ Notes on the starting guesses:
 
 ## Bookshelf insertion sequence (mirrors the pick path)
 
-The bookshelf place mirrors pick's approach → grasp → lift:
+The bookshelf place mirrors pick's approach → grasp → lift, but the motion to
+reach `pre_insert` is **rule-based** (the held object is invisible to collision —
+see "Planning constraint while carrying an object"):
 
-1. **pre_insert** — planned, collision-aware motion to the `pre_insert` pose in
-   front of the shelf opening (cuRobo `plan_trajectory`, single-pose mode).
+1. **transit + pre_insert** — lift to `transit_z`, traverse to above the shelf
+   opening, then descend to the `pre_insert` pose in front of the opening. The
+   arm legs are planned against the mapped scene, but the route is constrained to
+   keep the carried object high until it is clear of other objects; cuRobo
+   `plan_trajectory` (single-pose mode) is used per leg.
 2. **insert** — straight **+x push** of `insert_depth_m`, collision-off linear
    move (the same mechanism the pick path uses for the collision-off descent),
    so the gripper enters the shelf without the planner refusing on shelf contact.
@@ -147,8 +178,10 @@ locked.
 
 ## Success criteria
 
-- `place_poses.yml` exists with validated, safe values for `home`, `storage_1`,
-  `storage_2`, `bookshelf_floor1`, `bookshelf_floor2`.
+- `place_poses.yml` exists with validated, safe values for `transit_z`, `home`,
+  `storage_1`, `storage_2`, `bookshelf_floor1`, `bookshelf_floor2`.
+- `transit_z` is high enough that an object held by the gripper clears the
+  baskets, shelf, and other mapped objects when traversing laterally.
 - Each storage/home pose is reachable: cuRobo plans and the arm executes to it in
   the live sim without collision, and (home) the wrist camera frames the
   workspace basket.
