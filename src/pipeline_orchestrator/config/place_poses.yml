@@ -16,8 +16,8 @@
 transit_z: 0.80          # safe height for carrying an object laterally
 
 home:      {xyz: [0.55, 0.07, 0.90], quat_xyzw: [1.0, 0.0, 0.0, 0.0]}
-storage_1: {xyz: [0.0,  0.55, 0.85], quat_xyzw: [1.0, 0.0, 0.0, 0.0]}
-storage_2: {xyz: [0.0, -0.55, 0.85], quat_xyzw: [1.0, 0.0, 0.0, 0.0]}
+storage_1: {xyz: [0.0,  0.55, 0.62], quat_xyzw: [1.0, 0.0, 0.0, 0.0]}
+storage_2: {xyz: [0.0, -0.55, 0.62], quat_xyzw: [1.0, 0.0, 0.0, 0.0]}
 
 bookshelf_floor1:
   pre_insert:      {xyz: [0.60, -0.30, 0.55], quat_xyzw: [0.5, 0.5, 0.5, 0.5]}
