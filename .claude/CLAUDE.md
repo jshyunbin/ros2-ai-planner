@@ -26,7 +26,7 @@ docker compose -f docker-compose.yml -f docker-compose.debug.yml up
 docker compose -f docker-compose.yml -f docker-compose.debug.yml run --rm ai_planner bash
 ```
 
-> In debug mode `./src` is live-mounted, so Python edits to node code take effect on the next launch. Changes to `setup.py`, entry points, or `*.launch.py` files still require a workspace rebuild inside the container: `colcon build --packages-select pipeline_orchestrator` (from `/ros2_ws`), then relaunch.
+> In debug mode `./src` is live-mounted, so Python edits to node code take effect on the next launch. Changes to `setup.py`, entry points, or `*.launch.py` files still require a workspace rebuild inside the container: `colcon build --packages-select team_8` (from `/ros2_ws`), then relaunch.
 
 The container uses `network_mode: host` — all ROS2 topics from the host are immediately visible inside.
 
@@ -34,7 +34,7 @@ The container uses `network_mode: host` — all ROS2 topics from the host are im
 
 Two ROS2 packages live under `src/`:
 
-- `pipeline_orchestrator` — all pipeline nodes (below).
+- `team_8` — all pipeline nodes (below).
 - `utils/riro_srvs` — custom service definitions (`StringString`, `PlanTrajectory`, …).
 
 Nodes (each is a `console_scripts` entry point in `setup.py`):
@@ -94,7 +94,7 @@ Pip dependencies live under `requirements/` (`sam2.txt`, `graspgen.txt`, `curobo
 - `Dockerfile` — single layer-ordered image (CUDA 12.8 + ROS2 Humble + PyTorch + SAM2/GraspGen/cuRobo + baked models; `COPY src` last). No separate base image.
 - `docker-compose.yml` — deploy mode (baked image, runs `deploy.launch.py`).
 - `docker-compose.debug.yml` — override that live-mounts `./src`/`./scripts`/`./config` and runs `debug.launch.py`.
-- `src/pipeline_orchestrator/launch/{pipeline_common,deploy,debug}.launch.py` — shared node graph + the two mode entry points.
-- `src/pipeline_orchestrator/pipeline_orchestrator/` — all pipeline nodes (see table above)
+- `src/team_8/launch/{pipeline_common,deploy,debug}.launch.py` — shared node graph + the two mode entry points.
+- `src/team_8/team_8/` — all pipeline nodes (see table above)
 - `src/utils/riro_srvs/srv/` — custom service definitions
-- `src/pipeline_orchestrator/config/ur5_curobo.yml` — cuRobo robot config (keep ASCII-only: cuRobo's `load_yaml` opens it with the container's default ASCII codec, so non-ASCII bytes crash it)
+- `src/team_8/config/ur5_curobo.yml` — cuRobo robot config (keep ASCII-only: cuRobo's `load_yaml` opens it with the container's default ASCII codec, so non-ASCII bytes crash it)

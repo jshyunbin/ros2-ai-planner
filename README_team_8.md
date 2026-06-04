@@ -33,7 +33,7 @@ ros2 launch manip_challenge ur5_setup.launch.py
 ## Step 3 — Launch the planner in standby mode
 
 Run the image. The default command launches the full pipeline
-(`ros2 launch pipeline_orchestrator contest_run.launch.py`) and waits for a
+(`ros2 launch team_8 contest_run.launch.py`) and waits for a
 task command — this is the **standby** state.
 
 ```bash
