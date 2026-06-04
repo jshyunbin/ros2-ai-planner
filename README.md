@@ -73,7 +73,7 @@ GEMINI_API_KEY=<키>   # segmentation_service에서 필요
 
 `src/` 아래 두 ROS2 패키지:
 
-- `pipeline_orchestrator` — 모든 파이프라인 노드
+- `team_8` — 모든 파이프라인 노드
 - `utils/riro_srvs` — 커스텀 서비스 정의 (`StringString`, `PlanTrajectory`, …)
 
 ### 노드 목록
@@ -140,7 +140,7 @@ GEMINI_API_KEY=<키>   # segmentation_service에서 필요
 ```bash
 source /opt/ros/humble/setup.bash
 cd /ros2_ws
-colcon build --symlink-install --packages-select riro_srvs pipeline_orchestrator
+colcon build --symlink-install --packages-select riro_srvs team_8
 source install/setup.bash
 ```
 
@@ -148,7 +148,7 @@ source install/setup.bash
 
 pip 의존성은 `requirements/` 아래 파일별로 관리된다 (`sam2.txt`, `graspgen.txt`, `curobo.txt`, `planner-runtime.txt`). cuRobo는 소스에서 설치해야 한다. 의존성 변경 후에는 이미지 리빌드가 필요하다.
 
-**cuRobo YAML 설정 주의:** `src/pipeline_orchestrator/config/ur5_curobo.yml`은 ASCII 전용으로 유지해야 한다. cuRobo의 `load_yaml`이 ASCII 코덱으로 열기 때문에 비ASCII 문자가 있으면 크래시된다.
+**cuRobo YAML 설정 주의:** `src/team_8/config/ur5_curobo.yml`은 ASCII 전용으로 유지해야 한다. cuRobo의 `load_yaml`이 ASCII 코덱으로 열기 때문에 비ASCII 문자가 있으면 크래시된다.
 
 ### Dockerfile 레이어 순서
 

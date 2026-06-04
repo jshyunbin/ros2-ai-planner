@@ -157,4 +157,4 @@ ENV FASTRTPS_DEFAULT_PROFILES_FILE=/ros2_ws/config/fastdds_no_shm.xml
 ENV GEMINI_API_KEY=${GEMINI_API_KEY}
 
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["ros2", "launch", "pipeline_orchestrator", "contest_run.launch.py"]
+CMD ["ros2", "launch", "team_8", "contest_run.launch.py"]

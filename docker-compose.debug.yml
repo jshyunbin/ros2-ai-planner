@@ -5,4 +5,4 @@ services:
       - ./scripts:/ros2_ws/scripts
       - ./config:/ros2_ws/config:ro
       - ./artifacts:/artifacts
-    command: ["ros2", "launch", "pipeline_orchestrator", "debug.launch.py"]
+    command: ["ros2", "launch", "team_8", "debug.launch.py"]

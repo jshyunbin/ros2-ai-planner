@@ -30,11 +30,10 @@ docker images | grep image_team_8
 ros2 launch manip_challenge ur5_setup.launch.py
 ```
 
-## Step 3 — Launch the planner in standby mode
+## Step 3 — Start the container
 
-Run the image. The default command launches the full pipeline
-(`ros2 launch pipeline_orchestrator contest_run.launch.py`) and waits for a
-task command — this is the **standby** state.
+Start an interactive shell in the container. ROS2 and the `team_8` workspace
+are sourced automatically on entry, so the package is immediately available.
 
 ```bash
 docker run --rm -it \
@@ -43,20 +42,29 @@ docker run --rm -it \
   -e NVIDIA_DRIVER_CAPABILITIES=all \
   --network host \
   --ipc host \
-  image_team_8:latest
+  image_team_8:latest bash
 ```
 
 The container shares the host network (`--network host`), so all ROS2 topics
-from the simulator are visible immediately. Wait until cuRobo finishes
-initializing — the log goes quiet and the system idles, waiting on
-`/task_commands`. Requests that arrive before initialization completes are not
-dropped; they block until the planner is ready.
+from the simulator are visible immediately.
 
 > **ROS domain:** the image defaults to `ROS_DOMAIN_ID=0`. If the simulator
-> runs on a different domain, add `-e ROS_DOMAIN_ID=<id>` to the `docker run`
-> command.
+> runs on a different domain, add `-e ROS_DOMAIN_ID=<id>` to the command.
 
-## Step 4 — Send a task command
+## Step 4 — Launch the planner in standby mode (inside the container)
+
+From the container shell:
+
+```bash
+ros2 launch team_8 contest_run.launch.py
+```
+
+This brings up the full pipeline and waits for a task command — the **standby**
+state. Wait until cuRobo finishes initializing (the log goes quiet); requests
+that arrive before initialization completes are not dropped — they block until
+the planner is ready.
+
+## Step 5 — Send a task command
 
 From the host (or any sourced ROS2 shell):
 

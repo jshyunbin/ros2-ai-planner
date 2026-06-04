@@ -26,4 +26,4 @@ services:
     ipc: host
     stdin_open: true
     tty: true
-    command: ["ros2", "launch", "pipeline_orchestrator", "deploy.launch.py"]
+    command: ["ros2", "launch", "team_8", "deploy.launch.py"]
