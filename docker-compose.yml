@@ -1,7 +1,12 @@
 services:
   ai_planner:
+    image: image_team_8:latest
     build:
       context: .
+      args:
+        # Read from .env in the build environment and baked into the image,
+        # so no extra build flag is needed. Never committed (key lives in .env).
+        GEMINI_API_KEY: ${GEMINI_API_KEY:-}
     network_mode: host
     runtime: nvidia
     environment:

@@ -136,5 +136,25 @@ RUN . /opt/ros/humble/setup.sh && \
 COPY scripts/entrypoint.sh /entrypoint.sh
 COPY scripts/start_graspgen_server.sh /start_graspgen_server.sh
 RUN chmod +x /entrypoint.sh && chmod +x /start_graspgen_server.sh
+
+# ── Self-contained contest submission layer ─────────────────────────────────
+# Bake the DDS profile/config and runtime env so the image runs from a single
+# `docker run` with no compose file, mounts, or .env. Kept last so the heavy
+# layers above stay cached.
+COPY config/ /ros2_ws/config/
+RUN mkdir -p /artifacts/segmentation_service /artifacts/graspgen_service
+
+# The Gemini key is supplied at build time so it is NOT stored in source
+# control. Bake it into the submission image with:
+#   docker build --build-arg GEMINI_API_KEY=<key> -t image_team_8:latest .
+ARG GEMINI_API_KEY=""
+
+ENV ROS_DOMAIN_ID=0
+ENV ROS_LOCALHOST_ONLY=0
+ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+ENV FASTDDS_BUILTIN_TRANSPORTS=UDPv4
+ENV FASTRTPS_DEFAULT_PROFILES_FILE=/ros2_ws/config/fastdds_no_shm.xml
+ENV GEMINI_API_KEY=${GEMINI_API_KEY}
+
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["bash"]
+CMD ["ros2", "launch", "pipeline_orchestrator", "contest_run.launch.py"]
