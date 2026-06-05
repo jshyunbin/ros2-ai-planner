@@ -9,6 +9,8 @@ task_command → 세그멘테이션 (Gemini bbox + SAM2)
              → GraspGen (세그멘테이션된 포인트클라우드에서 파지 포즈)
              → cuRobo (실시간 듀얼 RGBD TSDF 기반 관절 궤적 계획)
              → UR5 실행 (/ur5_controller/follow_joint_trajectory)
+             → 목적지 이송 (충돌 미고려 safe-transit_z 경로; 책장은 +x 삽입 / −x 후퇴)
+             → 물체 놓기 → 홈 복귀 (충돌 고려)
 ```
 
 세 AI 단계는 각각 별도의 ROS2 노드로 구현되며, 오케스트레이터가 ROS2 서비스를 통해 조율한다.
@@ -80,10 +82,10 @@ GEMINI_API_KEY=<키>   # segmentation_service에서 필요
 
 | 모듈 | 엔트리포인트 | 역할 |
 |---|---|---|
-| `orchestrator.py` | `orchestrator` | `/task_commands` 구독 → 세그멘테이션 → GraspGen → cuRobo 서비스 순차 호출 → FollowJointTrajectory 실행 |
+| `orchestrator.py` | `orchestrator` | `/task_commands` 구독 → 세그멘테이션 → GraspGen → cuRobo 서비스 순차 호출 → FollowJointTrajectory 실행. pick 이후 목적지 키(`target_goal` 파라미터, 추후 상위 NL 파싱으로 대체)를 cuRobo `goal_name` 모드에 전달해 이송 → 놓기 → 홈 복귀 수행 |
 | `segmentation_service.py` | `segmentation_service` | `/segmentation/segment_prompt` 서비스. Gemini로 bbox 추출, SAM2로 마스크 정제, 깊이 역투영 후 세그멘테이션/배경 포인트클라우드 발행 |
 | `graspgen_service.py` | `graspgen_service` | `/graspgen/infer` 서비스. 세그멘테이션된 클라우드를 수신해 ZMQ로 GraspGen 서버에 추론 요청, 운동학/충돌 필터링 후 파지 순위 JSON 반환 |
-| `curobo_service.py` | `curobo_service` | `/curobo/plan_trajectory` 서비스. cuRobo 플래너 래퍼; pick(접근+파지/들기) 또는 단일 포즈(place/home) 계획 |
+| `curobo_service.py` | `curobo_service` | `/curobo/plan_trajectory` 서비스. cuRobo 플래너 래퍼; pick(접근+파지/들기), 단일 포즈(`grasp_pose`), 또는 `goal_name` 모드 — `place_poses.yml` 키를 충돌 미고려 safe-transit_z 이송(+책장 삽입/후퇴)으로, `home`은 충돌 고려 복귀로 계획 |
 | `curobo.py` | — | `CuRobo` 클래스: 듀얼 RGBD TSDF 매핑 + 모션 플래닝 |
 | `graspgen_client.py` | — | 독립 GraspGen 추론 서버에 대한 ZMQ 클라이언트 |
 | `segmentation_utils.py` | — | 세그멘테이션 헬퍼 (리사이즈, 깊이 역투영, 다운샘플, 중심점, 오버레이) |
