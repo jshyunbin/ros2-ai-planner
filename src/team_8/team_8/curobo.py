@@ -39,6 +39,10 @@ from team_8.pipeline_utils import (
     env_float as _env_float,
     env_int as _env_int,
 )
+from team_8.place_pose_utils import (
+    build_transit_waypoints,
+    translate_pose_x,
+)
 
 OVERHEAD_DEPTH_TOPIC = '/camera/camera/depth/color/image_raw'
 OVERHEAD_INFO_TOPIC = '/camera/camera/depth/color/camera_info'
@@ -77,6 +81,19 @@ class PickPlan:
         self.grasp = grasp
         self.lift = lift
         self.goalset_index = goalset_index
+
+
+class PlacePlan:
+    """Trajectories for a place: ``move`` is the collision-off safe-z transit to
+    the drop / pre-insert pose; ``insert`` and ``retract`` are the collision-off
+    +x / -x bookshelf segments (None for a simple top-down drop)."""
+
+    __slots__ = ('move', 'insert', 'retract')
+
+    def __init__(self, move, insert=None, retract=None):
+        self.move = move
+        self.insert = insert
+        self.retract = retract
 
 
 class CuRobo:
@@ -567,6 +584,78 @@ class CuRobo:
             f'CuRobo.plan_trajectory: all attempts exhausted ({last_status})')
         return None
 
+    def plan_place(self, place_pose, transit_z, bookshelf=False,
+                   insert_depth=0.0, retract_depth=0.0, joint_states=None):
+        """Plan a non-collision-aware safe-z transit to a place destination.
+
+        Returns a ``PlacePlan`` (move + optional bookshelf insert/retract) or
+        ``None`` on failure. All legs are collision-OFF: the carried object is
+        invisible to collision, so the rule-based transit (lift -> traverse at
+        ``transit_z`` -> descend) keeps it high instead.
+        """
+        with self._cuda_lock:
+            return self._plan_place_locked(
+                place_pose, transit_z, bool(bookshelf),
+                float(insert_depth), float(retract_depth), joint_states)
+
+    def _plan_place_locked(self, place_pose, transit_z, bookshelf,
+                           insert_depth, retract_depth, joint_states):
+        try:
+            self.update_joint_state(joint_states)
+            current_tool = self.tool_pose(joint_states)
+            if current_tool is None:
+                self._logger.warn('CuRobo.plan_place: FK for current pose failed.')
+                return None
+            cur_xyz, cur_quat_wxyz = current_tool
+            cur_quat_xyzw = [
+                cur_quat_wxyz[1], cur_quat_wxyz[2], cur_quat_wxyz[3],
+                cur_quat_wxyz[0],
+            ]
+            place_xyz, place_quat_xyzw = _pose_to_xyz_quat_xyzw(place_pose)
+            waypoints = build_transit_waypoints(
+                cur_xyz, cur_quat_xyzw, place_xyz, place_quat_xyzw, transit_z)
+
+            # Collision-OFF for the whole carried-object transit.
+            self._clear_collision_world()
+            current_state = self._ros_js_to_curobo(joint_states)
+            legs = []
+            for i, (xyz, quat) in enumerate(waypoints):
+                mat = _mat_from_xyz_quat_xyzw(xyz, quat)
+                jt = self._plan_pose_segment(mat, current_state, f'transit_{i}')
+                if jt is None:
+                    return None
+                legs.append(jt)
+                current_state = self._final_joint_state(jt)
+
+            move = legs[0]
+            for jt in legs[1:]:
+                move = concat_trajectories(move, jt)
+
+            insert_jt = None
+            retract_jt = None
+            if bookshelf:
+                inserted_xyz = translate_pose_x(place_xyz, insert_depth)
+                insert_mat = _mat_from_xyz_quat_xyzw(inserted_xyz, place_quat_xyzw)
+                insert_jt = self._plan_pose_segment(
+                    insert_mat, current_state, 'insert')
+                if insert_jt is None:
+                    return None
+                inserted_state = self._final_joint_state(insert_jt)
+                retract_xyz = translate_pose_x(inserted_xyz, -retract_depth)
+                retract_mat = _mat_from_xyz_quat_xyzw(retract_xyz, place_quat_xyzw)
+                retract_jt = self._plan_pose_segment(
+                    retract_mat, inserted_state, 'retract')
+                if retract_jt is None:
+                    return None
+
+            self._logger.info(
+                'CuRobo.plan_place succeeded: '
+                f'move={len(move.points)}pts bookshelf={bookshelf}')
+            return PlacePlan(move=move, insert=insert_jt, retract=retract_jt)
+        except Exception as exc:
+            self._logger.error(f'CuRobo.plan_place error: {exc}')
+            return None
+
     def tool_pose(self, joint_states):
         try:
             with self._cuda_lock:
@@ -820,6 +909,21 @@ def _last_tstep_to_int(last_tstep):
         raise ValueError(
             f'Invalid cuRobo interpolated last_tstep: {last_tstep!r}'
         ) from exc
+
+
+def _mat_from_xyz_quat_xyzw(xyz, quat_xyzw) -> np.ndarray:
+    """4x4 homogeneous pose from xyz + (x, y, z, w) quaternion."""
+    mat = np.eye(4, dtype=np.float32)
+    mat[:3, :3] = R.from_quat(
+        [float(q) for q in quat_xyzw]).as_matrix().astype(np.float32)
+    mat[:3, 3] = np.asarray(xyz, dtype=np.float32)
+    return mat
+
+
+def _pose_to_xyz_quat_xyzw(pose):
+    """(xyz list, quat_xyzw list) from a geometry_msgs/Pose."""
+    p, o = pose.position, pose.orientation
+    return [p.x, p.y, p.z], [o.x, o.y, o.z, o.w]
 
 
 def _candidate_pose_4x4(candidate) -> np.ndarray:

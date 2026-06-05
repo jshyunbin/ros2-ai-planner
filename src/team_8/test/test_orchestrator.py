@@ -650,3 +650,82 @@ def test_curobo_service_tsdf_publish_noop_with_empty_centers():
     )
     svc._publish_tsdf_voxels()
     pub.publish.assert_not_called()
+
+
+def test_mat_from_xyz_quat_xyzw_builds_pose_matrix():
+    import numpy as np
+    from team_8.curobo import _mat_from_xyz_quat_xyzw
+    mat = _mat_from_xyz_quat_xyzw([0.1, 0.2, 0.3], [0.0, 0.0, 0.0, 1.0])
+    assert mat.shape == (4, 4)
+    np.testing.assert_allclose(mat[:3, 3], [0.1, 0.2, 0.3], atol=1e-6)
+    np.testing.assert_allclose(mat[:3, :3], np.eye(3), atol=1e-6)
+
+
+def test_plan_place_storage_chains_three_collision_off_legs(monkeypatch):
+    import team_8.curobo as mod
+    from geometry_msgs.msg import Pose
+    from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+
+    curobo = mod.CuRobo.__new__(mod.CuRobo)
+    curobo._cuda_lock = threading.Lock()
+    curobo._logger = MagicMock()
+    curobo.update_joint_state = MagicMock()
+    curobo._ros_js_to_curobo = MagicMock(return_value='current')
+    curobo.tool_pose = MagicMock(return_value=([0.3, 0.1, 0.5], [1.0, 0.0, 0.0, 0.0]))
+    cleared = []
+    curobo._clear_collision_world = MagicMock(side_effect=lambda: cleared.append(1))
+
+    def _fake_segment(mat, state, name):
+        jt = JointTrajectory()
+        jt.points = [JointTrajectoryPoint()]
+        return jt
+    curobo._plan_pose_segment = MagicMock(side_effect=_fake_segment)
+    curobo._final_joint_state = MagicMock(return_value='next')
+    monkeypatch.setattr(mod, 'concat_trajectories', lambda a, b: a)
+
+    place_pose = Pose()
+    place_pose.position.x, place_pose.position.y, place_pose.position.z = 0.0, 0.55, 0.70
+    place_pose.orientation.x, place_pose.orientation.w = 1.0, 0.0
+
+    plan = curobo.plan_place(place_pose, transit_z=0.80, bookshelf=False,
+                             joint_states=MagicMock())
+
+    assert cleared == [1]
+    assert curobo._plan_pose_segment.call_count == 3
+    assert plan.insert is None and plan.retract is None
+    assert plan.move is not None
+
+
+def test_plan_place_bookshelf_adds_insert_and_retract(monkeypatch):
+    import team_8.curobo as mod
+    from geometry_msgs.msg import Pose
+    from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+
+    curobo = mod.CuRobo.__new__(mod.CuRobo)
+    curobo._cuda_lock = threading.Lock()
+    curobo._logger = MagicMock()
+    curobo.update_joint_state = MagicMock()
+    curobo._ros_js_to_curobo = MagicMock(return_value='current')
+    curobo.tool_pose = MagicMock(return_value=([0.3, 0.1, 0.5], [1.0, 0.0, 0.0, 0.0]))
+    curobo._clear_collision_world = MagicMock()
+
+    def _fake_segment(mat, state, name):
+        jt = JointTrajectory()
+        jt.points = [JointTrajectoryPoint()]
+        return jt
+    curobo._plan_pose_segment = MagicMock(side_effect=_fake_segment)
+    curobo._final_joint_state = MagicMock(return_value='next')
+    monkeypatch.setattr(mod, 'concat_trajectories', lambda a, b: a)
+
+    place_pose = Pose()
+    place_pose.position.x, place_pose.position.y, place_pose.position.z = 0.60, -0.30, 0.76
+    place_pose.orientation.x = 0.5
+
+    plan = curobo.plan_place(place_pose, transit_z=0.80, bookshelf=True,
+                             insert_depth=0.22, retract_depth=0.22,
+                             joint_states=MagicMock())
+
+    assert curobo._plan_pose_segment.call_count == 5
+    assert plan.insert is not None and plan.retract is not None
+    seg_names = [c.args[2] for c in curobo._plan_pose_segment.call_args_list]
+    assert seg_names[-2:] == ['insert', 'retract']
