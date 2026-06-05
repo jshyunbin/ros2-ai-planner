@@ -1,14 +1,23 @@
 # Top-K GraspGen TCP poses for pick planning (ordered by confidence, best first).
 # When non-empty, the cuRobo service runs plan_pick() and returns approach_and_grasp
-# in `trajectory` plus `lift_trajectory` (execute: trajectory → close gripper → lift).
+# in `trajectory` plus `lift_trajectory` (execute: trajectory -> close gripper -> lift).
 geometry_msgs/Pose[] grasp_poses
 # Single goal for place/home planning (used when grasp_poses is empty).
 geometry_msgs/Pose grasp_pose
 sensor_msgs/JointState joint_state
+# Place/home destination key (e.g. "storage_1", "bookshelf", "home"). When set
+# (and grasp_poses empty), the service resolves it from place_poses.yml and runs
+# plan_place() (collision-off transit) or, for "home", collision-aware planning.
+string goal_name
 ---
 bool success
 string message
-# Approach-to-grasp trajectory (arm moves from current pose to grasp contact).
+# Approach-to-grasp trajectory (pick), transit-to-place (place), or motion to
+# home -- depending on the request mode.
 trajectory_msgs/JointTrajectory trajectory
 # Lift trajectory (arm lifts after gripper closes). Only populated for plan_pick().
 trajectory_msgs/JointTrajectory lift_trajectory
+# Bookshelf collision-off +x insert push. Populated only for bookshelf place.
+trajectory_msgs/JointTrajectory insert_trajectory
+# Bookshelf collision-off -x retract. Populated only for bookshelf place.
+trajectory_msgs/JointTrajectory retract_trajectory
