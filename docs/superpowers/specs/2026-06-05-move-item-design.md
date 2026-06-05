@@ -84,6 +84,14 @@ semantics beyond the key it forwards.
 
 ## Component changes
 
+### 0. `config/place_poses.yml` — clean dummy schema
+The current YAML values are meaningless placeholders. Rewrite the file with a
+clean schema matching the data-driven design: `transit_z`, `home`, `storage_1`,
+`storage_2`, and a **single** `bookshelf` entry (`pre_insert` +
+`insert_depth_m`/`retract_depth_m`); no `floor1`/`floor2`. Values are **dummy
+placeholders** — the teammate's real poses are dropped in after implementation,
+so the code must not depend on any specific numeric value.
+
 ### 1. `riro_srvs/srv/PlanTrajectory.srv`
 Add (requires a `colcon build` of `riro_srvs`):
 
