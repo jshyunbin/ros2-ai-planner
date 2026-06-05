@@ -23,15 +23,25 @@ except ImportError:  # pragma: no cover - runtime dependency
     StringString = None
 
 try:
-    from grasp_gen.robot import get_gripper_info
-    from grasp_gen.utils.point_cloud_utils import filter_colliding_grasps
+    # resolve_gripper_info reads gripper_descriptions assets (x_grippers/<name>),
+    # the SAME source the GraspGenX server uses — unlike graspgenx.robot.get_gripper_info,
+    # which globs the empty graspgenx/config/grippers and raises in serving.
+    from graspgenx.x_grippers import resolve_gripper_info
+    from graspgenx.utils.collision_filter import filter_colliding_grasps
 except ImportError:  # pragma: no cover - import is environment-dependent
-    get_gripper_info = None
+    resolve_gripper_info = None
     filter_colliding_grasps = None
 
-# Kinematic reachability constants (ported from yeina / pick_and_place_ur5.py).
-# GraspGen TCP is GRIPPER_TCP_Z_OFFSET ahead of tool0 along the grasp Z-axis.
-_GRIPPER_TCP_Z_OFFSET = 0.1034   # m — robotiq_2f_140 checkpoint gripper_depth
+# Single source of truth for the gripper assets + TCP z-offset, shared with
+# curobo.py so grasp generation and motion planning stay aligned. See gripper_tcp.py.
+from team_8.gripper_tcp import (
+    DEFAULT_GRIPPER_NAME as _DEFAULT_GRIPPER_NAME,
+    gripper_assets_dir as _gripper_assets_dir,
+    resolve_gripper_tcp_z_offset as _resolve_gripper_tcp_z_offset,
+)
+
+# TCP is _GRIPPER_TCP_Z_OFFSET ahead of tool0 along the grasp +Z axis.
+_GRIPPER_TCP_Z_OFFSET, _GRIPPER_TCP_Z_OFFSET_SOURCE = _resolve_gripper_tcp_z_offset()
 _MAX_REACH = 0.82                 # m — UR5 kinematic reach limit
 _MIN_TOOL_Z = 0.08                # m — minimum tool0 height above table
 
@@ -45,6 +55,11 @@ class GraspGenService(Node):
 
         super().__init__("graspgen_service")
 
+        self.get_logger().info(
+            f"Gripper TCP z-offset = {_GRIPPER_TCP_Z_OFFSET:.4f} m "
+            f"(source: {_GRIPPER_TCP_Z_OFFSET_SOURCE})"
+        )
+
         self.declare_parameter("segmented_point_cloud_topic", "/graspgen/segmented_object")
         self.declare_parameter("background_point_cloud_topic", "/graspgen/background")
         self.declare_parameter("service_name", "/graspgen/infer")
@@ -52,14 +67,16 @@ class GraspGenService(Node):
         self.declare_parameter("server_port", 5556)
         self.declare_parameter("num_grasps", 200)
         self.declare_parameter("topk_num_grasps", 100)
-        self.declare_parameter("min_grasps", 20)
-        self.declare_parameter("max_tries", 4)
-        self.declare_parameter("remove_outliers", False)
+        # NOTE: min_grasps / max_tries / remove_outliers were removed — GraspGenX's
+        # infer() no longer supports them (the old outlier-retry loop is gone).
         self.declare_parameter("rank_mode", "approach_alignment")
         self.declare_parameter("target_approach_dir", [0.0, 0.0, -1.0])
         self.declare_parameter("max_returned_grasps", 5)
         self.declare_parameter("expected_frame", "base_link")
         self.declare_parameter("enable_collision_check", False)
+        # NOTE: GraspGenX's filter_colliding_grasps default is 0.02 m; this 0.002 m
+        # (2 mm) gate is intentionally tighter for this tabletop scene. Only used
+        # when enable_collision_check is True (off by default).
         self.declare_parameter("collision_threshold", 0.002)
         self.declare_parameter("collision_samples", 2000)
         self.declare_parameter("debug_dir", "/artifacts/graspgen_service")
@@ -240,11 +257,14 @@ class GraspGenService(Node):
         debug_id = time.strftime("%Y%m%d-%H%M%S") + f"-{int(time.time_ns() % 1_000_000_000):09d}"
         debug_path = self._debug_dir / debug_id
         debug_path.mkdir(parents=True, exist_ok=True)
-        remove_outliers = bool(self.get_parameter("remove_outliers").value)
         try:
-            grasps, confidences = self._infer_with_optional_retry(
+            # gripper_name omitted -> the GraspGenX server uses its --default_gripper
+            # (robotiq_2f_85). num_grasps / topk_num_grasps are the only tunables
+            # GraspGenX's infer() still accepts (plus grasp_threshold, left default).
+            grasps, confidences = self._client.infer(
                 segmented_cloud,
-                remove_outliers=remove_outliers,
+                num_grasps=int(self.get_parameter("num_grasps").value),
+                topk_num_grasps=int(self.get_parameter("topk_num_grasps").value),
             )
         except Exception as exc:
             error = f"GraspGen inference failed: {exc}"
@@ -330,53 +350,25 @@ class GraspGenService(Node):
                 msg.poses.append(pose)
         self._grasp_poses_pub.publish(msg)
 
-    def _infer_with_optional_retry(
-        self,
-        segmented_cloud: np.ndarray,
-        *,
-        remove_outliers: bool,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        infer_kwargs = {
-            "num_grasps": int(self.get_parameter("num_grasps").value),
-            "topk_num_grasps": int(self.get_parameter("topk_num_grasps").value),
-            "min_grasps": int(self.get_parameter("min_grasps").value),
-            "max_tries": int(self.get_parameter("max_tries").value),
-        }
-        try:
-            return self._client.infer(
-                segmented_cloud,
-                remove_outliers=remove_outliers,
-                **infer_kwargs,
-            )
-        except Exception as exc:
-            if not remove_outliers or not self._looks_like_empty_cloud_after_filter(exc):
-                raise
-            self.get_logger().warn(
-                "GraspGen removed all segmented points during outlier filtering; retrying with remove_outliers=false."
-            )
-            return self._client.infer(
-                segmented_cloud,
-                remove_outliers=False,
-                **infer_kwargs,
-            )
-
-    @staticmethod
-    def _looks_like_empty_cloud_after_filter(exc: Exception) -> bool:
-        message = str(exc)
-        return "cannot reshape tensor of 0 elements" in message or "shape [-1, 0, 3]" in message
-
     def _compute_collision_free_mask(self, grasps: np.ndarray):
         if not bool(self.get_parameter("enable_collision_check").value):
             return None
         if self._latest_background_cloud is None:
             self.get_logger().warn("Collision filtering enabled but no background cloud received yet.")
             return None
-        if get_gripper_info is None or filter_colliding_grasps is None:
-            self.get_logger().warn("Collision filtering requested but GraspGen collision utilities are unavailable.")
+        if resolve_gripper_info is None or filter_colliding_grasps is None:
+            self.get_logger().warn("Collision filtering requested but GraspGenX collision utilities are unavailable.")
             return None
 
-        gripper_name = self._client.server_metadata.get("gripper_name", "robotiq_2f_140")
-        gripper_info = get_gripper_info(gripper_name)
+        # GraspGenX's metadata action returns "default_gripper" (the server's
+        # pre-loaded gripper); "gripper_name" only appears in the infer response.
+        gripper_name = (
+            (self._client.server_metadata or {}).get("default_gripper")
+            or _DEFAULT_GRIPPER_NAME
+        )
+        # Load from the gripper_descriptions assets (x_grippers/<name>) — the same
+        # source the GraspGenX server uses; gives a real .collision_mesh.
+        gripper_info = resolve_gripper_info(gripper_name, str(_gripper_assets_dir()))
         collision_threshold = float(self.get_parameter("collision_threshold").value)
         collision_samples = int(self.get_parameter("collision_samples").value)
         return filter_colliding_grasps(

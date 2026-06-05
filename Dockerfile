@@ -1,21 +1,24 @@
 FROM nvcr.io/nvidia/pytorch:23.07-py3
 
-ARG GRASPGEN_REPO_URL=https://github.com/pianojay/GraspGen.git
-ARG GRASPGEN_BRANCH=jaeuk
-ARG GRASPGEN_COMMIT=31b67f65f3cb88928887edd2ee24e302c30cab70
-ARG GRASPGEN_MODELS_REPO_URL=https://huggingface.co/adithyamurali/GraspGenModels
-ARG GRASPGEN_MODELS_COMMIT=ec1ccbb5eec0680db669246ac312a3636f16ee43
-ARG GRIPPER_CONFIG_NAME=graspgen_robotiq_2f_140.yml
-ARG GRASPGEN_MODEL_FILES=checkpoints/graspgen_robotiq_2f_140.yml,checkpoints/graspgen_robotiq_2f_140_gen.pth,checkpoints/graspgen_robotiq_2f_140_dis.pth
+# GraspGenX is vendored in-tree (./GraspGenX) and installed from the COPY below.
+# Its gripper_descriptions + checkpoints are auto-fetched by graspgenx into
+# ${GRASPGENX_REPO_DIR}/ext on first import (see graspgenx/_setup_dependencies.py).
+ARG GRASPGENX_CHECKPOINT_VERSION=release
+ARG GRASPGENX_DEFAULT_GRIPPER=robotiq_2f_85
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV LANG=en_US.UTF-8
 ENV LC_ALL=en_US.UTF-8
 ENV PIP_ROOT_USER_ACTION=ignore
-ENV GRASPGEN_REPO_DIR=/opt/GraspGen
-ENV GRASPGEN_MODELS_DIR=/opt/GraspGenModels
-ENV SAM2_MODEL_DIR=/opt/models/sam2
-ENV SAM2_MODEL_PATH=/opt/models/sam2/sam2_t.pt
+ENV GRASPGENX_REPO_DIR=/opt/GraspGenX
+# gripper_descriptions + checkpoints land under ${GRASPGENX_REPO_DIR}/ext (graspgenx defaults).
+ENV GRASPGENX_CHECKPOINT_VERSION=release
+# Dir containing x_grippers/ (gripper_descriptions assets). Shared by the GraspGenX
+# server (--assets_dir) AND the ROS nodes' TCP/collision resolver (gripper_tcp.py)
+# so both read the same robotiq_2f_85 config (config.json -> fingertip depth).
+ENV GRASPGENX_ASSETS_DIR=/opt/GraspGenX/ext/gripper_descriptions/gripper_descriptions/assets
+ENV SAM3_MODEL_DIR=/opt/models/sam3
+ENV SAM3_MODEL_PATH=/opt/models/sam3/sam3.pt
 
 COPY requirements/ /tmp/requirements/
 
@@ -71,28 +74,23 @@ RUN apt-get update && apt-get install -y \
     python3-dev && \
     rm -rf /var/lib/apt/lists/*
 
-# Planner-side Python runtime. Keep this separate from GraspGen so Gemini/SAM2
+# Planner-side Python runtime. Keep this separate from GraspGen so Gemini/SAM3
 # issues do not get conflated with GraspGen inference issues.
 RUN python3 -m pip install --upgrade pip && \
     python3 -m pip install --no-cache-dir -r /tmp/requirements/planner-runtime.txt && \
-    python3 -m pip install --no-cache-dir --no-deps -r /tmp/requirements/sam2.txt
+    python3 -m pip install --no-cache-dir --no-deps -r /tmp/requirements/sam3.txt
 
-# Clone the fork only after ROS2/system and planner runtime are established.
-RUN git clone --recursive --branch ${GRASPGEN_BRANCH} ${GRASPGEN_REPO_URL} ${GRASPGEN_REPO_DIR} && \
-    cd ${GRASPGEN_REPO_DIR} && \
-    git checkout ${GRASPGEN_COMMIT} && \
-    git submodule update --init --recursive
-
-# GraspGen runtime. This is intentionally separated from the planner runtime above.
-RUN python3 -m pip install --no-cache-dir -r ${GRASPGEN_REPO_DIR}/requirements.zmq_pointnet_viser.txt
-
-# Official GraspGen pointnet installation pattern, adapted for the reduced runtime.
-RUN cd ${GRASPGEN_REPO_DIR}/pointnet2_ops && \
-    python3 -m pip install --no-cache-dir --no-build-isolation .
-
-# Install the fork itself without re-resolving the broad upstream dependency set.
-RUN cd ${GRASPGEN_REPO_DIR} && \
-    python3 -m pip install --no-cache-dir --no-deps -e .
+# GraspGenX is vendored in-tree; copy it into the image and install it. GraspGenX
+# bundles its own PointNet (graspgenx/models/pointnet/), so there is NO separate
+# pointnet2_ops build step, and there is no [serving] extra (serving needs only
+# msgpack/pyzmq, already provided). NOTE (build-time-unverified): GraspGenX
+# dependency resolution against this image's CUDA/torch stack is validated at
+# `docker compose build`, not in the static change pass; numpy is re-pinned
+# afterwards to preserve the cv_bridge ABI (mirrors the cuRobo block below).
+COPY GraspGenX/ ${GRASPGENX_REPO_DIR}/
+RUN cd ${GRASPGENX_REPO_DIR} && \
+    python3 -m pip install --no-cache-dir -e . && \
+    python3 -m pip install --no-cache-dir --force-reinstall "numpy<2"
 
 # cuRoboV2 runtime. The install order mirrors the validated smoke test against
 # the current planner image; re-pin numpy afterwards to preserve cv_bridge ABI.
@@ -103,26 +101,25 @@ RUN python3 -m pip install --no-cache-dir "numpy<2" uv && \
     cd / && rm -rf /tmp/curobo && \
     python3 -m pip install --no-cache-dir --force-reinstall "numpy<2"
 
-# Bake the Ultralytics SAM2 checkpoint into the image to avoid first-run downloads.
-RUN mkdir -p ${SAM2_MODEL_DIR} && \
-    curl -L https://github.com/ultralytics/assets/releases/download/v8.4.0/sam2_t.pt \
-      -o ${SAM2_MODEL_PATH} && \
-    test -s ${SAM2_MODEL_PATH}
+# Bake the Ultralytics SAM3 checkpoint into the image to avoid first-run downloads.
+# NOTE (build-time-unverified): the exact SAM3 weight filename/URL is resolved at
+# build time. ultralytics (>=8.3.237) recognizes SAM3 by the `sam3.pt` filename and
+# auto-downloads it on first load; if a pinned release asset URL is preferred,
+# substitute it here. This layer is NOT verified in the static-only change pass.
+RUN mkdir -p ${SAM3_MODEL_DIR} && cd ${SAM3_MODEL_DIR} && \
+    python3 -c "from ultralytics import SAM; SAM('sam3.pt')" && \
+    test -s ${SAM3_MODEL_PATH}
 
-# Download only the pinned GraspGen model assets required by the planner.
-RUN export GIT_LFS_SKIP_SMUDGE=1 && \
-    git clone ${GRASPGEN_MODELS_REPO_URL} /tmp/GraspGenModels && \
-    cd /tmp/GraspGenModels && \
-    git checkout ${GRASPGEN_MODELS_COMMIT} && \
-    git lfs pull --include="${GRASPGEN_MODEL_FILES}" && \
-    mkdir -p ${GRASPGEN_MODELS_DIR}/checkpoints && \
-    cp checkpoints/graspgen_robotiq_2f_140.yml ${GRASPGEN_MODELS_DIR}/checkpoints/ && \
-    cp checkpoints/graspgen_robotiq_2f_140_gen.pth ${GRASPGEN_MODELS_DIR}/checkpoints/ && \
-    cp checkpoints/graspgen_robotiq_2f_140_dis.pth ${GRASPGEN_MODELS_DIR}/checkpoints/ && \
-    rm -rf /tmp/GraspGenModels && \
-    test -f "${GRASPGEN_MODELS_DIR}/checkpoints/${GRIPPER_CONFIG_NAME}" && \
-    test -f "${GRASPGEN_MODELS_DIR}/checkpoints/graspgen_robotiq_2f_140_gen.pth" && \
-    test -f "${GRASPGEN_MODELS_DIR}/checkpoints/graspgen_robotiq_2f_140_dis.pth"
+# Pre-fetch GraspGenX gripper_descriptions + checkpoints at build time so the
+# first server start is fast. graspgenx auto-clones them into
+# ${GRASPGENX_REPO_DIR}/ext on import (gripper_descriptions from github;
+# checkpoints >1GB from HF via git-lfs, laid out as <version>/{gen,dis} with
+# version "${GRASPGENX_CHECKPOINT_VERSION}"). Best-effort: if the prefetch is
+# skipped/fails, the server fetches the assets on first import at runtime.
+# NOTE (build-time-unverified): asset availability/layout is validated at
+# `docker compose build`, not in the static change pass.
+RUN cd ${GRASPGENX_REPO_DIR} && python3 -c "import graspgenx" || \
+    echo "WARNING: GraspGenX asset prefetch incomplete; assets will be fetched on first import."
 
 # ── Application layer (frequently changing; kept last so the heavy layers
 #    above stay cached across src edits) ──────────────────────────────────────

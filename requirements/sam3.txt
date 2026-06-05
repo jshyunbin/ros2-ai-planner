@@ -1,0 +1,7 @@
+# Ultralytics SAM3 runtime
+# SAM 3 is integrated into ultralytics from v8.3.237 (predict/track). It keeps
+# SAM2-style visual prompts (boxes), so the bbox-prompt segmentation flow is a
+# drop-in replacement for the previous SAM2 path.
+# Install with --no-deps because the planner image already provides the working
+# torch/CUDA stack and supporting Python packages.
+ultralytics>=8.3.237

@@ -60,7 +60,12 @@ JOINT_NAMES = (
 
 TOPK_GRASPS = 10
 INTERP_DT = 0.02
-GRIPPER_TCP_Z_OFFSET = 0.1034
+# Shared with graspgen_service via gripper_tcp.py so grasp ranking and motion
+# planning use the SAME tool0->TCP depth (robotiq_2f_85, sourced from the
+# gripper_descriptions assets or PIPELINE_GRIPPER_TCP_Z_OFFSET_M; raises if
+# neither is available).
+from team_8.gripper_tcp import resolve_gripper_tcp_z_offset
+GRIPPER_TCP_Z_OFFSET, _GRIPPER_TCP_Z_OFFSET_SOURCE = resolve_gripper_tcp_z_offset()
 
 
 class PickPlan:

@@ -1,4 +1,0 @@
-# Ultralytics SAM2 runtime
-# Install with --no-deps because the planner image already provides the working
-# torch/CUDA stack and supporting Python packages.
-ultralytics>=8.2.70

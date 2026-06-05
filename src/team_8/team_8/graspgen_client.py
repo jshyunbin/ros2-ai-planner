@@ -1,4 +1,5 @@
 import time
+from typing import Optional
 
 import msgpack
 import msgpack_numpy
@@ -68,14 +69,20 @@ class GraspGenClient:
     def infer(
         self,
         point_cloud: np.ndarray,
+        gripper_name: Optional[str] = None,
         *,
-        grasp_threshold: float = -1.0,
         num_grasps: int = 200,
-        topk_num_grasps: int = 20,
-        min_grasps: int = 20,
-        max_tries: int = 4,
-        remove_outliers: bool = True,
+        grasp_threshold: float = -1.0,
+        topk_num_grasps: int = 100,
     ) -> tuple[np.ndarray, np.ndarray]:
+        """Send a point cloud (+ optional gripper) to the GraspGenX server.
+
+        The GraspGenX server dropped the old ``min_grasps``/``max_tries``/
+        ``remove_outliers`` retry fields; this signature mirrors GraspGenX's
+        ``infer(point_cloud, gripper_name, num_grasps, grasp_threshold,
+        topk_num_grasps)``. When ``gripper_name`` is None the server uses its
+        configured ``--default_gripper``.
+        """
         point_cloud = np.asarray(point_cloud, dtype=np.float32)
         if point_cloud.ndim != 2 or point_cloud.shape[1] != 3:
             raise ValueError(f"point_cloud must be (N, 3), got {point_cloud.shape}")
@@ -83,13 +90,12 @@ class GraspGenClient:
         payload = {
             "action": "infer",
             "point_cloud": point_cloud,
-            "grasp_threshold": grasp_threshold,
             "num_grasps": num_grasps,
+            "grasp_threshold": grasp_threshold,
             "topk_num_grasps": topk_num_grasps,
-            "min_grasps": min_grasps,
-            "max_tries": max_tries,
-            "remove_outliers": remove_outliers,
         }
+        if gripper_name is not None:
+            payload["gripper_name"] = gripper_name
         response = self._request(payload)
         grasps = np.asarray(response["grasps"], dtype=np.float32)
         confidences = np.asarray(response["confidences"], dtype=np.float32)

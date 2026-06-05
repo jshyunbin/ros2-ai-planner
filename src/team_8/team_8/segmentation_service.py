@@ -101,7 +101,7 @@ class SegmentationService(Node):
         self.declare_parameter("overlay_topic", "/segmentation/overlay")
         self.declare_parameter("mask_topic", "/segmentation/mask")
         self.declare_parameter("gemini_model", "gemini-2.5-flash")
-        self.declare_parameter("sam2_model", "/opt/models/sam2/sam2_t.pt")
+        self.declare_parameter("sam_model", "/opt/models/sam3/sam3.pt")
         self.declare_parameter("output_frame", "base_link")
         self.declare_parameter("max_api_image_dim", 1024)
         self.declare_parameter("min_depth_m", 0.05)
@@ -139,8 +139,8 @@ class SegmentationService(Node):
 
         self._gemini = genai.Client(api_key=gemini_api_key)
         self._gemini_model = str(self.get_parameter("gemini_model").value)
-        self._sam2_model_name = str(self.get_parameter("sam2_model").value)
-        self._sam2 = SAM(self._sam2_model_name)
+        self._sam_model_name = str(self.get_parameter("sam_model").value)
+        self._sam = SAM(self._sam_model_name)
         self._output_frame = str(self.get_parameter("output_frame").value)
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
@@ -287,10 +287,10 @@ class SegmentationService(Node):
                 prompt_result["box_2d"], api_width, api_height
             )
             prompt_bbox = self._scale_bbox(prompt_bbox_api, scale_x, scale_y, rgb_bgr.shape[1], rgb_bgr.shape[0])
-            mask = self._segment_with_sam2(rgb_bgr, prompt_bbox)
+            mask = self._segment_with_sam(rgb_bgr, prompt_bbox)
             mask = self._clip_mask_to_bbox(mask, prompt_bbox)
             if not mask.any():
-                raise RuntimeError("SAM2 returned an empty mask.")
+                raise RuntimeError("SAM3 returned an empty mask.")
 
             object_points, background_points = depth_to_masked_points(
                 depth_image,
@@ -376,7 +376,7 @@ class SegmentationService(Node):
                     "cy": round(float(cy), 5),
                 },
                 "gemini_bbox_xyxy": list(prompt_bbox),
-                "sam2_model": self._sam2_model_name,
+                "sam_model": self._sam_model_name,
                 "debug_dir": str(debug_path),
             }
             response.data = json.dumps(response_payload)
@@ -513,24 +513,24 @@ class SegmentationService(Node):
             raise RuntimeError(f"Degenerate pixel bbox: {[x_min, y_min, x_max, y_max]}")
         return x_min, y_min, x_max, y_max
 
-    def _segment_with_sam2(
+    def _segment_with_sam(
         self, image_bgr: np.ndarray, bbox: tuple[int, int, int, int]
     ) -> np.ndarray:
         x_min, y_min, x_max, y_max = bbox
-        results = self._sam2(image_bgr, bboxes=[x_min, y_min, x_max, y_max], verbose=False)
+        results = self._sam(image_bgr, bboxes=[x_min, y_min, x_max, y_max], verbose=False)
         if not results:
-            raise RuntimeError("SAM2 returned no results.")
+            raise RuntimeError("SAM3 returned no results.")
 
         masks = results[0].masks
         if masks is None or masks.data is None or len(masks.data) == 0:
-            raise RuntimeError("SAM2 returned no masks.")
+            raise RuntimeError("SAM3 returned no masks.")
 
         mask_data = masks.data.detach().cpu().numpy()
         best_index = int(np.argmax(mask_data.reshape(mask_data.shape[0], -1).sum(axis=1)))
         mask = mask_data[best_index] > 0
         if mask.shape != image_bgr.shape[:2]:
             raise RuntimeError(
-                f"SAM2 mask shape {mask.shape} does not match image shape {image_bgr.shape[:2]}"
+                f"SAM3 mask shape {mask.shape} does not match image shape {image_bgr.shape[:2]}"
             )
         return mask.astype(bool)
 
