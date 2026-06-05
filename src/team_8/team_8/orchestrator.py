@@ -87,6 +87,8 @@ class PipelineOrchestrator(Node):
                                '/ur5_controller/follow_joint_trajectory')
         self.declare_parameter('gripper_action_name',
                                '/gripper_controller/follow_joint_trajectory')
+        self.declare_parameter('target_goal', 'storage_1')
+        self._target_goal = str(self.get_parameter('target_goal').value)
 
         self._segmentation_service_name = str(
             self.get_parameter('segmentation_service_name').value)
@@ -323,7 +325,7 @@ class PipelineOrchestrator(Node):
 
         self.get_logger().info(result.message)
 
-        # 4-phase pick execution: open gripper → approach+grasp → close → lift.
+        # pick (open → approach+grasp → close → lift) → place → release → home.
         # Opening first is essential: the planned grasp pose assumes open
         # fingers, so a gripper left closed from a prior cycle would collide
         # with the object during the approach instead of enclosing it.
@@ -334,8 +336,10 @@ class PipelineOrchestrator(Node):
             self._send_gripper(closed=True)
             self._send_and_wait(
                 self._arm_client, result.lift_trajectory, 'lift')
+            self._plan_and_execute_place(self._target_goal)
+            self._plan_and_execute_home()
         except Exception as exc:
-            self.get_logger().error(f'Pick execution failed: {exc}')
+            self.get_logger().error(f'Pick/place execution failed: {exc}')
             # Best-effort: try to open the gripper so we don't drop/drag things.
             try:
                 self._send_gripper(closed=False)
@@ -343,6 +347,55 @@ class PipelineOrchestrator(Node):
                 pass
         finally:
             self._reset_pipeline_state()
+
+    def _call_curobo_blocking(self, request, label):
+        """Call the CuRobo plan service and block for the response.
+
+        Safe from inside an action/service done-callback because the node is
+        spun with a MultiThreadedExecutor (see main()).
+        """
+        if self._curobo_client is None:
+            raise RuntimeError(f'{label}: CuRobo service client unavailable.')
+        if not self._curobo_client.wait_for_service(
+                timeout_sec=self._curobo_service_wait_sec):
+            raise RuntimeError(
+                f'{label}: CuRobo service unavailable '
+                f'({self._curobo_service_name}).')
+        timeout_sec = _env_float('PIPELINE_PLAN_SERVICE_TIMEOUT_SEC', 600.0)
+        future = self._curobo_client.call_async(request)
+        result = self._wait_for_future(future, label, 'plan response', timeout_sec)
+        if result is None:
+            raise RuntimeError(f'{label}: CuRobo service returned no result.')
+        return result
+
+    def _plan_and_execute_place(self, goal_name: str) -> None:
+        """Plan (collision-off) + execute the transit to a place destination,
+        release the object, and (bookshelf) retract."""
+        request = PlanTrajectory.Request()
+        request.goal_name = goal_name
+        request.joint_state = self._latest_joints
+        result = self._call_curobo_blocking(request, f'place:{goal_name}')
+        if not result.success:
+            raise RuntimeError(f'place planning failed: {result.message}')
+        self._send_and_wait(self._arm_client, result.trajectory, 'place_transit')
+        if result.insert_trajectory and result.insert_trajectory.points:
+            self._send_and_wait(
+                self._arm_client, result.insert_trajectory, 'bookshelf_insert')
+        # Release the object onto the basket / shelf board.
+        self._send_gripper(closed=False)
+        if result.retract_trajectory and result.retract_trajectory.points:
+            self._send_and_wait(
+                self._arm_client, result.retract_trajectory, 'bookshelf_retract')
+
+    def _plan_and_execute_home(self) -> None:
+        """Plan (collision-aware) + execute the return to the home pose."""
+        request = PlanTrajectory.Request()
+        request.goal_name = 'home'
+        request.joint_state = self._latest_joints
+        result = self._call_curobo_blocking(request, 'home')
+        if not result.success:
+            raise RuntimeError(f'home planning failed: {result.message}')
+        self._send_and_wait(self._arm_client, result.trajectory, 'home')
 
     # ── execution helpers ─────────────────────────────────────────────────────
 

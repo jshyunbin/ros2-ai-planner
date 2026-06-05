@@ -375,11 +375,15 @@ def test_orchestrator_plan_execute_pick_calls_curobo_service():
 
 
 def test_orchestrator_curobo_pick_done_executes_phase_sequence():
+    from unittest.mock import call
     from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
     orch = _orchestrator_skeleton()
     orch._send_and_wait = MagicMock()
     orch._send_gripper = MagicMock()
     orch._reset_pipeline_state = MagicMock()
+    orch._plan_and_execute_place = MagicMock()
+    orch._plan_and_execute_home = MagicMock()
+    orch._target_goal = 'storage_1'
     trajectory = JointTrajectory()
     trajectory.points = [JointTrajectoryPoint()]
     lift_trajectory = JointTrajectory()
@@ -397,7 +401,9 @@ def test_orchestrator_curobo_pick_done_executes_phase_sequence():
 
     assert orch._send_and_wait.call_args_list[0].args == (
         orch._arm_client, trajectory, 'approach_and_grasp')
-    orch._send_gripper.assert_called_once_with(closed=True)
+    # Gripper opens before the grasp approach, then closes on the object.
+    assert orch._send_gripper.call_args_list == [
+        call(closed=False), call(closed=True)]
     assert orch._send_and_wait.call_args_list[1].args == (
         orch._arm_client, lift_trajectory, 'lift')
     orch._reset_pipeline_state.assert_called_once()
@@ -825,3 +831,100 @@ def test_route_place_pauses_mapping_but_home_does_not():
     route_place_or_home(curobo_home, _place_data(), "home",
                         MagicMock(), PlanTrajectory.Response())
     curobo_home.pause_mapping.assert_not_called()
+
+
+def _make_place_response(insert=False, retract=False, success=True):
+    from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+
+    def _t(points):
+        jt = JointTrajectory()
+        if points:
+            jt.points = [JointTrajectoryPoint()]
+        return jt
+    return MagicMock(
+        success=success, message='ok',
+        trajectory=_t(True),
+        insert_trajectory=_t(insert),
+        retract_trajectory=_t(retract),
+    )
+
+
+def test_orchestrator_place_storage_sequence_releases_then_no_retract():
+    from sensor_msgs.msg import JointState
+    orch = _orchestrator_skeleton()
+    orch._arm_client = MagicMock()
+    orch._send_and_wait = MagicMock()
+    orch._send_gripper = MagicMock()
+    orch._latest_joints = JointState()
+    orch._call_curobo_blocking = MagicMock(
+        return_value=_make_place_response(insert=False, retract=False))
+
+    orch._plan_and_execute_place('storage_1')
+
+    labels = [c.args[2] for c in orch._send_and_wait.call_args_list]
+    assert labels == ['place_transit']
+    orch._send_gripper.assert_called_once_with(closed=False)
+
+
+def test_orchestrator_place_bookshelf_sequence_insert_release_retract():
+    from sensor_msgs.msg import JointState
+    orch = _orchestrator_skeleton()
+    orch._arm_client = MagicMock()
+    calls = []
+    orch._send_and_wait = MagicMock(
+        side_effect=lambda c, t, label, **k: calls.append(('move', label)))
+    orch._send_gripper = MagicMock(
+        side_effect=lambda closed: calls.append(('grip', closed)))
+    orch._latest_joints = JointState()
+    orch._call_curobo_blocking = MagicMock(
+        return_value=_make_place_response(insert=True, retract=True))
+
+    orch._plan_and_execute_place('bookshelf')
+
+    assert calls == [
+        ('move', 'place_transit'),
+        ('move', 'bookshelf_insert'),
+        ('grip', False),
+        ('move', 'bookshelf_retract'),
+    ]
+
+
+def test_orchestrator_home_executes_returned_trajectory():
+    from sensor_msgs.msg import JointState
+    from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+    orch = _orchestrator_skeleton()
+    orch._arm_client = MagicMock()
+    orch._send_and_wait = MagicMock()
+    orch._latest_joints = JointState()
+    home_traj = JointTrajectory(); home_traj.points = [JointTrajectoryPoint()]
+    orch._call_curobo_blocking = MagicMock(
+        return_value=MagicMock(success=True, message='ok', trajectory=home_traj))
+
+    orch._plan_and_execute_home()
+
+    assert orch._send_and_wait.call_args.args == (
+        orch._arm_client, home_traj, 'home')
+
+
+def test_orchestrator_pick_done_runs_place_then_home():
+    from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+    orch = _orchestrator_skeleton()
+    orch._send_and_wait = MagicMock()
+    orch._send_gripper = MagicMock()
+    orch._reset_pipeline_state = MagicMock()
+    orch._plan_and_execute_place = MagicMock()
+    orch._plan_and_execute_home = MagicMock()
+    orch._target_goal = 'storage_2'
+    orch._arm_client = MagicMock()
+    trajectory = JointTrajectory(); trajectory.points = [JointTrajectoryPoint()]
+    lift_trajectory = JointTrajectory(); lift_trajectory.points = [JointTrajectoryPoint()]
+    future = MagicMock()
+    future.result.return_value = MagicMock(
+        success=True, message='planned',
+        trajectory=trajectory, lift_trajectory=lift_trajectory)
+
+    orch._on_curobo_pick_done(future)
+
+    orch._plan_and_execute_place.assert_called_once_with('storage_2')
+    orch._plan_and_execute_home.assert_called_once_with()
+    orch._reset_pipeline_state.assert_called_once()
