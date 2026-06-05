@@ -101,13 +101,17 @@ RUN python3 -m pip install --no-cache-dir "numpy<2" uv && \
     cd / && rm -rf /tmp/curobo && \
     python3 -m pip install --no-cache-dir --force-reinstall "numpy<2"
 
-# Bake the Ultralytics SAM3 checkpoint into the image to avoid first-run downloads.
-# NOTE (build-time-unverified): the exact SAM3 weight filename/URL is resolved at
-# build time. ultralytics (>=8.3.237) recognizes SAM3 by the `sam3.pt` filename and
-# auto-downloads it on first load; if a pinned release asset URL is preferred,
-# substitute it here. This layer is NOT verified in the static-only change pass.
-RUN mkdir -p ${SAM3_MODEL_DIR} && cd ${SAM3_MODEL_DIR} && \
-    python3 -c "from ultralytics import SAM; SAM('sam3.pt')" && \
+# Bake the SAM 3 checkpoint into the image to avoid first-run downloads.
+# SAM 3 weights are GATED on Hugging Face (facebook/sam3): they are NOT
+# auto-downloaded by ultralytics — you must accept Meta's license, get approved,
+# and download with an authenticated token. Pass it at build time:
+#   docker compose build --build-arg HF_TOKEN=hf_xxx
+# (the token account must already have approved access to https://huggingface.co/facebook/sam3)
+ARG HF_TOKEN=""
+RUN test -n "${HF_TOKEN}" || (echo "ERROR: HF_TOKEN build-arg required to download gated SAM3 weights (facebook/sam3). Build with: docker compose build --build-arg HF_TOKEN=hf_xxx" >&2; exit 1) && \
+    python3 -m pip install --no-cache-dir "huggingface_hub>=0.34.0" && \
+    mkdir -p ${SAM3_MODEL_DIR} && \
+    HF_TOKEN="${HF_TOKEN}" python3 -c "import os, shutil; from huggingface_hub import hf_hub_download; p = hf_hub_download(repo_id='facebook/sam3', filename='sam3.pt', token=os.environ['HF_TOKEN']); shutil.copy(p, '${SAM3_MODEL_PATH}')" && \
     test -s ${SAM3_MODEL_PATH}
 
 # Pre-fetch GraspGenX gripper_descriptions + checkpoints at build time so the

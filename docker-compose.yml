@@ -7,6 +7,8 @@ services:
         # Read from .env in the build environment and baked into the image,
         # so no extra build flag is needed. Never committed (key lives in .env).
         GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+        # HF token with approved access to the gated facebook/sam3 weights.
+        HF_TOKEN: ${HF_TOKEN:-}
     network_mode: host
     runtime: nvidia
     environment:
