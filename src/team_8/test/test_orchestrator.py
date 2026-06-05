@@ -729,3 +729,78 @@ def test_plan_place_bookshelf_adds_insert_and_retract(monkeypatch):
     assert plan.insert is not None and plan.retract is not None
     seg_names = [c.args[2] for c in curobo._plan_pose_segment.call_args_list]
     assert seg_names[-2:] == ['insert', 'retract']
+
+
+# --- route_place_or_home ---
+
+def _place_data():
+    return {
+        "transit_z": 0.80,
+        "home": {"xyz": [0.55, 0.07, 0.90], "quat_xyzw": [1.0, 0.0, 0.0, 0.0]},
+        "storage_1": {"xyz": [0.0, 0.55, 0.70], "quat_xyzw": [1.0, 0.0, 0.0, 0.0]},
+        "bookshelf": {
+            "pre_insert": {"xyz": [0.60, -0.30, 0.76],
+                           "quat_xyzw": [0.5, 0.5, 0.5, 0.5]},
+            "insert_depth_m": 0.22, "retract_depth_m": 0.22,
+        },
+    }
+
+
+def test_route_home_uses_collision_aware_plan_trajectory():
+    from riro_srvs.srv import PlanTrajectory
+    from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+    from team_8.curobo_service import route_place_or_home
+    curobo = MagicMock()
+    traj = JointTrajectory(); traj.points = [JointTrajectoryPoint()]
+    curobo.plan_trajectory.return_value = traj
+    resp = route_place_or_home(curobo, _place_data(), "home",
+                               MagicMock(), PlanTrajectory.Response())
+    curobo.plan_trajectory.assert_called_once()
+    curobo.plan_place.assert_not_called()
+    assert resp.success is True
+    assert resp.trajectory is traj
+
+
+def test_route_storage_calls_plan_place_simple():
+    from riro_srvs.srv import PlanTrajectory
+    from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+    from team_8.curobo_service import route_place_or_home
+    from team_8.curobo import PlacePlan
+    curobo = MagicMock()
+    move = JointTrajectory(); move.points = [JointTrajectoryPoint()]
+    curobo.plan_place.return_value = PlacePlan(move=move)
+    resp = route_place_or_home(curobo, _place_data(), "storage_1",
+                               MagicMock(), PlanTrajectory.Response())
+    assert curobo.plan_place.call_args.kwargs["bookshelf"] is False
+    assert resp.success is True
+    assert resp.trajectory is move
+    assert not resp.insert_trajectory.points
+    assert not resp.retract_trajectory.points
+
+
+def test_route_bookshelf_populates_insert_and_retract():
+    from riro_srvs.srv import PlanTrajectory
+    from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+    from team_8.curobo_service import route_place_or_home
+    from team_8.curobo import PlacePlan
+    curobo = MagicMock()
+    move = JointTrajectory(); move.points = [JointTrajectoryPoint()]
+    ins = JointTrajectory(); ins.points = [JointTrajectoryPoint()]
+    ret = JointTrajectory(); ret.points = [JointTrajectoryPoint()]
+    curobo.plan_place.return_value = PlacePlan(move=move, insert=ins, retract=ret)
+    resp = route_place_or_home(curobo, _place_data(), "bookshelf",
+                               MagicMock(), PlanTrajectory.Response())
+    assert curobo.plan_place.call_args.kwargs["bookshelf"] is True
+    assert curobo.plan_place.call_args.kwargs["insert_depth"] == 0.22
+    assert resp.insert_trajectory is ins
+    assert resp.retract_trajectory is ret
+
+
+def test_route_unknown_goal_fails_cleanly():
+    from riro_srvs.srv import PlanTrajectory
+    from team_8.curobo_service import route_place_or_home
+    curobo = MagicMock()
+    resp = route_place_or_home(curobo, _place_data(), "nope",
+                               MagicMock(), PlanTrajectory.Response())
+    assert resp.success is False
+    curobo.plan_place.assert_not_called()

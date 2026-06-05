@@ -35,6 +35,11 @@ from sensor_msgs.msg import PointCloud2
 from team_8.pipeline_utils import as_bool as _as_bool
 from team_8.pipeline_utils import env_float as _env_float
 from team_8.pipeline_utils import make_xyz_cloud
+from team_8.place_pose_utils import (
+    is_bookshelf_target,
+    load_place_poses,
+    resolve_target_pose,
+)
 from riro_srvs.srv import PlanTrajectory
 
 
@@ -57,6 +62,19 @@ class CuRoboService(Node):
         self.declare_parameter('tsdf_voxels_topic', '/curobo/tsdf_voxels')
         self.declare_parameter('overhead_cloud_topic', '/curobo/overhead_cloud')
         self.declare_parameter('init_wait_sec', 120.0)
+        self.declare_parameter(
+            'place_poses_path', '/ros2_ws/src/team_8/config/place_poses.yml')
+        self._place_poses = None
+        place_poses_path = str(self.get_parameter('place_poses_path').value)
+        try:
+            self._place_poses = load_place_poses(place_poses_path)
+            self.get_logger().info(
+                f'Loaded place poses from {place_poses_path}: '
+                f'{sorted(self._place_poses)}')
+        except Exception as exc:
+            self.get_logger().error(
+                f'Failed to load place poses from {place_poses_path}: '
+                f'{type(exc).__name__}: {exc}')
 
         self._latest_joints = None
         # Set while a plan is in flight so the debug viz thread pauses its
@@ -270,6 +288,14 @@ class CuRoboService(Node):
 
         self._planning.set()
         try:
+            goal_name = (request.goal_name or '').strip()
+            if goal_name:
+                if self._place_poses is None:
+                    response.success = False
+                    response.message = 'place_poses.yml not loaded; cannot place.'
+                    return response
+                return route_place_or_home(
+                    curobo, self._place_poses, goal_name, joint_state, response)
             if request.grasp_poses:
                 return self._handle_pick(curobo, request, joint_state, response)
             return self._handle_single_pose(curobo, request, joint_state, response)
@@ -351,6 +377,61 @@ def _poses_to_candidates(ros_poses) -> list[dict]:
         ]
         candidates.append({'pose_4x4': mat})
     return candidates
+
+
+def route_place_or_home(curobo, place_poses, goal_name, joint_state, response):
+    """Route a goal_name request to home (collision-aware) or place (off).
+
+    Resolves *goal_name* from *place_poses* and fills *response*. ``home`` uses
+    the collision-aware single-pose planner; any other key uses the collision-off
+    ``plan_place`` transit, populating insert/retract for bookshelf destinations.
+    """
+    try:
+        pose = resolve_target_pose(place_poses, goal_name)
+    except KeyError:
+        response.success = False
+        response.message = f'Unknown goal_name: {goal_name!r}'
+        return response
+
+    curobo.update_joint_state(joint_state)
+
+    if goal_name == 'home':
+        trajectory = curobo.plan_trajectory(pose, joint_state)
+        if trajectory is None or not trajectory.points:
+            response.success = False
+            response.message = 'CuRobo home planning failed.'
+            return response
+        response.trajectory = trajectory
+        response.success = True
+        response.message = f'CuRobo home planned: {len(trajectory.points)} points.'
+        return response
+
+    bookshelf = is_bookshelf_target(place_poses, goal_name)
+    insert_depth = retract_depth = 0.0
+    if bookshelf:
+        entry = place_poses[goal_name]
+        insert_depth = float(entry['insert_depth_m'])
+        retract_depth = float(entry['retract_depth_m'])
+
+    plan = curobo.plan_place(
+        pose, float(place_poses['transit_z']), bookshelf=bookshelf,
+        insert_depth=insert_depth, retract_depth=retract_depth,
+        joint_states=joint_state)
+    if plan is None or plan.move is None or not plan.move.points:
+        response.success = False
+        response.message = f'CuRobo.plan_place failed for {goal_name!r}.'
+        return response
+
+    response.trajectory = plan.move
+    if plan.insert is not None:
+        response.insert_trajectory = plan.insert
+    if plan.retract is not None:
+        response.retract_trajectory = plan.retract
+    response.success = True
+    response.message = (
+        f'CuRobo place planned for {goal_name!r}: '
+        f'move={len(plan.move.points)}pts bookshelf={bookshelf}')
+    return response
 
 
 def _append_preclose_insertion_to_trajectory(trajectory):
