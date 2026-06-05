@@ -156,3 +156,15 @@ def test_translate_pose_x_offsets_only_x():
         [0.82, -0.30, 0.76])
     assert translate_pose_x([0.82, -0.30, 0.76], -0.22) == pytest.approx(
         [0.60, -0.30, 0.76])
+
+
+def test_build_transit_waypoints_does_not_lower_when_above_transit_z():
+    # Post-pick pose already above transit_z: lift/traverse must stay high,
+    # never drive the carried object back down to transit_z.
+    wps = build_transit_waypoints(
+        current_xyz=[0.30, 0.10, 0.95], current_quat_xyzw=[1.0, 0.0, 0.0, 0.0],
+        place_xyz=[0.00, 0.55, 0.70], place_quat_xyzw=[1.0, 0.0, 0.0, 0.0],
+        transit_z=0.80)
+    assert wps[0][0] == [0.30, 0.10, 0.95]   # lift stays at current (higher) z
+    assert wps[1][0] == [0.00, 0.55, 0.95]   # traverse at the same safe height
+    assert wps[2][0] == [0.00, 0.55, 0.70]   # descend to the drop pose

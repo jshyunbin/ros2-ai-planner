@@ -514,7 +514,7 @@ class CuRobo:
         if not _result_success(result):
             status = getattr(result, 'status', 'unknown')
             self._logger.warn(
-                f'CuRobo.plan_pick: {name} planning failed (status={status}).')
+                f'CuRobo: {name} planning failed (status={status}).')
             return None
         return interp_traj_to_ros(
             result.get_interpolated_plan(),

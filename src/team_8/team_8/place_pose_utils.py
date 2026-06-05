@@ -107,11 +107,15 @@ def build_transit_waypoints(current_xyz, current_quat_xyzw,
     2. traverse to above the place xy at ``transit_z`` (place orientation)
     3. descend to the full place pose
 
+    The lift height is ``max(current_z, transit_z)`` so the carried object is
+    never driven *down* when the post-pick pose already sits above ``transit_z``.
+
     Returns a list of ``(xyz, quat_xyzw)`` tuples (plain Python lists).
     """
-    lift = ([float(current_xyz[0]), float(current_xyz[1]), float(transit_z)],
+    lift_z = max(float(current_xyz[2]), float(transit_z))
+    lift = ([float(current_xyz[0]), float(current_xyz[1]), lift_z],
             [float(q) for q in current_quat_xyzw])
-    traverse = ([float(place_xyz[0]), float(place_xyz[1]), float(transit_z)],
+    traverse = ([float(place_xyz[0]), float(place_xyz[1]), lift_z],
                 [float(q) for q in place_quat_xyzw])
     descend = ([float(v) for v in place_xyz],
                [float(q) for q in place_quat_xyzw])
