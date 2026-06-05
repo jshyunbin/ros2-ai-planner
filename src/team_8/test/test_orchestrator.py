@@ -804,3 +804,24 @@ def test_route_unknown_goal_fails_cleanly():
                                MagicMock(), PlanTrajectory.Response())
     assert resp.success is False
     curobo.plan_place.assert_not_called()
+
+
+def test_route_place_pauses_mapping_but_home_does_not():
+    from riro_srvs.srv import PlanTrajectory
+    from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+    from team_8.curobo_service import route_place_or_home
+    from team_8.curobo import PlacePlan
+    # Place: mapping is paused so the carried object doesn't fuse into the world.
+    curobo = MagicMock()
+    move = JointTrajectory(); move.points = [JointTrajectoryPoint()]
+    curobo.plan_place.return_value = PlacePlan(move=move)
+    route_place_or_home(curobo, _place_data(), "storage_1",
+                        MagicMock(), PlanTrajectory.Response())
+    curobo.pause_mapping.assert_called_once()
+    # Home: mapping stays live for collision-aware planning.
+    curobo_home = MagicMock()
+    htraj = JointTrajectory(); htraj.points = [JointTrajectoryPoint()]
+    curobo_home.plan_trajectory.return_value = htraj
+    route_place_or_home(curobo_home, _place_data(), "home",
+                        MagicMock(), PlanTrajectory.Response())
+    curobo_home.pause_mapping.assert_not_called()

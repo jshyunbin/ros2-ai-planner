@@ -427,6 +427,21 @@ def route_place_or_home(curobo, place_poses, goal_name, joint_state, response):
         response.insert_trajectory = plan.insert
     if plan.retract is not None:
         response.retract_trajectory = plan.retract
+
+    # Pause TSDF mapping while the object is carried through the place, so the
+    # carried object doesn't fuse into the collision world (home, planned after
+    # release, deliberately keeps mapping live for collision-aware planning).
+    pause_sec = (
+        _trajectory_duration_sec(plan.move)
+        + _trajectory_duration_sec(plan.insert)
+        + _trajectory_duration_sec(plan.retract)
+        + _env_float('PIPELINE_GRASP_MAPPING_PAUSE_EXTRA_SEC', 2.0)
+    )
+    try:
+        curobo.pause_mapping(pause_sec)
+    except Exception:
+        pass
+
     response.success = True
     response.message = (
         f'CuRobo place planned for {goal_name!r}: '
