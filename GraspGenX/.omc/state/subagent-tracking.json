@@ -1,0 +1,22 @@
+{
+  "agents": [
+    {
+      "agent_id": "a0d56770086df4260",
+      "agent_type": "w-docker",
+      "started_at": "2026-06-03T23:47:14.049Z",
+      "parent_mode": "none",
+      "status": "running"
+    },
+    {
+      "agent_id": "ab24984da6cfaeec0",
+      "agent_type": "w-adapter",
+      "started_at": "2026-06-03T23:47:36.699Z",
+      "parent_mode": "none",
+      "status": "running"
+    }
+  ],
+  "total_spawned": 2,
+  "total_completed": 0,
+  "total_failed": 0,
+  "last_updated": "2026-06-03T23:47:36.800Z"
+}

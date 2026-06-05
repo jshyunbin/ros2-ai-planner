@@ -1,0 +1,63 @@
+{
+  "updatedAt": "2026-06-03T23:47:36.699Z",
+  "missions": [
+    {
+      "id": "session:3ca0c516-d425-468b-8793-cc00f549a2f7:none",
+      "source": "session",
+      "name": "none",
+      "objective": "Session mission",
+      "createdAt": "2026-06-03T23:47:14.049Z",
+      "updatedAt": "2026-06-03T23:47:36.699Z",
+      "status": "running",
+      "workerCount": 2,
+      "taskCounts": {
+        "total": 2,
+        "pending": 0,
+        "blocked": 0,
+        "inProgress": 2,
+        "completed": 0,
+        "failed": 0
+      },
+      "agents": [
+        {
+          "name": "w-docker:a0d5677",
+          "role": "w-docker",
+          "ownership": "a0d56770086df4260",
+          "status": "running",
+          "currentStep": null,
+          "latestUpdate": null,
+          "completedSummary": null,
+          "updatedAt": "2026-06-03T23:47:14.049Z"
+        },
+        {
+          "name": "w-adapter:ab24984",
+          "role": "w-adapter",
+          "ownership": "ab24984da6cfaeec0",
+          "status": "running",
+          "currentStep": null,
+          "latestUpdate": null,
+          "completedSummary": null,
+          "updatedAt": "2026-06-03T23:47:36.699Z"
+        }
+      ],
+      "timeline": [
+        {
+          "id": "session-start:a0d56770086df4260:2026-06-03T23:47:14.049Z",
+          "at": "2026-06-03T23:47:14.049Z",
+          "kind": "update",
+          "agent": "w-docker:a0d5677",
+          "detail": "started w-docker:a0d5677",
+          "sourceKey": "session-start:a0d56770086df4260"
+        },
+        {
+          "id": "session-start:ab24984da6cfaeec0:2026-06-03T23:47:36.699Z",
+          "at": "2026-06-03T23:47:36.699Z",
+          "kind": "update",
+          "agent": "w-adapter:ab24984",
+          "detail": "started w-adapter:ab24984",
+          "sourceKey": "session-start:ab24984da6cfaeec0"
+        }
+      ]
+    }
+  ]
+}
