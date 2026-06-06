@@ -23,11 +23,14 @@ import traceback
 import numpy as np
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSDurabilityPolicy, QoSProfile
 from scipy.spatial.transform import Rotation as R
 from sensor_msgs.msg import JointState
+from std_msgs.msg import Bool
 
 from team_8.curobo import (
     BASE_FRAME,
+    MIN_FRAMES,
     CuRobo,
     concat_trajectories,
 )
@@ -47,6 +50,9 @@ from riro_srvs.srv import PlanTrajectory
 # rather than ROS timers, so a long blocking plan_trajectory call on the
 # single-threaded executor can't starve them. Republishing cached numpy is cheap.
 _VIZ_PUBLISH_HZ = 5.0
+
+# Latched topic the orchestrator waits on before issuing the first plan.
+READY_TOPIC = '/curobo/ready'
 
 
 class CuRoboService(Node):
@@ -104,6 +110,17 @@ class CuRoboService(Node):
             f'curobo_service advertised {service_name}; '
             'initialising CuRobo in background.'
         )
+
+        # Latched readiness signal: published once, when init has finished AND
+        # the TSDF has at least MIN_FRAMES. Clients (the orchestrator) wait for
+        # this before issuing the first plan, so they don't park the single
+        # executor thread before the depth callbacks have built the map. The
+        # condition is monotonic, so this is a one-shot at startup.
+        self._ready_published = False
+        ready_qos = QoSProfile(
+            depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+        self._ready_pub = self.create_publisher(Bool, READY_TOPIC, ready_qos)
+        self._ready_timer = self.create_timer(0.5, self._check_ready)
 
         self._tsdf_pub = None
         self._overhead_pub = None
@@ -236,6 +253,29 @@ class CuRoboService(Node):
             self.get_clock().now().to_msg(),
         )
         self._overhead_pub.publish(cloud)
+
+    # ── readiness signal ──────────────────────────────────────────────────────
+
+    def _check_ready(self) -> None:
+        """Publish the latched /curobo/ready=true once init is done AND the TSDF
+        has >= MIN_FRAMES. One-shot: the condition only ever becomes true.
+
+        Uses the base MIN_FRAMES (not PIPELINE_CUROBO_MIN_PLANNING_FRAMES, which
+        can be raised arbitrarily to force free-collision planning): we only need
+        the map to be non-empty so the first home plan isn't planned cold.
+        """
+        if self._ready_published:
+            return
+        with self._init_cv:
+            curobo = self._curobo
+            done = self._init_done
+        if not done or curobo is None or curobo.frame_count < MIN_FRAMES:
+            return
+        self._ready_pub.publish(Bool(data=True))
+        self._ready_published = True
+        self._ready_timer.cancel()
+        self.get_logger().info(
+            f'{READY_TOPIC} published (init done, {curobo.frame_count} TSDF frames).')
 
     # ── init gating ───────────────────────────────────────────────────────────
 

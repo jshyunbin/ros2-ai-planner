@@ -2,6 +2,8 @@ import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 
 # --- CuRobo ---
 
@@ -935,6 +937,9 @@ def test_orchestrator_home_before_capture_homes_before_opening_gripper():
     orch._enable_motion_execution = True
     orch._curobo_client = MagicMock()
     orch._latest_joints = MagicMock()
+    orch._curobo_ready_event = threading.Event()
+    orch._curobo_ready_event.set()  # cuRobo already ready: no wait
+    orch._curobo_ready_wait_sec = 1.0
     # Record call order: the home move (which blocks on the cuRobo service until
     # the planner has initialised) must run BEFORE the gripper command, so the
     # gripper action isn't issued while the controllers are still coming up and
@@ -951,6 +956,36 @@ def test_orchestrator_home_before_capture_homes_before_opening_gripper():
 
     assert calls == [('home', None), ('grip', False)]
     assert stamp == 999
+
+
+def test_orchestrator_home_before_capture_raises_if_curobo_never_ready():
+    orch = _orchestrator_skeleton()
+    orch._enable_motion_execution = True
+    orch._curobo_client = MagicMock()
+    orch._latest_joints = MagicMock()
+    orch._curobo_ready_event = threading.Event()  # never set
+    orch._curobo_ready_wait_sec = 0.05
+    orch._plan_and_execute_home = MagicMock()
+    orch._send_gripper = MagicMock()
+
+    with pytest.raises(RuntimeError, match='/curobo/ready'):
+        orch._home_before_capture()
+
+    # Never moves the arm or touches the gripper if cuRobo isn't ready.
+    orch._plan_and_execute_home.assert_not_called()
+    orch._send_gripper.assert_not_called()
+
+
+def test_orchestrator_on_curobo_ready_sets_event():
+    from types import SimpleNamespace
+    orch = _orchestrator_skeleton()
+    orch._curobo_ready_event = threading.Event()
+
+    orch._on_curobo_ready(SimpleNamespace(data=False))
+    assert not orch._curobo_ready_event.is_set()
+
+    orch._on_curobo_ready(SimpleNamespace(data=True))
+    assert orch._curobo_ready_event.is_set()
 
 
 def test_orchestrator_home_before_capture_skips_when_motion_disabled():
@@ -1014,3 +1049,55 @@ def test_orchestrator_run_pipeline_aborts_when_home_fails():
 
     orch._segmentation_client.call_async.assert_not_called()
     orch._reset_pipeline_state.assert_called_once()
+
+
+# --- curobo_service /curobo/ready readiness signal ---
+
+def _ready_service_skeleton(init_done, frame_count):
+    """A CuRoboService with only the readiness state _check_ready touches."""
+    from team_8.curobo_service import CuRoboService
+    svc = CuRoboService.__new__(CuRoboService)
+    svc.get_logger = lambda: MagicMock()
+    svc._init_cv = threading.Condition()
+    svc._init_done = init_done
+    svc._curobo = None if frame_count is None else MagicMock(frame_count=frame_count)
+    svc._ready_published = False
+    svc._ready_pub = MagicMock()
+    svc._ready_timer = MagicMock()
+    return svc
+
+
+def test_curobo_service_check_ready_publishes_when_init_done_and_map_ready():
+    from team_8.curobo import MIN_FRAMES
+    svc = _ready_service_skeleton(init_done=True, frame_count=MIN_FRAMES)
+
+    svc._check_ready()
+
+    svc._ready_pub.publish.assert_called_once()
+    published = svc._ready_pub.publish.call_args.args[0]
+    assert published.data is True
+    assert svc._ready_published is True
+    svc._ready_timer.cancel.assert_called_once()
+
+
+def test_curobo_service_check_ready_waits_for_init():
+    svc = _ready_service_skeleton(init_done=False, frame_count=None)
+    svc._check_ready()
+    svc._ready_pub.publish.assert_not_called()
+    assert svc._ready_published is False
+
+
+def test_curobo_service_check_ready_waits_for_map_frames():
+    from team_8.curobo import MIN_FRAMES
+    svc = _ready_service_skeleton(init_done=True, frame_count=MIN_FRAMES - 1)
+    svc._check_ready()
+    svc._ready_pub.publish.assert_not_called()
+    assert svc._ready_published is False
+
+
+def test_curobo_service_check_ready_is_one_shot():
+    from team_8.curobo import MIN_FRAMES
+    svc = _ready_service_skeleton(init_done=True, frame_count=MIN_FRAMES)
+    svc._ready_published = True  # already fired
+    svc._check_ready()
+    svc._ready_pub.publish.assert_not_called()

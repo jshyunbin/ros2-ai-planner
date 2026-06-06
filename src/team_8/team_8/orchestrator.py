@@ -18,8 +18,10 @@ try:  # pragma: no cover - runtime dependency
     from rclpy.action import ActionClient
     from rclpy.node import Node
     from rclpy.executors import MultiThreadedExecutor
+    from rclpy.callback_groups import ReentrantCallbackGroup
+    from rclpy.qos import QoSDurabilityPolicy, QoSProfile
     from sensor_msgs.msg import JointState
-    from std_msgs.msg import String
+    from std_msgs.msg import Bool, String
     from control_msgs.action import FollowJointTrajectory
     from geometry_msgs.msg import Pose
     from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
@@ -35,6 +37,8 @@ except ImportError:  # pragma: no cover - import-only test fallback
     JointTrajectoryPoint = None
     RosDuration = None
     MultiThreadedExecutor = None
+    ReentrantCallbackGroup = None
+    Bool = None
 
     class Node:  # type: ignore[override]
         pass
@@ -65,6 +69,7 @@ class PipelineOrchestrator(Node):
 
     TASK_COMMANDS_TOPIC = '/task_commands'
     JOINT_STATES_TOPIC = '/joint_states'
+    CUROBO_READY_TOPIC = '/curobo/ready'
 
     def __init__(self):
         if rclpy is None:
@@ -82,6 +87,9 @@ class PipelineOrchestrator(Node):
         self.declare_parameter('graspgen_service_wait_sec', 10.0)
         self.declare_parameter('curobo_service_name', '/curobo/plan_trajectory')
         self.declare_parameter('curobo_service_wait_sec', 30.0)
+        # Generous: covers CuRobo's background init (~tens of seconds) plus a
+        # moment for the TSDF to fill. Only ever waited on the first cycle.
+        self.declare_parameter('curobo_ready_wait_sec', 180.0)
         self.declare_parameter('enable_motion_execution', False)
         self.declare_parameter('arm_action_name',
                                '/ur5_controller/follow_joint_trajectory')
@@ -106,11 +114,25 @@ class PipelineOrchestrator(Node):
             self.get_parameter('curobo_service_wait_sec').value)
         self._enable_motion_execution = _as_bool(
             self.get_parameter('enable_motion_execution').value)
+        self._curobo_ready_wait_sec = float(
+            self.get_parameter('curobo_ready_wait_sec').value)
 
         self._task_sub = self.create_subscription(
             String, self.TASK_COMMANDS_TOPIC, self.task_command_callback, 10)
         self._joint_sub = self.create_subscription(
             JointState, self.JOINT_STATES_TOPIC, self._cache_joints, 10)
+
+        # Latched readiness from curobo_service: set once the planner has
+        # initialised AND the TSDF map has frames. The orchestrator waits for
+        # this before the first home move so it doesn't park the curobo executor
+        # before the map is built (see _home_before_capture). A reentrant group
+        # lets this callback fire while a task callback is blocked waiting on it.
+        self._curobo_ready_event = threading.Event()
+        ready_qos = QoSProfile(
+            depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+        self._curobo_ready_sub = self.create_subscription(
+            Bool, self.CUROBO_READY_TOPIC, self._on_curobo_ready, ready_qos,
+            callback_group=ReentrantCallbackGroup())
         self._segmentation_client = self.create_client(
             StringString, self._segmentation_service_name)
         self._graspgen_client = self.create_client(
@@ -163,6 +185,12 @@ class PipelineOrchestrator(Node):
 
     def _cache_joints(self, msg) -> None:
         self._latest_joints = msg
+
+    def _on_curobo_ready(self, msg) -> None:
+        if getattr(msg, 'data', False):
+            if not self._curobo_ready_event.is_set():
+                self.get_logger().info('cuRobo reported ready.')
+            self._curobo_ready_event.set()
 
     # ── pipeline entry ────────────────────────────────────────────────────────
 
@@ -416,13 +444,23 @@ class PipelineOrchestrator(Node):
                 'No /joint_states yet; skipping initial home move and '
                 'frame freshness gate.')
             return 0
-        # Plan + execute the home move first. _plan_and_execute_home blocks on the
-        # cuRobo service until the planner finishes its (tens-of-seconds) startup
-        # init, and only then executes an arm trajectory — which proves the
-        # controllers are live. Issuing the gripper command before that, on the
-        # first task command, sends the action goal while the gripper controller
-        # isn't accepting goals yet, and the goal response never arrives (60s
-        # timeout). Open the gripper only after the home move has gated on cuRobo.
+        # Wait for cuRobo to report ready (init done + TSDF populated) before
+        # issuing any motion. The curobo executor is single-threaded and builds
+        # the TSDF on that same thread, so sending a plan before it's ready would
+        # park the thread and starve the map (planning home cold against an empty
+        # world). This only blocks on the first cycle; the signal is latched, so
+        # later cycles return immediately. It also keeps the gripper/arm goals
+        # below from being issued before the controllers are accepting them.
+        if not self._curobo_ready_event.is_set():
+            self.get_logger().info(
+                'Waiting for cuRobo to report ready before the first home move '
+                f'(up to {self._curobo_ready_wait_sec:.0f}s)...')
+            if not self._curobo_ready_event.wait(self._curobo_ready_wait_sec):
+                raise RuntimeError(
+                    f'cuRobo did not report ready on {self.CUROBO_READY_TOPIC} '
+                    f'within {self._curobo_ready_wait_sec:.0f}s.')
+        # Plan + execute the home move, then open the gripper (controllers are
+        # live by now). _plan_and_execute_home runs the collision-aware return.
         self._plan_and_execute_home()
         # Open the gripper for the upcoming grasp. In every normal/failure path the
         # gripper is already open by here, so this is idempotent insurance.
