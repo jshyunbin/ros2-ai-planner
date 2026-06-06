@@ -618,6 +618,31 @@ class SegmentationService(Node):
             json.dump({"prompt": prompt, "response": failure_payload}, handle, indent=2)
 
     @staticmethod
+    def _parse_request(data) -> tuple[str, int]:
+        """Parse a segmentation request into (prompt, min_stamp_ns).
+
+        The request `data` is normally a JSON object
+        ``{"prompt": "...", "min_stamp_ns": <int>}``. For back-compat, a value
+        that does not parse as a JSON *dict* (e.g. a bare prompt string sent by
+        standalone callers) is treated as the prompt with no freshness gate.
+        """
+        text = (data or "").strip()
+        if not text:
+            return "", 0
+        try:
+            payload = json.loads(text)
+        except (TypeError, ValueError):
+            return text, 0
+        if not isinstance(payload, dict):
+            return text, 0
+        prompt = str(payload.get("prompt", "")).strip()
+        try:
+            min_stamp_ns = int(payload.get("min_stamp_ns", 0) or 0)
+        except (TypeError, ValueError):
+            min_stamp_ns = 0
+        return prompt, min_stamp_ns
+
+    @staticmethod
     def _stamp_to_ns(stamp) -> int:
         return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
 
