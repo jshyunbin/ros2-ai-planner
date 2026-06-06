@@ -935,15 +935,19 @@ def test_orchestrator_home_before_capture_moves_home_and_returns_clock():
     orch._enable_motion_execution = True
     orch._curobo_client = MagicMock()
     orch._latest_joints = MagicMock()
-    orch._send_gripper = MagicMock()
-    orch._plan_and_execute_home = MagicMock()
+    # Record call order: the gripper must open BEFORE the home move, so a closed
+    # gripper carrying nothing can't drag a previously-placed object on the way home.
+    calls = []
+    orch._send_gripper = MagicMock(
+        side_effect=lambda closed: calls.append(('grip', closed)))
+    orch._plan_and_execute_home = MagicMock(
+        side_effect=lambda: calls.append(('home', None)))
     orch.get_clock = MagicMock(
         return_value=MagicMock(now=lambda: MagicMock(nanoseconds=999)))
 
     stamp = orch._home_before_capture()
 
-    orch._send_gripper.assert_called_once_with(closed=False)
-    orch._plan_and_execute_home.assert_called_once_with()
+    assert calls == [('grip', False), ('home', None)]
     assert stamp == 999
 
 
