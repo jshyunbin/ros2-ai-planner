@@ -44,3 +44,11 @@ def test_parse_request_non_dict_json_is_prompt_without_gate():
     prompt, min_stamp_ns = SegmentationService._parse_request("123")
     assert prompt == "123"
     assert min_stamp_ns == 0
+
+
+def test_parse_request_invalid_stamp_falls_back_to_no_gate():
+    # A corrupt min_stamp_ns must disable the gate (return 0), not crash.
+    prompt, min_stamp_ns = SegmentationService._parse_request(
+        '{"prompt": "pick the mug", "min_stamp_ns": "abc"}')
+    assert prompt == "pick the mug"
+    assert min_stamp_ns == 0

@@ -618,7 +618,7 @@ class SegmentationService(Node):
             json.dump({"prompt": prompt, "response": failure_payload}, handle, indent=2)
 
     @staticmethod
-    def _parse_request(data) -> tuple[str, int]:
+    def _parse_request(data: "str | None") -> tuple[str, int]:
         """Parse a segmentation request into (prompt, min_stamp_ns).
 
         The request `data` is normally a JSON object
