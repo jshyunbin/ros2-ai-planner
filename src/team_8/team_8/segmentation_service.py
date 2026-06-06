@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import threading
 import time
 
 import cv2
@@ -14,7 +15,7 @@ from rclpy.time import Time
 from sensor_msgs.msg import CameraInfo, Image, PointCloud2
 from tf2_ros import Buffer, TransformException, TransformListener
 
-from team_8.pipeline_utils import make_xyz_cloud
+from team_8.pipeline_utils import env_float, make_xyz_cloud
 from team_8.segmentation_utils import (
     build_overlay_image,
     compute_centroid,
@@ -116,6 +117,12 @@ class SegmentationService(Node):
         self.declare_parameter("depth_unit_scale", 0.001)
         self.declare_parameter("debug_dir", "/artifacts/segmentation_service")
         self._bridge = CvBridge()
+        # _frame_cv guards the latest RGB/depth stamps and is notified whenever a
+        # new frame arrives, so a service handler blocked in _wait_for_fresh_frames
+        # wakes as soon as a post-home frame lands.
+        self._frame_cv = threading.Condition()
+        self._fresh_frame_timeout_sec = env_float(
+            "PIPELINE_SEG_FRESH_FRAME_TIMEOUT_SEC", 5.0)
         self._latest_rgb = None
         self._latest_rgb_stamp_ns = 0
         self._latest_depth = None
@@ -193,8 +200,12 @@ class SegmentationService(Node):
         )
 
     def _rgb_callback(self, msg: Image) -> None:
-        self._latest_rgb = self._bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
-        self._latest_rgb_stamp_ns = self._stamp_to_ns(msg.header.stamp)
+        rgb = self._bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+        stamp_ns = self._stamp_to_ns(msg.header.stamp)
+        with self._frame_cv:
+            self._latest_rgb = rgb
+            self._latest_rgb_stamp_ns = stamp_ns
+            self._frame_cv.notify_all()
         if not self._logged_first_rgb:
             self.get_logger().info(
                 f"Received first RGB frame {msg.width}x{msg.height} on "
@@ -209,14 +220,19 @@ class SegmentationService(Node):
         else:
             depth = self._bridge.imgmsg_to_cv2(msg, desired_encoding="32FC1").astype(np.float32)
 
-        self._latest_depth = depth
-        self._latest_depth_stamp = msg.header.stamp
-        self._latest_depth_stamp_ns = self._stamp_to_ns(msg.header.stamp)
-        self._latest_frame_id = msg.header.frame_id
+        stamp = msg.header.stamp
+        stamp_ns = self._stamp_to_ns(stamp)
+        frame_id = msg.header.frame_id
+        with self._frame_cv:
+            self._latest_depth = depth
+            self._latest_depth_stamp = stamp
+            self._latest_depth_stamp_ns = stamp_ns
+            self._latest_frame_id = frame_id
+            self._frame_cv.notify_all()
         if not self._logged_first_depth:
             self.get_logger().info(
                 f"Received first depth frame {msg.width}x{msg.height} "
-                f"frame={msg.header.frame_id} on {self.get_parameter('depth_topic').value}"
+                f"frame={frame_id} on {self.get_parameter('depth_topic').value}"
             )
             self._logged_first_depth = True
 
@@ -616,6 +632,23 @@ class SegmentationService(Node):
             np.save(debug_path / "depth_m.npy", np.asarray(depth_image, dtype=np.float32))
         with open(debug_path / "failure.json", "w", encoding="utf-8") as handle:
             json.dump({"prompt": prompt, "response": failure_payload}, handle, indent=2)
+
+    def _wait_for_fresh_frames(self, min_stamp_ns: int) -> bool:
+        """Block until both the RGB and depth caches hold a frame stamped after
+        *min_stamp_ns*, or until PIPELINE_SEG_FRESH_FRAME_TIMEOUT_SEC elapses.
+
+        Used to guarantee segmentation runs on a frame captured *after* the arm
+        settled at home, not a stale mid-transit frame.
+        """
+        deadline = time.monotonic() + self._fresh_frame_timeout_sec
+        with self._frame_cv:
+            while (self._latest_rgb_stamp_ns <= min_stamp_ns
+                   or self._latest_depth_stamp_ns <= min_stamp_ns):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    return False
+                self._frame_cv.wait(timeout=remaining)
+            return True
 
     @staticmethod
     def _parse_request(data: "str | None") -> tuple[str, int]:

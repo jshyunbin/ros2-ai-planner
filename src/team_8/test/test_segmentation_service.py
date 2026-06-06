@@ -52,3 +52,45 @@ def test_parse_request_invalid_stamp_falls_back_to_no_gate():
         '{"prompt": "pick the mug", "min_stamp_ns": "abc"}')
     assert prompt == "pick the mug"
     assert min_stamp_ns == 0
+
+
+def _service_skeleton():
+    """A SegmentationService with only the freshness-gate state the unit tests
+    need (mirrors the GraspGen test skeleton; __init__ builds real ROS handles
+    and warms up Gemini/SAM2, so build a bare instance via __new__)."""
+    svc = SegmentationService.__new__(SegmentationService)
+    svc._frame_cv = threading.Condition()
+    svc._latest_rgb_stamp_ns = 0
+    svc._latest_depth_stamp_ns = 0
+    svc._fresh_frame_timeout_sec = 0.2
+    return svc
+
+
+def test_wait_for_fresh_frames_times_out_when_stale():
+    svc = _service_skeleton()
+    # Both stamps are at/under the gate -> never satisfied -> timeout.
+    svc._latest_rgb_stamp_ns = 100
+    svc._latest_depth_stamp_ns = 100
+    assert svc._wait_for_fresh_frames(100) is False
+
+
+def test_wait_for_fresh_frames_returns_when_both_fresh():
+    svc = _service_skeleton()
+    svc._latest_rgb_stamp_ns = 101
+    svc._latest_depth_stamp_ns = 101
+    assert svc._wait_for_fresh_frames(100) is True
+
+
+def test_wait_for_fresh_frames_waits_for_lagging_depth():
+    svc = _service_skeleton()
+    svc._fresh_frame_timeout_sec = 2.0
+    svc._latest_rgb_stamp_ns = 101  # rgb already fresh
+    svc._latest_depth_stamp_ns = 50  # depth still stale
+
+    def _deliver_depth():
+        with svc._frame_cv:
+            svc._latest_depth_stamp_ns = 101
+            svc._frame_cv.notify_all()
+
+    threading.Timer(0.05, _deliver_depth).start()
+    assert svc._wait_for_fresh_frames(100) is True
