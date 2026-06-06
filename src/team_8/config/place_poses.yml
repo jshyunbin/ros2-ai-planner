@@ -6,15 +6,21 @@
 #   quat_xyzw [1, 0, 0, 0]         -> tool0 +z points down (top-down drops / home)
 #   quat_xyzw [0.5, 0.5, 0.5, 0.5] -> tool0 +z points +x (into the bookshelf)
 #
-# VALUES BELOW ARE DUMMY PLACEHOLDERS. Real poses are provided separately.
+# Real poses. home is the tool0 FK of the home joint configuration
+#   [pan, lift, elbow, w1, w2, w3] = [-1.332, -2.402, 1.538, -0.863, -1.114, -1.292]
+# (computed with the planner's own cuRobo kinematics). storage_1/storage_2 are
+# the basket drop points (storageA_1 / storageB_1) with a top-down orientation.
 
-transit_z: 0.80          # safe height for carrying an object laterally
+# Lateral carry height. Capped by UR5 reach: at storage_1's xy radius (~0.65 m)
+# cuRobo IK reaches up to z~0.60; 0.80 was unreachable and broke the lift leg.
+transit_z: 0.55          # safe height for carrying an object laterally
 
-home:      {xyz: [0.55, 0.07, 0.90], quat_xyzw: [1.0, 0.0, 0.0, 0.0]}
-storage_1: {xyz: [0.0,  0.55, 0.70], quat_xyzw: [1.0, 0.0, 0.0, 0.0]}
-storage_2: {xyz: [0.0, -0.55, 0.70], quat_xyzw: [1.0, 0.0, 0.0, 0.0]}
+home:      {xyz: [0.152144, -0.010048, 0.615651], quat_xyzw: [-0.685513, 0.687999, -0.179150, 0.156950]}
+storage_1: {xyz: [0.068869,  0.649168, 0.370337], quat_xyzw: [1.0, 0.0, 0.0, 0.0]}
+storage_2: {xyz: [0.068870, -0.430833, 0.370327], quat_xyzw: [1.0, 0.0, 0.0, 0.0]}
 
-bookshelf:
-  pre_insert:      {xyz: [0.60, -0.30, 0.76], quat_xyzw: [0.5, 0.5, 0.5, 0.5]}
-  insert_depth_m:  0.22
-  retract_depth_m: 0.22
+# bookshelf/shelf pose not yet provided — add when available, e.g.:
+# bookshelf:
+#   pre_insert:      {xyz: [..., ..., ...], quat_xyzw: [0.5, 0.5, 0.5, 0.5]}
+#   insert_depth_m:  0.22
+#   retract_depth_m: 0.22
