@@ -9,6 +9,8 @@ import numpy as np
 import rclpy
 from cv_bridge import CvBridge
 from PIL import Image as PILImage
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
@@ -161,20 +163,27 @@ class SegmentationService(Node):
         cloud_qos = QoSProfile(depth=10)
         cloud_qos.reliability = ReliabilityPolicy.RELIABLE
 
+        # Camera callbacks share a reentrant group so they can keep updating the
+        # latest frames while a service handler blocks in _wait_for_fresh_frames
+        # (the node is spun with a MultiThreadedExecutor in main()).
+        camera_group = ReentrantCallbackGroup()
         self.create_subscription(
-            Image, str(self.get_parameter("rgb_topic").value), self._rgb_callback, qos
+            Image, str(self.get_parameter("rgb_topic").value), self._rgb_callback, qos,
+            callback_group=camera_group,
         )
         self.create_subscription(
             Image,
             str(self.get_parameter("depth_topic").value),
             self._depth_callback,
             qos,
+            callback_group=camera_group,
         )
         self.create_subscription(
             CameraInfo,
             str(self.get_parameter("camera_info_topic").value),
             self._camera_info_callback,
             qos,
+            callback_group=camera_group,
         )
 
         self._segmented_pub = self.create_publisher(
@@ -264,15 +273,39 @@ class SegmentationService(Node):
         )
 
     def _handle_request(self, request: StringString.Request, response: StringString.Response):
-        prompt = request.data.strip()
+        prompt, min_stamp_ns = self._parse_request(request.data)
         if not prompt:
             prompt = "Pick the requested object."
 
-        if self._latest_rgb is None or self._latest_depth is None:
+        # When the orchestrator passes a freshness gate (the home-arrival time),
+        # wait for a wrist frame captured after the arm settled at home so we
+        # never segment a stale mid-transit frame.
+        if min_stamp_ns > 0 and not self._wait_for_fresh_frames(min_stamp_ns):
+            response.data = json.dumps({
+                "success": False,
+                "error": (
+                    f"Timed out waiting for wrist frames newer than {min_stamp_ns} ns "
+                    f"(waited {self._fresh_frame_timeout_sec:.1f}s)."
+                ),
+            })
+            return response
+
+        # Snapshot the latest frame and its stamps atomically: the camera
+        # callbacks run on another thread (MultiThreadedExecutor + reentrant
+        # group), so reading these fields separately could mix a newer frame's
+        # stamp with an older frame's pixels.
+        with self._frame_cv:
+            rgb_bgr = None if self._latest_rgb is None else self._latest_rgb.copy()
+            depth_image = None if self._latest_depth is None else self._latest_depth.copy()
+            source_frame = self._latest_frame_id
+            cloud_stamp = self._latest_depth_stamp
+            cloud_stamp_ns = int(self._latest_depth_stamp_ns)
+
+        if rgb_bgr is None or depth_image is None:
             missing = []
-            if self._latest_rgb is None:
+            if rgb_bgr is None:
                 missing.append("rgb")
-            if self._latest_depth is None:
+            if depth_image is None:
                 missing.append("depth")
             response.data = json.dumps(
                 {
@@ -288,8 +321,6 @@ class SegmentationService(Node):
         debug_path = self._debug_dir / debug_id
         debug_path.mkdir(parents=True, exist_ok=True)
         try:
-            rgb_bgr = self._latest_rgb.copy()
-            depth_image = self._latest_depth.copy()
             fx, fy, cx, cy = self._camera_intrinsics()
 
             api_image_bgr, scale_x, scale_y = resize_for_api(
@@ -322,18 +353,17 @@ class SegmentationService(Node):
                 raise RuntimeError("Masked point cloud is empty after depth filtering.")
 
             output_frame = self._output_frame
-            source_frame = self._latest_frame_id
             object_points = self._transform_points_to_output_frame(
                 object_points,
                 source_frame=source_frame,
                 target_frame=output_frame,
-                stamp=self._latest_depth_stamp,
+                stamp=cloud_stamp,
             )
             background_points = self._transform_points_to_output_frame(
                 background_points,
                 source_frame=source_frame,
                 target_frame=output_frame,
-                stamp=self._latest_depth_stamp,
+                stamp=cloud_stamp,
             )
 
             object_points = stable_downsample(
@@ -352,7 +382,6 @@ class SegmentationService(Node):
             assert roi is not None
             x_min, y_min, x_max, y_max = roi
 
-            cloud_stamp = self._latest_depth_stamp
             self._segmented_pub.publish(
                 make_xyz_cloud(object_points, output_frame, stamp=cloud_stamp))
             if len(background_points) > 0:
@@ -377,7 +406,7 @@ class SegmentationService(Node):
                 "label": prompt_result["label"],
                 "frame_id": output_frame,
                 "source_frame_id": source_frame,
-                "cloud_stamp_ns": int(self._latest_depth_stamp_ns),
+                "cloud_stamp_ns": cloud_stamp_ns,
                 "centroid": [round(float(v), 5) for v in centroid],
                 "roi_xyxy": [x_min, y_min, x_max, y_max],
                 "mask_pixel_count": int(mask.sum()),
@@ -427,8 +456,8 @@ class SegmentationService(Node):
             self._save_failure_debug_artifacts(
                 debug_path,
                 prompt=prompt,
-                rgb_bgr=self._latest_rgb,
-                depth_image=self._latest_depth,
+                rgb_bgr=rgb_bgr,
+                depth_image=depth_image,
                 failure_payload=failure_payload,
             )
             response.data = json.dumps(failure_payload)
@@ -687,8 +716,13 @@ class SegmentationService(Node):
 def main(args=None) -> None:
     rclpy.init(args=args)
     node = SegmentationService()
+    # MultiThreadedExecutor so the service handler can block in
+    # _wait_for_fresh_frames while the camera callbacks (reentrant group) keep
+    # delivering frames on another thread.
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:

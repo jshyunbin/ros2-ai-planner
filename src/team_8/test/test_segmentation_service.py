@@ -98,3 +98,25 @@ def test_wait_for_fresh_frames_waits_for_lagging_depth():
         assert svc._wait_for_fresh_frames(100) is True
     finally:
         timer.join()
+
+
+def test_handle_request_returns_timeout_when_frame_never_fresh():
+    import json
+    svc = _service_skeleton()
+    svc.get_logger = lambda: SimpleNamespace(
+        info=lambda *a, **k: None, warn=lambda *a, **k: None,
+        error=lambda *a, **k: None)
+    # Frames exist, but the freshness gate is never satisfied.
+    svc._latest_rgb = object()
+    svc._latest_depth = object()
+    svc._wait_for_fresh_frames = lambda min_stamp_ns: False
+
+    request = SimpleNamespace(
+        data='{"prompt": "pick the mug", "min_stamp_ns": 999}')
+    response = SimpleNamespace(data=None)
+
+    result = svc._handle_request(request, response)
+
+    payload = json.loads(result.data)
+    assert payload["success"] is False
+    assert "999" in payload["error"]
