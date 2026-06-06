@@ -562,7 +562,24 @@ class CuRobo:
                     'CuRobo.plan_trajectory retrying with relaxed collision '
                     'world; TSDF blocked the pose trajectory.')
             _reset_planner_seed(self._planner)
-            result = self._planner.plan_pose(goal, current)
+            # Single-goal plan_pose engages the PRM graph-seed fallback from the
+            # first failed trajopt attempt (enable_graph_attempt=1). Against a
+            # dense TSDF that graph search is slow AND silent (no per-iteration
+            # logs) and was never warmed up — it was the startup-home "hang".
+            # Disable graph seeding (large enable_graph_attempt) so a collision-
+            # aware attempt trajopt can't solve fails fast and we fall through to
+            # the 'relaxed' (collision-off) retry below, exactly like the end-of-
+            # cycle home that always worked. Re-enable via env if ever needed.
+            graph_attempt = 1 if _env_bool(
+                'PIPELINE_CUROBO_TRAJ_ENABLE_GRAPH', False) else 1_000_000
+            t_plan = time.perf_counter()
+            result = self._planner.plan_pose(
+                goal, current, enable_graph_attempt=graph_attempt)
+            self._logger.info(
+                f'CuRobo.plan_trajectory: plan_pose(world={world_mode}, '
+                f'graph_attempt={graph_attempt}) took '
+                f'{time.perf_counter() - t_plan:.2f}s '
+                f'(success={_result_success(result)}).')
             if _result_success(result):
                 if world_mode == 'relaxed':
                     self._logger.info(

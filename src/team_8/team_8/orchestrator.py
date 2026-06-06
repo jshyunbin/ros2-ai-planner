@@ -117,8 +117,20 @@ class PipelineOrchestrator(Node):
         self._curobo_ready_wait_sec = float(
             self.get_parameter('curobo_ready_wait_sec').value)
 
+        # The pipeline runs synchronously inside task_command_callback and blocks
+        # on service/action futures (home plan, place plan, arm/gripper actions).
+        # Those clients MUST live in a callback group the executor can service
+        # while this callback is blocked — otherwise the response can never be
+        # delivered (it's stuck behind the blocked callback in the same
+        # MutuallyExclusiveCallbackGroup) and we deadlock: planning succeeds but
+        # the robot never moves. A shared ReentrantCallbackGroup + the
+        # MultiThreadedExecutor lets those responses resolve on other threads.
+        # (_cache_joints stays in the default group so joints keep updating while
+        # the pipeline blocks.)
+        self._pipeline_cbg = ReentrantCallbackGroup()
         self._task_sub = self.create_subscription(
-            String, self.TASK_COMMANDS_TOPIC, self.task_command_callback, 10)
+            String, self.TASK_COMMANDS_TOPIC, self.task_command_callback, 10,
+            callback_group=self._pipeline_cbg)
         self._joint_sub = self.create_subscription(
             JointState, self.JOINT_STATES_TOPIC, self._cache_joints, 10)
 
@@ -134,9 +146,11 @@ class PipelineOrchestrator(Node):
             Bool, self.CUROBO_READY_TOPIC, self._on_curobo_ready, ready_qos,
             callback_group=ReentrantCallbackGroup())
         self._segmentation_client = self.create_client(
-            StringString, self._segmentation_service_name)
+            StringString, self._segmentation_service_name,
+            callback_group=self._pipeline_cbg)
         self._graspgen_client = self.create_client(
-            StringString, self._graspgen_service_name)
+            StringString, self._graspgen_service_name,
+            callback_group=self._pipeline_cbg)
 
         self._pipeline_busy = False
         self._active_task = ''
@@ -153,16 +167,19 @@ class PipelineOrchestrator(Node):
                     'PlanTrajectory service and ROS2 actions are required '
                     'for motion execution.')
             self._curobo_client = self.create_client(
-                PlanTrajectory, self._curobo_service_name)
+                PlanTrajectory, self._curobo_service_name,
+                callback_group=self._pipeline_cbg)
             self._arm_client = ActionClient(
                 self,
                 FollowJointTrajectory,
                 str(self.get_parameter('arm_action_name').value),
+                callback_group=self._pipeline_cbg,
             )
             self._gripper_client = ActionClient(
                 self,
                 FollowJointTrajectory,
                 str(self.get_parameter('gripper_action_name').value),
+                callback_group=self._pipeline_cbg,
             )
         else:
             self.get_logger().info(
@@ -393,8 +410,13 @@ class PipelineOrchestrator(Node):
     def _call_curobo_blocking(self, request, label):
         """Call the CuRobo plan service and block for the response.
 
-        Safe from inside an action/service done-callback because the node is
-        spun with a MultiThreadedExecutor (see main()).
+        Safe to block from inside the pipeline callback because the node is spun
+        with a MultiThreadedExecutor AND the curobo client lives in a
+        ReentrantCallbackGroup (self._pipeline_cbg) separate from the default
+        group — so the executor can deliver the response on another thread while
+        this callback is blocked. MultiThreadedExecutor alone is NOT enough: if
+        the client shared the blocked callback's MutuallyExclusiveCallbackGroup,
+        the response could never be delivered and this would deadlock.
         """
         if self._curobo_client is None:
             raise RuntimeError(f'{label}: CuRobo service client unavailable.')

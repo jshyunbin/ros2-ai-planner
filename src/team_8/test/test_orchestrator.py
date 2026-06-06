@@ -240,8 +240,8 @@ def test_curobo_trajectory_retries_relaxed_world_after_tsdf_failure(monkeypatch)
         def reset_seed(self):
             pass
 
-        def plan_pose(self, goal, current):
-            self.plan_calls.append((goal, current))
+        def plan_pose(self, goal, current, enable_graph_attempt=1):
+            self.plan_calls.append((goal, current, enable_graph_attempt))
             if len(self.plan_calls) == 2:
                 return SimpleNamespace(
                     success=np.array([True]),
@@ -279,6 +279,10 @@ def test_curobo_trajectory_retries_relaxed_world_after_tsdf_failure(monkeypatch)
 
     assert trajectory == 'ros-traj'
     assert len(fake_planner.plan_calls) == 2
+    # The single-goal trajectory plan must disable the PRM graph-seed fallback
+    # (large enable_graph_attempt) so a TSDF-blocked attempt fails fast and falls
+    # through to the relaxed retry, instead of stalling in a silent graph search.
+    assert all(call[2] >= 1000 for call in fake_planner.plan_calls)
     assert len(fake_planner.world_updates) == 2
     assert any(
         'world=tsdf' in str(call.args[0])
