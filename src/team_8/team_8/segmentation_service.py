@@ -255,6 +255,9 @@ class SegmentationService(Node):
             self._logged_first_camera_info = True
 
     def _camera_intrinsics(self) -> tuple[float, float, float, float]:
+        # Read outside _frame_cv on purpose: intrinsics are quasi-static for a
+        # fixed camera, so a one-message-stale CameraInfo is harmless (and the
+        # reference grab is atomic under CPython). Not part of the frame snapshot.
         info = self._latest_camera_info
         if info is not None:
             return (
