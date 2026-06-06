@@ -191,11 +191,15 @@ class PipelineOrchestrator(Node):
         try:
             min_stamp_ns = self._home_before_capture()
         except Exception as exc:
+            # The arm may be left partway home with the gripper open; that's a
+            # safe idle state, so just clear busy/active and wait for the next task.
             self.get_logger().error(f'Initial home move failed: {exc}')
             self._reset_pipeline_state()
             return
 
         request = StringString.Request()
+        # min_stamp_ns == 0 (motion disabled / no joints yet) tells the
+        # segmentation service to skip the freshness gate and use the latest frame.
         request.data = json.dumps({'prompt': task, 'min_stamp_ns': min_stamp_ns})
         future = self._segmentation_client.call_async(request)
         future.add_done_callback(self._on_segmentation_done)
