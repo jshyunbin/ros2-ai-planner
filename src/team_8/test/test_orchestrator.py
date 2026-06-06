@@ -970,3 +970,45 @@ def test_orchestrator_home_before_capture_skips_without_joints():
 
     assert orch._home_before_capture() == 0
     orch._plan_and_execute_home.assert_not_called()
+
+
+def test_orchestrator_run_pipeline_homes_before_segmenting():
+    import json
+    orch = _orchestrator_skeleton()
+    orch._pipeline_busy = False
+    orch._active_task = ''
+    orch._segmentation_service_name = '/segmentation/segment_prompt'
+    orch._segmentation_service_wait_sec = 0.1
+    calls = []
+    orch._segmentation_client = MagicMock()
+    orch._segmentation_client.wait_for_service.return_value = True
+    orch._segmentation_client.call_async.side_effect = (
+        lambda req: calls.append(('segment', req)) or MagicMock())
+    orch._home_before_capture = MagicMock(
+        side_effect=lambda: calls.append(('home', None)) or 555)
+    orch._on_segmentation_done = MagicMock()
+
+    orch._run_pipeline('pick the mug')
+
+    # Home move happens before segmentation is requested.
+    assert [c[0] for c in calls] == ['home', 'segment']
+    request = calls[1][1]
+    payload = json.loads(request.data)
+    assert payload == {'prompt': 'pick the mug', 'min_stamp_ns': 555}
+
+
+def test_orchestrator_run_pipeline_aborts_when_home_fails():
+    orch = _orchestrator_skeleton()
+    orch._pipeline_busy = False
+    orch._active_task = ''
+    orch._segmentation_service_name = '/segmentation/segment_prompt'
+    orch._segmentation_service_wait_sec = 0.1
+    orch._segmentation_client = MagicMock()
+    orch._segmentation_client.wait_for_service.return_value = True
+    orch._home_before_capture = MagicMock(side_effect=RuntimeError('no plan'))
+    orch._reset_pipeline_state = MagicMock()
+
+    orch._run_pipeline('pick the mug')
+
+    orch._segmentation_client.call_async.assert_not_called()
+    orch._reset_pipeline_state.assert_called_once()

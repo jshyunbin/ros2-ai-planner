@@ -186,11 +186,21 @@ class PipelineOrchestrator(Node):
         self._pipeline_busy = True
         self._active_task = task
 
+        # Move to home first so the wrist camera observes the workspace, then
+        # gate segmentation on a frame captured after the arm settled there.
+        try:
+            min_stamp_ns = self._home_before_capture()
+        except Exception as exc:
+            self.get_logger().error(f'Initial home move failed: {exc}')
+            self._reset_pipeline_state()
+            return
+
         request = StringString.Request()
-        request.data = task
+        request.data = json.dumps({'prompt': task, 'min_stamp_ns': min_stamp_ns})
         future = self._segmentation_client.call_async(request)
         future.add_done_callback(self._on_segmentation_done)
-        self.get_logger().info(f'Started segmentation for task: {task}')
+        self.get_logger().info(
+            f'Started segmentation for task: {task} (min_stamp_ns={min_stamp_ns})')
 
     # ── pipeline callbacks ────────────────────────────────────────────────────
 
