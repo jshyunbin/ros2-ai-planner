@@ -642,6 +642,10 @@ class SegmentationService(Node):
         """
         deadline = time.monotonic() + self._fresh_frame_timeout_sec
         with self._frame_cv:
+            # Strict ">" (loop while "<="): a frame stamped exactly at the gate
+            # could have been captured mid-transit, so require one strictly newer.
+            # (GraspGen's _wait_for_cloud uses ">=" because there the stamp is the
+            # request token; the freshness semantics here are deliberately different.)
             while (self._latest_rgb_stamp_ns <= min_stamp_ns
                    or self._latest_depth_stamp_ns <= min_stamp_ns):
                 remaining = deadline - time.monotonic()

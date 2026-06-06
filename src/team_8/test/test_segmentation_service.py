@@ -92,5 +92,9 @@ def test_wait_for_fresh_frames_waits_for_lagging_depth():
             svc._latest_depth_stamp_ns = 101
             svc._frame_cv.notify_all()
 
-    threading.Timer(0.05, _deliver_depth).start()
-    assert svc._wait_for_fresh_frames(100) is True
+    timer = threading.Timer(0.05, _deliver_depth)
+    timer.start()
+    try:
+        assert svc._wait_for_fresh_frames(100) is True
+    finally:
+        timer.join()
