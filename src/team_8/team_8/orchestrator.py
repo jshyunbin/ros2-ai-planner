@@ -416,10 +416,17 @@ class PipelineOrchestrator(Node):
                 'No /joint_states yet; skipping initial home move and '
                 'frame freshness gate.')
             return 0
-        # Open the gripper: nothing should be carried at the start of a cycle, and
-        # the next grasp assumes open fingers.
-        self._send_gripper(closed=False)
+        # Plan + execute the home move first. _plan_and_execute_home blocks on the
+        # cuRobo service until the planner finishes its (tens-of-seconds) startup
+        # init, and only then executes an arm trajectory — which proves the
+        # controllers are live. Issuing the gripper command before that, on the
+        # first task command, sends the action goal while the gripper controller
+        # isn't accepting goals yet, and the goal response never arrives (60s
+        # timeout). Open the gripper only after the home move has gated on cuRobo.
         self._plan_and_execute_home()
+        # Open the gripper for the upcoming grasp. In every normal/failure path the
+        # gripper is already open by here, so this is idempotent insurance.
+        self._send_gripper(closed=False)
         return self.get_clock().now().nanoseconds
 
     def _plan_and_execute_home(self) -> None:

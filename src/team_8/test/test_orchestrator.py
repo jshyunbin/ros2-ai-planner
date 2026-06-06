@@ -930,13 +930,15 @@ def test_orchestrator_pick_done_runs_place_then_home():
     orch._reset_pipeline_state.assert_called_once()
 
 
-def test_orchestrator_home_before_capture_moves_home_and_returns_clock():
+def test_orchestrator_home_before_capture_homes_before_opening_gripper():
     orch = _orchestrator_skeleton()
     orch._enable_motion_execution = True
     orch._curobo_client = MagicMock()
     orch._latest_joints = MagicMock()
-    # Record call order: the gripper must open BEFORE the home move, so a closed
-    # gripper carrying nothing can't drag a previously-placed object on the way home.
+    # Record call order: the home move (which blocks on the cuRobo service until
+    # the planner has initialised) must run BEFORE the gripper command, so the
+    # gripper action isn't issued while the controllers are still coming up and
+    # not yet accepting goals (otherwise the goal response times out).
     calls = []
     orch._send_gripper = MagicMock(
         side_effect=lambda closed: calls.append(('grip', closed)))
@@ -947,7 +949,7 @@ def test_orchestrator_home_before_capture_moves_home_and_returns_clock():
 
     stamp = orch._home_before_capture()
 
-    assert calls == [('grip', False), ('home', None)]
+    assert calls == [('home', None), ('grip', False)]
     assert stamp == 999
 
 
