@@ -387,6 +387,27 @@ class PipelineOrchestrator(Node):
             self._send_and_wait(
                 self._arm_client, result.retract_trajectory, 'bookshelf_retract')
 
+    def _home_before_capture(self) -> int:
+        """Move the arm to home so the wrist camera observes the workspace, and
+        return the ROS time (ns) at which it settled.
+
+        Returns 0 when motion execution is disabled or joints/CuRobo are not yet
+        available — meaning no home move and no freshness gate, so GraspGen-only
+        and standalone modes keep working.
+        """
+        if not self._enable_motion_execution or self._curobo_client is None:
+            return 0
+        if self._latest_joints is None:
+            self.get_logger().warn(
+                'No /joint_states yet; skipping initial home move and '
+                'frame freshness gate.')
+            return 0
+        # Open the gripper: nothing should be carried at the start of a cycle, and
+        # the next grasp assumes open fingers.
+        self._send_gripper(closed=False)
+        self._plan_and_execute_home()
+        return self.get_clock().now().nanoseconds
+
     def _plan_and_execute_home(self) -> None:
         """Plan (collision-aware) + execute the return to the home pose."""
         request = PlanTrajectory.Request()

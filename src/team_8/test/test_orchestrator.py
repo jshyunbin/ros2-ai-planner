@@ -928,3 +928,41 @@ def test_orchestrator_pick_done_runs_place_then_home():
     orch._plan_and_execute_place.assert_called_once_with('storage_2')
     orch._plan_and_execute_home.assert_called_once_with()
     orch._reset_pipeline_state.assert_called_once()
+
+
+def test_orchestrator_home_before_capture_moves_home_and_returns_clock():
+    orch = _orchestrator_skeleton()
+    orch._enable_motion_execution = True
+    orch._curobo_client = MagicMock()
+    orch._latest_joints = MagicMock()
+    orch._send_gripper = MagicMock()
+    orch._plan_and_execute_home = MagicMock()
+    orch.get_clock = MagicMock(
+        return_value=MagicMock(now=lambda: MagicMock(nanoseconds=999)))
+
+    stamp = orch._home_before_capture()
+
+    orch._send_gripper.assert_called_once_with(closed=False)
+    orch._plan_and_execute_home.assert_called_once_with()
+    assert stamp == 999
+
+
+def test_orchestrator_home_before_capture_skips_when_motion_disabled():
+    orch = _orchestrator_skeleton()
+    orch._enable_motion_execution = False
+    orch._curobo_client = None
+    orch._plan_and_execute_home = MagicMock()
+
+    assert orch._home_before_capture() == 0
+    orch._plan_and_execute_home.assert_not_called()
+
+
+def test_orchestrator_home_before_capture_skips_without_joints():
+    orch = _orchestrator_skeleton()
+    orch._enable_motion_execution = True
+    orch._curobo_client = MagicMock()
+    orch._latest_joints = None
+    orch._plan_and_execute_home = MagicMock()
+
+    assert orch._home_before_capture() == 0
+    orch._plan_and_execute_home.assert_not_called()
