@@ -1,19 +1,18 @@
-FROM nvcr.io/nvidia/pytorch:23.07-py3
+# GraspGenX requires PyTorch>=2.1; nvcr.io/nvidia/pytorch:24.01-py3 ships 2.2.
+FROM nvcr.io/nvidia/pytorch:24.01-py3
 
-ARG GRASPGEN_REPO_URL=https://github.com/pianojay/GraspGen.git
-ARG GRASPGEN_BRANCH=jaeuk
-ARG GRASPGEN_COMMIT=31b67f65f3cb88928887edd2ee24e302c30cab70
-ARG GRASPGEN_MODELS_REPO_URL=https://huggingface.co/adithyamurali/GraspGenModels
-ARG GRASPGEN_MODELS_COMMIT=ec1ccbb5eec0680db669246ac312a3636f16ee43
-ARG GRIPPER_CONFIG_NAME=graspgen_robotiq_2f_140.yml
-ARG GRASPGEN_MODEL_FILES=checkpoints/graspgen_robotiq_2f_140.yml,checkpoints/graspgen_robotiq_2f_140_gen.pth,checkpoints/graspgen_robotiq_2f_140_dis.pth
+ARG GRASPGENX_REPO_URL=https://github.com/NVlabs/GraspGenX.git
+ARG GRASPGENX_COMMIT=main
+ARG GRASPGENX_MODELS_REPO_URL=https://huggingface.co/adithyamurali/GraspGenXModel
+ARG GRASPGENX_MODELS_COMMIT=main
+ARG GRASPGENX_GRIPPER=robotiq_2f_85
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV LANG=en_US.UTF-8
 ENV LC_ALL=en_US.UTF-8
 ENV PIP_ROOT_USER_ACTION=ignore
-ENV GRASPGEN_REPO_DIR=/opt/GraspGen
-ENV GRASPGEN_MODELS_DIR=/opt/GraspGenModels
+ENV GRASPGENX_REPO_DIR=/opt/GraspGenX
+ENV GRASPGENX_CHECKPOINT_DIR=/opt/GraspGenXModel/release
 ENV SAM2_MODEL_DIR=/opt/models/sam2
 ENV SAM2_MODEL_PATH=/opt/models/sam2/sam2_t.pt
 
@@ -45,19 +44,25 @@ RUN apt-get update && apt-get install -y \
     rm -rf /var/lib/apt/lists/*
 
 # ROS2 Humble + Python tools for planner-side nodes.
-RUN apt-get update && apt-get install -y \
-    ros-humble-ros-base \
-    ros-humble-control-msgs \
-    ros-humble-cv-bridge \
-    ros-humble-rosidl-default-generators \
-    ros-humble-ur-description \
-    ros-humble-vision-msgs \
-    ros-humble-xacro \
-    python3-opencv \
-    python3-colcon-common-extensions \
-    python3-numpy \
-    python3-rosdep \
-    python3-pip && \
+# The ROS2 apt mirror intermittently returns 400 for random packages, so we
+# retry up to 5 times with a short sleep + apt-get update between attempts.
+RUN for i in 1 2 3 4 5; do \
+        apt-get update && \
+        apt-get install -y --no-install-recommends \
+            ros-humble-ros-base \
+            ros-humble-control-msgs \
+            ros-humble-cv-bridge \
+            ros-humble-rosidl-default-generators \
+            ros-humble-ur-description \
+            ros-humble-vision-msgs \
+            ros-humble-xacro \
+            python3-opencv \
+            python3-colcon-common-extensions \
+            python3-numpy \
+            python3-rosdep \
+            python3-pip && break || \
+        (echo "apt attempt $i failed, retrying in 15s..." && sleep 15); \
+    done && \
     rm -rf /var/lib/apt/lists/*
 
 # UR5 URDF used by the cuRobo robot configuration.
@@ -65,43 +70,35 @@ RUN bash -c "source /opt/ros/humble/setup.bash && \
     xacro /opt/ros/humble/share/ur_description/urdf/ur.urdf.xacro \
       ur_type:=ur5 name:=ur > /ur5.urdf"
 
-# Additional non-ROS system packages for pointnet2_ops compilation.
+# System packages for build tools (GraspGenX has no C extension compilation).
 RUN apt-get update && apt-get install -y \
     build-essential \
     python3-dev && \
     rm -rf /var/lib/apt/lists/*
 
-# Planner-side Python runtime. Keep this separate from GraspGen so Gemini/SAM2
-# issues do not get conflated with GraspGen inference issues.
+# Planner-side Python runtime. Keep this separate from GraspGenX so Gemini/SAM2
+# issues do not get conflated with GraspGenX inference issues.
 RUN python3 -m pip install --upgrade pip && \
     python3 -m pip install --no-cache-dir -r /tmp/requirements/planner-runtime.txt && \
     python3 -m pip install --no-cache-dir --no-deps -r /tmp/requirements/sam2.txt
 
-# Clone the fork only after ROS2/system and planner runtime are established.
-RUN git clone --recursive --branch ${GRASPGEN_BRANCH} ${GRASPGEN_REPO_URL} ${GRASPGEN_REPO_DIR} && \
-    cd ${GRASPGEN_REPO_DIR} && \
-    git checkout ${GRASPGEN_COMMIT} && \
-    git submodule update --init --recursive
+# Clone GraspGenX and install with the [serve] extra (adds pyzmq + msgpack).
+# No C extension compilation needed — replaces GraspGen's pointnet2_ops build step.
+RUN git clone ${GRASPGENX_REPO_URL} ${GRASPGENX_REPO_DIR} && \
+    cd ${GRASPGENX_REPO_DIR} && \
+    git checkout ${GRASPGENX_COMMIT}
 
-# GraspGen runtime. This is intentionally separated from the planner runtime above.
-RUN python3 -m pip install --no-cache-dir -r ${GRASPGEN_REPO_DIR}/requirements.zmq_pointnet_viser.txt
-
-# Official GraspGen pointnet installation pattern, adapted for the reduced runtime.
-RUN cd ${GRASPGEN_REPO_DIR}/pointnet2_ops && \
-    python3 -m pip install --no-cache-dir --no-build-isolation .
-
-# Install the fork itself without re-resolving the broad upstream dependency set.
-RUN cd ${GRASPGEN_REPO_DIR} && \
-    python3 -m pip install --no-cache-dir --no-deps -e .
+RUN python3 -m pip install --no-cache-dir -e "${GRASPGENX_REPO_DIR}[serve]"
 
 # cuRoboV2 runtime. The install order mirrors the validated smoke test against
 # the current planner image; re-pin numpy afterwards to preserve cv_bridge ABI.
+# GraspGenX pins numpy==1.26.4 which satisfies the <2 constraint.
 RUN python3 -m pip install --no-cache-dir "numpy<2" uv && \
     git clone --branch v0.8.0 --depth 1 https://github.com/NVlabs/curobo.git /tmp/curobo && \
     cd /tmp/curobo && \
     uv pip install --system ".[cu12]" && \
     cd / && rm -rf /tmp/curobo && \
-    python3 -m pip install --no-cache-dir --force-reinstall "numpy<2"
+    python3 -m pip install --no-cache-dir --force-reinstall "numpy==1.26.4"
 
 # Bake the Ultralytics SAM2 checkpoint into the image to avoid first-run downloads.
 RUN mkdir -p ${SAM2_MODEL_DIR} && \
@@ -109,20 +106,19 @@ RUN mkdir -p ${SAM2_MODEL_DIR} && \
       -o ${SAM2_MODEL_PATH} && \
     test -s ${SAM2_MODEL_PATH}
 
-# Download only the pinned GraspGen model assets required by the planner.
+# Download GraspGenX model checkpoints (gen + dis) from Hugging Face.
+# GRASPGENX_CHECKPOINT_DIR points to the "release" version subdir that
+# GraspGenXSampler expects (gen/ and dis/ subdirectories inside).
 RUN export GIT_LFS_SKIP_SMUDGE=1 && \
-    git clone ${GRASPGEN_MODELS_REPO_URL} /tmp/GraspGenModels && \
-    cd /tmp/GraspGenModels && \
-    git checkout ${GRASPGEN_MODELS_COMMIT} && \
-    git lfs pull --include="${GRASPGEN_MODEL_FILES}" && \
-    mkdir -p ${GRASPGEN_MODELS_DIR}/checkpoints && \
-    cp checkpoints/graspgen_robotiq_2f_140.yml ${GRASPGEN_MODELS_DIR}/checkpoints/ && \
-    cp checkpoints/graspgen_robotiq_2f_140_gen.pth ${GRASPGEN_MODELS_DIR}/checkpoints/ && \
-    cp checkpoints/graspgen_robotiq_2f_140_dis.pth ${GRASPGEN_MODELS_DIR}/checkpoints/ && \
-    rm -rf /tmp/GraspGenModels && \
-    test -f "${GRASPGEN_MODELS_DIR}/checkpoints/${GRIPPER_CONFIG_NAME}" && \
-    test -f "${GRASPGEN_MODELS_DIR}/checkpoints/graspgen_robotiq_2f_140_gen.pth" && \
-    test -f "${GRASPGEN_MODELS_DIR}/checkpoints/graspgen_robotiq_2f_140_dis.pth"
+    git clone ${GRASPGENX_MODELS_REPO_URL} /tmp/GraspGenXModel && \
+    cd /tmp/GraspGenXModel && \
+    git checkout ${GRASPGENX_MODELS_COMMIT} && \
+    git lfs pull --include="release/gen/**,release/dis/**" && \
+    mkdir -p /opt/GraspGenXModel && \
+    cp -r release /opt/GraspGenXModel/release && \
+    rm -rf /tmp/GraspGenXModel && \
+    test -d "${GRASPGENX_CHECKPOINT_DIR}/gen" && \
+    test -d "${GRASPGENX_CHECKPOINT_DIR}/dis"
 
 # ── Application layer (frequently changing; kept last so the heavy layers
 #    above stay cached across src edits) ──────────────────────────────────────

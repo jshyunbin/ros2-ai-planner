@@ -49,26 +49,44 @@ robot_cfg:
           radius: 0.045
       wrist_1_link:
         - center: [0, 0, 0]
-          radius: 0.04
+          radius: 0.035
       wrist_2_link:
         - center: [0, 0, 0]
-          radius: 0.04
+          radius: 0.035
       wrist_3_link:
+        # Reduced radii so the wrist does not collide with table TSDF when
+        # tool0 is at low grasp heights (z≈0.10-0.16 m in base_link).
+        # wrist_3_link sphere at local z=0.05 with radius=0.03:
+        #   bottom_z = tool0_z - (0.05+0.03)×0.98 ≈ tool0_z - 0.078
+        #   For tool0_z=0.10: bottom = 0.022m (well above table z=0)  ✓
         - center: [0, 0, 0]
-          radius: 0.04
+          radius: 0.035
         - center: [0, 0, 0.05]
-          radius: 0.05
+          radius: 0.030
       tool0:
-        # Robotiq 85 gripper body: 3 spheres covering the flange and palm only.
-        # Finger spheres above z=0.10 were removed - they extended into the
-        # workspace envelope and caused false collision detections with the
-        # workspace_basket_support cuboid during approach trajectory planning.
+        # Robotiq 2F-85 gripper body (tool0 +z points toward fingertip).
+        # Palm region (z=0-0.095): larger spheres for arm/env collision.
+        # Finger region (z=0.095-0.136): small spheres to detect floor contact.
+        #   With collision_activation_distance=0.025m, a finger sphere at
+        #   local z=0.12 (world z = tool0_z - 0.12 for top-down grasps)
+        #   triggers floor avoidance only when tool0_z < floor_z+0.12+0.025
+        #   = -0.089+0.12+0.025 = 0.056m — below the kinematic filter threshold
+        #   (0.057m), so valid grasps are never blocked by these spheres.
         - center: [0, 0, 0.02]
           radius: 0.05
-        - center: [0, 0, 0.06]
-          radius: 0.05
-        - center: [0, 0, 0.10]
-          radius: 0.05
+        - center: [0, 0, 0.055]
+          radius: 0.04
+        # Finger region spheres — trigger floor avoidance only when arm
+        # descends below the kinematic filter threshold (tool0_z < 0.087m).
+        # At clamped descent target tool0_z=0.097m (top-down):
+        #   z=0.10 sphere world_z = 0.097-0.10 = -0.003m, dist to floor=0.086m > 0.025m ✓
+        #   z=0.130 sphere world_z = 0.097-0.130 = -0.033m, dist to floor=0.056m > 0.025m ✓
+        # Below clamp (e.g. tool0_z=0.060m):
+        #   z=0.130 sphere world_z = 0.060-0.130 = -0.070m, dist to floor=0.019m < 0.025m → blocked ✓
+        - center: [0, 0, 0.100]
+          radius: 0.018
+        - center: [0, 0, 0.130]
+          radius: 0.015
     self_collision_buffer:
       shoulder_link: 0.05
       upper_arm_link: 0.0
@@ -82,6 +100,7 @@ robot_cfg:
         - shoulder_link
         - forearm_link
       forearm_link:
+        - upper_arm_link   # allow low-height grasps where forearm folds near upper arm
         - wrist_1_link
       wrist_1_link:
         - wrist_2_link

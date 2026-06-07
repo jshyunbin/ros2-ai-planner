@@ -1,6 +1,6 @@
-# GraspGen remote inference client dependencies
+# GraspGenX remote inference client dependencies
 # These are enough for ros2-ai-planner to send point clouds to the
-# standalone GraspGen ZMQ server without importing the model itself.
+# standalone GraspGenX ZMQ server without importing the model itself.
 msgpack
 msgpack-numpy
 pyzmq

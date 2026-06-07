@@ -15,25 +15,37 @@ from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2
 
 from pipeline_orchestrator.graspgen_client import GraspGenClient
-from pipeline_orchestrator.pipeline_utils import pose_from_grasp_row
+from pipeline_orchestrator.pipeline_utils import ROBOTIQ_2F_85_TCP_Z_OFFSET, pose_from_grasp_row
 
 try:  # pragma: no cover - runtime dependency
     from riro_srvs.srv import StringString
 except ImportError:  # pragma: no cover - runtime dependency
     StringString = None
 
-try:
-    from grasp_gen.robot import get_gripper_info
-    from grasp_gen.utils.point_cloud_utils import filter_colliding_grasps
-except ImportError:  # pragma: no cover - import is environment-dependent
-    get_gripper_info = None
-    filter_colliding_grasps = None
-
-# Kinematic reachability constants (ported from yeina / pick_and_place_ur5.py).
-# GraspGen TCP is GRIPPER_TCP_Z_OFFSET ahead of tool0 along the grasp Z-axis.
-_GRIPPER_TCP_Z_OFFSET = 0.1034   # m — robotiq_2f_140 checkpoint gripper_depth
+# Kinematic reachability constants.
+# GraspGenX TCP is _GRIPPER_TCP_Z_OFFSET ahead of tool0 along the grasp Z-axis.
+_GRIPPER_TCP_Z_OFFSET = ROBOTIQ_2F_85_TCP_Z_OFFSET  # from pipeline_utils
 _MAX_REACH = 0.82                 # m — UR5 kinematic reach limit
-_MIN_TOOL_Z = 0.08                # m — minimum tool0 height above table
+
+# Robotiq 2F-85 fingertip length from tool0 origin (full-open, top-down grasp).
+# At 85 mm opening, the fingertip contact point is ≈136 mm below tool0.
+_FINGERTIP_LEN = 0.136            # m
+
+# Minimum tool0 Z: ensure fingertip stays above the table surface + safety margin.
+# Computed from PIPELINE_FLOOR_Z (measured depth-camera value) at import time so
+# the threshold automatically tracks the calibrated floor height.
+#   min_tool_z = floor_z + fingertip_len + margin(0.015 m)
+# Fallback floor_z = -0.07 m when env var is absent.
+_FLOOR_Z = float(os.environ.get('PIPELINE_FLOOR_Z', -0.07))
+# Kinematic pre-filter margin: only rejects grasps where the fingertip would
+# be BELOW the table surface.  cuRobo's floor cuboid + collision activation
+# distance handle the actual motion-level floor avoidance.  Keep this small so
+# objects sitting on the table are not filtered out prematurely.
+_FLOOR_CLEARANCE_M = 0.010  # m — 1 cm: just enough to reject sub-table grasps
+_MIN_TOOL_Z = _FLOOR_Z + _FINGERTIP_LEN + _FLOOR_CLEARANCE_M  # e.g. -0.089+0.136+0.010 = 0.057 m
+
+# GraspGenX gripper name passed to the inference server.
+_GRASPGENX_GRIPPER = 'robotiq_2f_85'
 
 
 class GraspGenService(Node):
@@ -50,22 +62,25 @@ class GraspGenService(Node):
         self.declare_parameter("service_name", "/graspgen/infer")
         self.declare_parameter("server_host", "127.0.0.1")
         self.declare_parameter("server_port", 5556)
-        self.declare_parameter("num_grasps", 200)
-        self.declare_parameter("topk_num_grasps", 100)
-        self.declare_parameter("min_grasps", 20)
-        self.declare_parameter("max_tries", 4)
-        self.declare_parameter("remove_outliers", False)
-        self.declare_parameter("rank_mode", "approach_alignment")
+        # GraspGenX inference parameters.
+        self.declare_parameter("num_grasps", 200)       # diffusion samples
+        self.declare_parameter("topk_num_grasps", 100)  # top-K returned by server
+        # Grasp ranking / filtering.
+        self.declare_parameter("rank_mode", "confidence")
         self.declare_parameter("target_approach_dir", [0.0, 0.0, -1.0])
-        self.declare_parameter("max_returned_grasps", 5)
+        self.declare_parameter("max_returned_grasps", 20)
         self.declare_parameter("expected_frame", "base_link")
-        self.declare_parameter("enable_collision_check", False)
-        self.declare_parameter("collision_threshold", 0.002)
-        self.declare_parameter("collision_samples", 2000)
+        # Note: collision_check is not supported with GraspGenX; cuRobo TSDF
+        # carve-out handles object collision avoidance instead.
         self.declare_parameter("debug_dir", "/artifacts/graspgen_service")
         self.declare_parameter("cloud_wait_sec", 5.0)
         self.declare_parameter("publish_grasp_poses", False)
         self.declare_parameter("grasp_poses_topic", "/graspgen/grasp_poses")
+        # Minimum downward score for grasp candidates: -approach_z[2] in base_link.
+        # 0.0 = no filter; 0.5 = approach within ~60° of vertical (top-down bias);
+        # 0.85 = within ~32° of vertical (strict top-down only).
+        # Raise this if the gripper hits the floor due to near-horizontal grasps.
+        self.declare_parameter("min_grasp_downward_score", 0.0)
 
         # RELIABLE to match the segmentation publishers; the cloud is bulk
         # request/response data, not a high-rate stream.
@@ -89,7 +104,7 @@ class GraspGenService(Node):
         port = int(self.get_parameter("server_port").value)
         self._client = GraspGenClient(host=host, port=port)
         self.get_logger().info(
-            f"Connected to GraspGen server at {host}:{port} metadata={self._client.server_metadata}"
+            f"Connected to GraspGenX server at {host}:{port} metadata={self._client.server_metadata}"
         )
 
         segmented_topic = str(self.get_parameter("segmented_point_cloud_topic").value)
@@ -240,14 +255,10 @@ class GraspGenService(Node):
         debug_id = time.strftime("%Y%m%d-%H%M%S") + f"-{int(time.time_ns() % 1_000_000_000):09d}"
         debug_path = self._debug_dir / debug_id
         debug_path.mkdir(parents=True, exist_ok=True)
-        remove_outliers = bool(self.get_parameter("remove_outliers").value)
         try:
-            grasps, confidences = self._infer_with_optional_retry(
-                segmented_cloud,
-                remove_outliers=remove_outliers,
-            )
+            grasps, confidences = self._run_infer(segmented_cloud)
         except Exception as exc:
-            error = f"GraspGen inference failed: {exc}"
+            error = f"GraspGenX inference failed: {exc}"
             self._save_debug_artifacts(
                 debug_path,
                 segmented_cloud=segmented_cloud,
@@ -293,9 +304,6 @@ class GraspGenService(Node):
             "frame_id": segmented_frame,
             "num_input_points": int(len(segmented_cloud)),
             "num_grasps": int(len(grasps)),
-            "num_collision_free_grasps": int(np.sum(collision_free_mask))
-            if collision_free_mask is not None
-            else None,
             "rank_mode": str(self.get_parameter("rank_mode").value),
             "top_grasps": top_rows,
             "debug_dir": str(debug_path),
@@ -330,83 +338,57 @@ class GraspGenService(Node):
                 msg.poses.append(pose)
         self._grasp_poses_pub.publish(msg)
 
-    def _infer_with_optional_retry(
-        self,
-        segmented_cloud: np.ndarray,
-        *,
-        remove_outliers: bool,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        infer_kwargs = {
-            "num_grasps": int(self.get_parameter("num_grasps").value),
-            "topk_num_grasps": int(self.get_parameter("topk_num_grasps").value),
-            "min_grasps": int(self.get_parameter("min_grasps").value),
-            "max_tries": int(self.get_parameter("max_tries").value),
-        }
-        try:
-            return self._client.infer(
-                segmented_cloud,
-                remove_outliers=remove_outliers,
-                **infer_kwargs,
-            )
-        except Exception as exc:
-            if not remove_outliers or not self._looks_like_empty_cloud_after_filter(exc):
-                raise
-            self.get_logger().warn(
-                "GraspGen removed all segmented points during outlier filtering; retrying with remove_outliers=false."
-            )
-            return self._client.infer(
-                segmented_cloud,
-                remove_outliers=False,
-                **infer_kwargs,
-            )
-
-    @staticmethod
-    def _looks_like_empty_cloud_after_filter(exc: Exception) -> bool:
-        message = str(exc)
-        return "cannot reshape tensor of 0 elements" in message or "shape [-1, 0, 3]" in message
+    def _run_infer(self, segmented_cloud: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Call GraspGenX server and return (grasps, confidences)."""
+        return self._client.infer(
+            segmented_cloud,
+            gripper_name=_GRASPGENX_GRIPPER,
+            num_grasps=int(self.get_parameter("num_grasps").value),
+            topk_num_grasps=int(self.get_parameter("topk_num_grasps").value),
+        )
 
     def _compute_collision_free_mask(self, grasps: np.ndarray):
-        if not bool(self.get_parameter("enable_collision_check").value):
-            return None
-        if self._latest_background_cloud is None:
-            self.get_logger().warn("Collision filtering enabled but no background cloud received yet.")
-            return None
-        if get_gripper_info is None or filter_colliding_grasps is None:
-            self.get_logger().warn("Collision filtering requested but GraspGen collision utilities are unavailable.")
-            return None
-
-        gripper_name = self._client.server_metadata.get("gripper_name", "robotiq_2f_140")
-        gripper_info = get_gripper_info(gripper_name)
-        collision_threshold = float(self.get_parameter("collision_threshold").value)
-        collision_samples = int(self.get_parameter("collision_samples").value)
-        return filter_colliding_grasps(
-            self._latest_background_cloud.astype(np.float32),
-            np.asarray(grasps, dtype=np.float32),
-            gripper_info.collision_mesh,
-            collision_threshold=collision_threshold,
-            num_collision_samples=collision_samples,
-        )
+        # GraspGenX does not ship pre-grasp collision utilities.
+        # Object collision avoidance is handled downstream by cuRobo TSDF carve-out.
+        return None
 
     def _kinematic_filter(
         self, grasps: np.ndarray, confidences: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray]:
         """Remove grasps whose tool0 position violates UR5 reach or table clearance.
 
-        Ported from yeina graspgen.py AC2 filter.  tool0 is approximated by
-        backing off from the GraspGen TCP along the grasp +Z axis by
-        _GRIPPER_TCP_Z_OFFSET.
+        If nothing passes the strict z threshold, retries with a relaxed threshold
+        (floor surface only, no safety margin) so objects sitting directly on the
+        table are not permanently excluded.  cuRobo's floor cuboid handles the
+        actual motion-level floor avoidance.
         """
         tool_pos = np.stack(
             [g[:3, 3] - g[:3, 2] * _GRIPPER_TCP_Z_OFFSET for g in grasps]
         )
         radii = np.linalg.norm(tool_pos, axis=1)
-        min_tool_z = max(
-            float(os.environ.get('PIPELINE_GRASPGEN_MIN_TOOL_Z', _MIN_TOOL_Z)),
-            _MIN_TOOL_Z,
-        )
-        keep = (radii < _MAX_REACH) & (tool_pos[:, 2] > min_tool_z)
+        reach_ok = radii < _MAX_REACH
+
+        min_tool_z = float(os.environ.get('PIPELINE_GRASPGEN_MIN_TOOL_Z', _MIN_TOOL_Z))
+        keep = reach_ok & (tool_pos[:, 2] > min_tool_z)
+        n_kept = int(keep.sum())
+
+        if n_kept == 0:
+            # Relax: accept grasps whose fingertip is at or above the floor surface.
+            # This handles objects sitting directly on the table where even valid
+            # grasps barely exceed the normal margin.
+            floor_z = float(os.environ.get('PIPELINE_FLOOR_Z', _FLOOR_Z))
+            relaxed_min_z = floor_z + _FINGERTIP_LEN  # fingertip exactly at floor
+            keep_relaxed = reach_ok & (tool_pos[:, 2] > relaxed_min_z)
+            n_relaxed = int(keep_relaxed.sum())
+            self.get_logger().warn(
+                f'GraspGenX kinematic filter: 0 passed strict threshold '
+                f'(tool_z>{min_tool_z:.3f}m); relaxing to tool_z>{relaxed_min_z:.3f}m '
+                f'→ {n_relaxed}/{len(grasps)} grasps kept'
+            )
+            return grasps[keep_relaxed], confidences[keep_relaxed]
+
         self.get_logger().info(
-            f'GraspGen kinematic filter: kept {int(keep.sum())}/{len(grasps)} grasps '
+            f'GraspGenX kinematic filter: kept {n_kept}/{len(grasps)} grasps '
             f'(reach<{_MAX_REACH:.2f}m, tool_z>{min_tool_z:.2f}m)'
         )
         return grasps[keep], confidences[keep]
@@ -425,7 +407,18 @@ class GraspGenService(Node):
         if collision_free_mask is not None:
             rows = [row for row, keep in zip(rows, collision_free_mask) if keep]
 
-        if rank_mode == "approach_alignment":
+        min_down = float(self.get_parameter("min_grasp_downward_score").value)
+        if min_down > 0.0:
+            before = len(rows)
+            rows = [r for r in rows if r.get("downward_score", -1.0) >= min_down]
+            self.get_logger().info(
+                f"Top-down filter (min_downward_score={min_down:.2f}): "
+                f"{len(rows)}/{before} grasps passed"
+            )
+
+        if rank_mode == "confidence":
+            rows.sort(key=lambda row: row["confidence"], reverse=True)
+        elif rank_mode == "approach_alignment":
             rows.sort(
                 key=lambda row: (row["alignment"], row["confidence"]),
                 reverse=True,
@@ -454,10 +447,16 @@ class GraspGenService(Node):
         approach = approach / max(np.linalg.norm(approach), 1e-6)
         finger = finger / max(np.linalg.norm(finger), 1e-6)
 
+        # downward_score: how much the approach Z-axis points downward in base_link.
+        # For top-down grasps, approach[2] < 0 → downward_score close to 1.0.
+        # Always included so _rank_grasps can filter by min_grasp_downward_score.
+        downward_score = round(float(-approach[2]), 4)
+
         row = {
             "confidence": round(confidence, 4),
             "translation": [round(float(x), 4) for x in grasp[:3, 3]],
             "rotation_matrix": [[round(float(v), 4) for v in r] for r in grasp[:3, :3]],
+            "downward_score": downward_score,
         }
 
         if rank_mode == "approach_alignment":

@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import threading
 import time
 
 import cv2
@@ -8,6 +9,8 @@ import numpy as np
 import rclpy
 from cv_bridge import CvBridge
 from PIL import Image as PILImage
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
@@ -116,6 +119,9 @@ class SegmentationService(Node):
         self.declare_parameter("depth_unit_scale", 0.001)
         self.declare_parameter("debug_dir", "/artifacts/segmentation_service")
         self._bridge = CvBridge()
+        # _frame_lock protects all _latest_* fields written by camera callbacks
+        # and read by the service handler, preventing mixed-frame snapshots.
+        self._frame_lock = threading.Lock()
         self._latest_rgb = None
         self._latest_rgb_stamp_ns = 0
         self._latest_depth = None
@@ -154,20 +160,28 @@ class SegmentationService(Node):
         cloud_qos = QoSProfile(depth=10)
         cloud_qos.reliability = ReliabilityPolicy.RELIABLE
 
+        # ReentrantCallbackGroup: camera callbacks must keep running while the
+        # service handler blocks on Gemini + SAM2 (seconds-long operation).
+        # Without this, a single-group executor would deadlock the handler.
+        self._reentrant = ReentrantCallbackGroup()
+
         self.create_subscription(
-            Image, str(self.get_parameter("rgb_topic").value), self._rgb_callback, qos
+            Image, str(self.get_parameter("rgb_topic").value), self._rgb_callback, qos,
+            callback_group=self._reentrant,
         )
         self.create_subscription(
             Image,
             str(self.get_parameter("depth_topic").value),
             self._depth_callback,
             qos,
+            callback_group=self._reentrant,
         )
         self.create_subscription(
             CameraInfo,
             str(self.get_parameter("camera_info_topic").value),
             self._camera_info_callback,
             qos,
+            callback_group=self._reentrant,
         )
 
         self._segmented_pub = self.create_publisher(
@@ -182,7 +196,8 @@ class SegmentationService(Node):
         self._mask_pub = self.create_publisher(Image, str(self.get_parameter("mask_topic").value), qos)
 
         self.create_service(
-            StringString, str(self.get_parameter("service_name").value), self._handle_request
+            StringString, str(self.get_parameter("service_name").value), self._handle_request,
+            callback_group=self._reentrant,
         )
 
         self.get_logger().info(
@@ -193,8 +208,11 @@ class SegmentationService(Node):
         )
 
     def _rgb_callback(self, msg: Image) -> None:
-        self._latest_rgb = self._bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
-        self._latest_rgb_stamp_ns = self._stamp_to_ns(msg.header.stamp)
+        img = self._bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+        stamp_ns = self._stamp_to_ns(msg.header.stamp)
+        with self._frame_lock:
+            self._latest_rgb = img
+            self._latest_rgb_stamp_ns = stamp_ns
         if not self._logged_first_rgb:
             self.get_logger().info(
                 f"Received first RGB frame {msg.width}x{msg.height} on "
@@ -208,11 +226,13 @@ class SegmentationService(Node):
             depth *= float(self.get_parameter("depth_unit_scale").value)
         else:
             depth = self._bridge.imgmsg_to_cv2(msg, desired_encoding="32FC1").astype(np.float32)
-
-        self._latest_depth = depth
-        self._latest_depth_stamp = msg.header.stamp
-        self._latest_depth_stamp_ns = self._stamp_to_ns(msg.header.stamp)
-        self._latest_frame_id = msg.header.frame_id
+        stamp = msg.header.stamp
+        stamp_ns = self._stamp_to_ns(stamp)
+        with self._frame_lock:
+            self._latest_depth = depth
+            self._latest_depth_stamp = stamp
+            self._latest_depth_stamp_ns = stamp_ns
+            self._latest_frame_id = msg.header.frame_id
         if not self._logged_first_depth:
             self.get_logger().info(
                 f"Received first depth frame {msg.width}x{msg.height} "
@@ -221,7 +241,8 @@ class SegmentationService(Node):
             self._logged_first_depth = True
 
     def _camera_info_callback(self, msg: CameraInfo) -> None:
-        self._latest_camera_info = msg
+        with self._frame_lock:
+            self._latest_camera_info = msg
         if not self._logged_first_camera_info:
             self.get_logger().info(
                 f"Received first CameraInfo fx={msg.k[0]:.3f} fy={msg.k[4]:.3f} "
@@ -252,11 +273,20 @@ class SegmentationService(Node):
         if not prompt:
             prompt = "Pick the requested object."
 
-        if self._latest_rgb is None or self._latest_depth is None:
+        # Atomic snapshot: grab all frame-related state under one lock so that
+        # rgb/depth/stamp/frame_id all come from the same camera callback cycle.
+        with self._frame_lock:
+            snap_rgb = self._latest_rgb
+            snap_depth = self._latest_depth
+            snap_stamp = self._latest_depth_stamp
+            snap_stamp_ns = self._latest_depth_stamp_ns
+            snap_frame_id = self._latest_frame_id
+
+        if snap_rgb is None or snap_depth is None:
             missing = []
-            if self._latest_rgb is None:
+            if snap_rgb is None:
                 missing.append("rgb")
-            if self._latest_depth is None:
+            if snap_depth is None:
                 missing.append("depth")
             response.data = json.dumps(
                 {
@@ -272,8 +302,8 @@ class SegmentationService(Node):
         debug_path = self._debug_dir / debug_id
         debug_path.mkdir(parents=True, exist_ok=True)
         try:
-            rgb_bgr = self._latest_rgb.copy()
-            depth_image = self._latest_depth.copy()
+            rgb_bgr = snap_rgb.copy()
+            depth_image = snap_depth.copy()
             fx, fy, cx, cy = self._camera_intrinsics()
 
             api_image_bgr, scale_x, scale_y = resize_for_api(
@@ -306,18 +336,18 @@ class SegmentationService(Node):
                 raise RuntimeError("Masked point cloud is empty after depth filtering.")
 
             output_frame = self._output_frame
-            source_frame = self._latest_frame_id
+            source_frame = snap_frame_id
             object_points = self._transform_points_to_output_frame(
                 object_points,
                 source_frame=source_frame,
                 target_frame=output_frame,
-                stamp=self._latest_depth_stamp,
+                stamp=snap_stamp,
             )
             background_points = self._transform_points_to_output_frame(
                 background_points,
                 source_frame=source_frame,
                 target_frame=output_frame,
-                stamp=self._latest_depth_stamp,
+                stamp=snap_stamp,
             )
 
             object_points = stable_downsample(
@@ -336,7 +366,7 @@ class SegmentationService(Node):
             assert roi is not None
             x_min, y_min, x_max, y_max = roi
 
-            cloud_stamp = self._latest_depth_stamp
+            cloud_stamp = snap_stamp
             self._segmented_pub.publish(
                 make_xyz_cloud(object_points, output_frame, stamp=cloud_stamp))
             if len(background_points) > 0:
@@ -361,7 +391,7 @@ class SegmentationService(Node):
                 "label": prompt_result["label"],
                 "frame_id": output_frame,
                 "source_frame_id": source_frame,
-                "cloud_stamp_ns": int(self._latest_depth_stamp_ns),
+                "cloud_stamp_ns": int(snap_stamp_ns),
                 "centroid": [round(float(v), 5) for v in centroid],
                 "roi_xyxy": [x_min, y_min, x_max, y_max],
                 "mask_pixel_count": int(mask.sum()),
@@ -625,8 +655,13 @@ class SegmentationService(Node):
 def main(args=None) -> None:
     rclpy.init(args=args)
     node = SegmentationService()
+    # MultiThreadedExecutor: Gemini+SAM2 service handler blocks for seconds;
+    # camera callbacks must keep delivering frames on separate threads during
+    # that time so the next request gets a fresh snapshot.
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:

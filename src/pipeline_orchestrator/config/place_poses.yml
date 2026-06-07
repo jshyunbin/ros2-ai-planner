@@ -1,0 +1,51 @@
+# Place and home poses for the pipeline_orchestrator.
+# All poses are expressed in base_link frame.
+# quat_xyzw: quaternion in [x, y, z, w] order.
+#
+# home pose measured with:
+#   ros2 run tf2_ros tf2_echo base_link tool0
+# at joint angles [-1.332, -2.402, 1.538, -0.863, -1.114, -1.292]
+#
+# Storage positions from drop_positions survey (2026-06-07).
+# Orientation matches home (tool0 pointing straight down).
+
+transit_z: 0.50
+
+# ── Home pose (camera faces straight down at workspace center) ────────────────
+home:
+  xyz: [0.428, 0.109, 0.648]
+  quat_xyzw: [0.707, -0.707, 0.017, -0.017]
+
+# ── Storage A (right side of workspace, +Y) ───────────────────────────────────
+storageA_1:
+  xyz: [0.069, 0.649, 0.370]
+  quat_xyzw: [0.707, -0.707, 0.017, -0.017]
+
+storageA_2:
+  xyz: [0.099, 0.439, 0.370]
+  quat_xyzw: [0.707, -0.707, 0.017, -0.017]
+
+storageA_3:
+  xyz: [-0.021, 0.439, 0.370]
+  quat_xyzw: [0.707, -0.707, 0.017, -0.017]
+
+storageA_4:
+  xyz: [-0.021, 0.649, 0.370]
+  quat_xyzw: [0.707, -0.707, 0.017, -0.017]
+
+# ── Storage B (left side of workspace, -Y) ────────────────────────────────────
+storageB_1:
+  xyz: [0.069, -0.431, 0.370]
+  quat_xyzw: [0.707, -0.707, 0.017, -0.017]
+
+storageB_2:
+  xyz: [0.069, -0.611, 0.370]
+  quat_xyzw: [0.707, -0.707, 0.017, -0.017]
+
+storageB_3:
+  xyz: [-0.051, -0.431, 0.370]
+  quat_xyzw: [0.707, -0.707, 0.017, -0.017]
+
+storageB_4:
+  xyz: [-0.051, -0.611, 0.370]
+  quat_xyzw: [0.707, -0.707, 0.017, -0.017]

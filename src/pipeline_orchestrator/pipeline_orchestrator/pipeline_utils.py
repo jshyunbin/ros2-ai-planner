@@ -5,6 +5,12 @@ coercion, the XYZ PointCloud2 builder, and the grasp-row pose /
 rotation-to-quaternion helpers).
 """
 
+# graspgenX outputs the tool0 frame directly (translation = where tool0 should go).
+# cuRobo also targets tool0. So no backing-off offset is needed between graspgenX
+# output and cuRobo input.  Set to 0.0.
+# (Legacy value was 0.085m for old GraspGen which output fingertip contact points.)
+ROBOTIQ_2F_85_TCP_Z_OFFSET = 0.0  # metres
+
 import math
 import os
 

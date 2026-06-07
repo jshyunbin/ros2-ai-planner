@@ -25,9 +25,7 @@ class GraspGenProbe(Node):
         self.declare_parameter("workspace_max", [1.5, 1.0, 2.0])
         self.declare_parameter("num_grasps", 200)
         self.declare_parameter("topk_num_grasps", 20)
-        self.declare_parameter("min_grasps", 20)
-        self.declare_parameter("max_tries", 4)
-        self.declare_parameter("remove_outliers", True)
+        self.declare_parameter("gripper_name", "robotiq_2f_85")
 
         topic = self.get_parameter("point_cloud_topic").value
         host = self.get_parameter("server_host").value
@@ -40,6 +38,7 @@ class GraspGenProbe(Node):
         self._latest_cloud = None
         self._latest_frame_id = ""
         self._request_in_flight = False
+        self._gripper_name = str(self.get_parameter("gripper_name").value)
 
         self._client = GraspGenClient(host=host, port=port)
         self.get_logger().info(
@@ -89,11 +88,9 @@ class GraspGenProbe(Node):
         try:
             grasps, confidences = self._client.infer(
                 cloud,
+                gripper_name=self._gripper_name,
                 num_grasps=int(self.get_parameter("num_grasps").value),
                 topk_num_grasps=int(self.get_parameter("topk_num_grasps").value),
-                min_grasps=int(self.get_parameter("min_grasps").value),
-                max_tries=int(self.get_parameter("max_tries").value),
-                remove_outliers=bool(self.get_parameter("remove_outliers").value),
             )
         except Exception as exc:
             self.get_logger().error(f"GraspGen inference failed: {exc}")

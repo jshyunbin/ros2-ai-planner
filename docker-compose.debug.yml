@@ -5,4 +5,48 @@ services:
       - ./scripts:/ros2_ws/scripts
       - ./config:/ros2_ws/config:ro
       - ./artifacts:/artifacts
+    environment:
+      # Table surface measured with depth camera: histogram peak = -0.089 m (base_link).
+      - PIPELINE_FLOOR_Z=-0.089
+
+      # ── Floor collision avoidance (generous settings) ────────────────────
+      # cuRobo starts routing away from obstacles this far in advance.
+      # 0.05 m: generous enough to route around real objects (cola can, etc.)
+      # while still allowing near-table grasps. Floor avoidance relies on
+      # the descent clamp + kinematic filter, not on activation distance.
+      - PIPELINE_CUROBO_COLLISION_ACTIVATION_DIST=0.05
+
+      # Approach offsets to try per candidate (tool-z, negative = above grasp).
+      # Start from 15 cm above for safer descent; fall back to 20 cm if needed.
+      - PIPELINE_CUROBO_GRASP_APPROACH_OFFSETS=-0.15,-0.20,-0.25
+
+      # Height to lift above grasp pose after closing gripper (world-z).
+      - PIPELINE_CUROBO_PICK_LIFT_OFFSET=0.15
+
+      # ── Basket cuboid ────────────────────────────────────────────────────
+      # basket_wall_top < place_tool0_z - 0.095 - activation_dist
+      # = 0.370 - 0.095 - 0.05 = 0.225 m  → use 0.20 m (2.5 cm margin)
+      - PIPELINE_BASKET_WALL_TOP=0.20
+
+      # ── Preclose nudge ───────────────────────────────────────────────────
+      # The nudge continues joint motion in the descent direction past the
+      # clamped grasp pose → pushes fingertip into the floor. Disable it.
+      - PIPELINE_GRASP_CLOSE_NUDGE_MAX_JOINT_DELTA_RAD=0
+
+      # ── Descent floor clamp ──────────────────────────────────────────────
+      # tool0_z is clamped to floor_z + fingertip_len + this margin during descent.
+      # cuRobo collision spheres don't cover the fingertip region (z=0.095-0.136
+      # from tool0), so this prevents physical floor contact.
+      # Fingertip gap above table when gripper closes.
+      # Robotiq 2F-85 finger linkage drops ~1-2 cm during closure,
+      # so 5 cm gap ensures fingers don't reach the table surface.
+      # tool0_z clamp = -0.089 + 0.136 + 0.05 = 0.097 m
+      # fingertip world_z = 0.097 - 0.136 = -0.039 m (5 cm above table)
+      - PIPELINE_CUROBO_DESCENT_MARGIN=0.05
+
+      # ── Approach corridor carving (noise above object) ───────────────────
+      # Cylindrical corridor directly above object centroid.
+      # Narrower than bbox+pad so nearby objects (cola can etc.) stay visible.
+      - PIPELINE_CUROBO_CORRIDOR_RADIUS=0.06
+      - PIPELINE_CUROBO_CORRIDOR_Z_ABOVE=0.35
     command: ["ros2", "launch", "pipeline_orchestrator", "debug.launch.py"]

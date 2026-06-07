@@ -22,20 +22,33 @@ import threading
 import numpy as np
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSDurabilityPolicy, QoSProfile, ReliabilityPolicy
 from scipy.spatial.transform import Rotation as R
-from sensor_msgs.msg import JointState
+from sensor_msgs.msg import JointState, PointCloud2
+from sensor_msgs_py import point_cloud2
+from std_msgs.msg import Bool
 
 from pipeline_orchestrator.curobo import (
     BASE_FRAME,
+    MIN_FRAMES,
     CuRobo,
     concat_trajectories,
     interp_traj_to_ros,
 )
-from sensor_msgs.msg import PointCloud2
 from pipeline_orchestrator.pipeline_utils import as_bool as _as_bool
 from pipeline_orchestrator.pipeline_utils import env_float as _env_float
 from pipeline_orchestrator.pipeline_utils import make_xyz_cloud
+from pipeline_orchestrator.place_pose_utils import (
+    build_transit_waypoints,
+    is_bookshelf_target,
+    load_place_poses,
+    resolve_target_pose,
+)
 from riro_srvs.srv import PlanTrajectory
+
+# Topic published by segmentation_service; curobo_service subscribes to get
+# the object cloud for TSDF carve-out at planning time.
+_SEGMENTED_OBJECT_TOPIC = '/graspgen/segmented_object'
 
 
 class CuRoboService(Node):
@@ -52,6 +65,7 @@ class CuRoboService(Node):
         self.declare_parameter('init_wait_sec', 120.0)
 
         self._latest_joints = None
+        self._latest_object_cloud: np.ndarray | None = None
         self._curobo: CuRobo | None = None
         self._init_error = ''
         self._init_done = False
@@ -68,12 +82,30 @@ class CuRoboService(Node):
             10,
         )
 
+        # Subscribe to the segmented object cloud so we can carve the target
+        # object out of the TSDF collision world at pick-planning time.
+        _qos = QoSProfile(depth=1)
+        _qos.reliability = ReliabilityPolicy.RELIABLE
+        self.create_subscription(
+            PointCloud2,
+            _SEGMENTED_OBJECT_TOPIC,
+            self._cache_object_cloud,
+            _qos,
+        )
+
         service_name = str(self.get_parameter('service_name').value)
         self.create_service(PlanTrajectory, service_name, self._handle_plan)
         self.get_logger().info(
             f'curobo_service advertised {service_name}; '
             'initialising CuRobo in background.'
         )
+
+        # Latched /curobo/ready: published once after init + MIN_FRAMES TSDF.
+        # TRANSIENT_LOCAL so late subscribers (orchestrator) still receive it.
+        ready_qos = QoSProfile(depth=1)
+        ready_qos.durability = QoSDurabilityPolicy.TRANSIENT_LOCAL
+        self._ready_pub = self.create_publisher(Bool, '/curobo/ready', ready_qos)
+        self._ready_published = False
 
         self._tsdf_pub = None
         if _as_bool(self.get_parameter('enable_viz').value):
@@ -120,6 +152,27 @@ class CuRoboService(Node):
         if latest_joints is not None:
             curobo.update_joint_state(latest_joints)
         self.get_logger().info('CuRobo initialisation complete; service is ready.')
+        # Poll until TSDF has MIN_FRAMES, then publish /curobo/ready.
+        self.create_timer(1.0, self._check_and_publish_ready)
+
+    # ── ready signal ──────────────────────────────────────────────────────────
+
+    def _check_and_publish_ready(self) -> None:
+        """Publish /curobo/ready=true once TSDF has accumulated MIN_FRAMES."""
+        if self._ready_published:
+            return
+        with self._init_cv:
+            curobo = self._curobo
+        if curobo is None:
+            return
+        if curobo.frame_count < MIN_FRAMES:
+            return
+        msg = Bool()
+        msg.data = True
+        self._ready_pub.publish(msg)
+        self._ready_published = True
+        self.get_logger().info(
+            f'/curobo/ready published (frame_count={curobo.frame_count}).')
 
     # ── joint state cache ─────────────────────────────────────────────────────
 
@@ -129,6 +182,25 @@ class CuRoboService(Node):
             curobo = self._curobo
         if curobo is not None:
             curobo.update_joint_state(msg)
+
+    # ── segmented object cloud cache ──────────────────────────────────────────
+
+    def _cache_object_cloud(self, msg: PointCloud2) -> None:
+        """Cache the latest segmented object cloud for TSDF carve-out."""
+        try:
+            pts = point_cloud2.read_points_numpy(msg, field_names=('x', 'y', 'z'))
+            if pts.size == 0:
+                return
+            pts = np.asarray(pts, dtype=np.float32)
+            if pts.ndim != 2 or pts.shape[1] != 3:
+                return
+            finite = np.isfinite(pts).all(axis=1)
+            pts = pts[finite]
+            if len(pts) > 0:
+                self._latest_object_cloud = pts
+        except Exception as exc:
+            self.get_logger().warn(
+                f'curobo_service: failed to cache object cloud: {exc}')
 
     # ── TSDF voxel publisher ──────────────────────────────────────────────────
 
@@ -202,6 +274,8 @@ class CuRoboService(Node):
         try:
             if request.grasp_poses:
                 return self._handle_pick(curobo, request, joint_state, response)
+            if request.goal_name:
+                return self._handle_place_or_home(curobo, request, joint_state, response)
             return self._handle_single_pose(curobo, request, joint_state, response)
         except Exception as exc:
             response.success = False
@@ -216,25 +290,29 @@ class CuRoboService(Node):
         candidates = _poses_to_candidates(request.grasp_poses)
         curobo.update_joint_state(joint_state)
 
-        result = curobo.plan_pick(candidates, joint_state)
+        # Pass the cached segmented object cloud so cuRobo can carve the target
+        # object's voxels out of the TSDF before planning, preventing false
+        # collision failures when the gripper approaches the object.
+        object_cloud = self._latest_object_cloud
+        result = curobo.plan_pick(candidates, joint_state, object_cloud=object_cloud)
         if result is None:
             response.success = False
             response.message = 'CuRobo.plan_pick failed for all candidates.'
             return response
 
-        approach_jt = interp_traj_to_ros(
+        approach_jt = _unwrap_traj(
             result.approach_interpolated_trajectory,
-            last_tstep=getattr(result, 'approach_interpolated_last_tstep', None),
+            getattr(result, 'approach_interpolated_last_tstep', None),
         )
         grasp_jt, n_preclose = _append_preclose_insertion_to_trajectory(
-            interp_traj_to_ros(
+            _unwrap_traj(
                 result.grasp_interpolated_trajectory,
-                last_tstep=getattr(result, 'grasp_interpolated_last_tstep', None),
+                getattr(result, 'grasp_interpolated_last_tstep', None),
             )
         )
-        lift_jt = interp_traj_to_ros(
+        lift_jt = _unwrap_traj(
             result.lift_interpolated_trajectory,
-            last_tstep=getattr(result, 'lift_interpolated_last_tstep', None),
+            getattr(result, 'lift_interpolated_last_tstep', None),
         )
 
         response.trajectory = concat_trajectories(approach_jt, grasp_jt)
@@ -263,6 +341,87 @@ class CuRoboService(Node):
         response.trajectory = trajectory
         response.message = (
             f'CuRobo trajectory planned: {len(trajectory.points)} points.')
+        return response
+
+    def _handle_place_or_home(self, curobo, request, joint_state, response):
+        """goal_name mode: collision-aware home OR collision-off place transit."""
+        goal = request.goal_name
+        curobo.update_joint_state(joint_state)
+
+        try:
+            cfg = load_place_poses()
+        except Exception as exc:
+            response.success = False
+            response.message = f'Failed to load place_poses.yml: {exc}'
+            return response
+
+        target_pose = resolve_target_pose(cfg, goal)
+        if target_pose is None:
+            response.success = False
+            response.message = f'resolve_target_pose returned None for goal={goal!r}'
+            return response
+
+        if goal == 'home':
+            # Home: collision-aware trajectory (TSDF active).
+            trajectory = curobo.plan_trajectory(target_pose, joint_state)
+            if trajectory is None or not trajectory.points:
+                response.success = False
+                response.message = f'Home trajectory planning failed for goal={goal!r}.'
+                return response
+            response.trajectory = trajectory
+            response.success = True
+            response.message = (
+                f'Home trajectory planned: {len(trajectory.points)} points.')
+            return response
+
+        # Place: collision-off safe-Z transit with waypoints.
+        tcp_result = curobo.tool_pose(joint_state)
+        if tcp_result is None:
+            response.success = False
+            response.message = 'FK failed: cannot compute current TCP pose for transit.'
+            return response
+        current_xyz, _ = tcp_result
+
+        transit_z = float(cfg['transit_z'])
+        waypoints = build_transit_waypoints(current_xyz, target_pose, transit_z)
+
+        trajectory = curobo.plan_place(waypoints, joint_state)
+        if trajectory is None or not trajectory.points:
+            response.success = False
+            response.message = f'Place trajectory planning failed for goal={goal!r}.'
+            return response
+
+        response.trajectory = trajectory
+        response.success = True
+        response.message = (
+            f'Place trajectory planned: {len(trajectory.points)} points '
+            f'(goal={goal!r}).')
+
+        # Handle bookshelf insert/retract if applicable.
+        if is_bookshelf_target(cfg, goal):
+            entry = cfg[goal]
+            insert_depth = float(entry.get('insert_depth_m', 0.0))
+            retract_depth = float(entry.get('retract_depth_m', 0.0))
+            if insert_depth > 0:
+                from pipeline_orchestrator.place_pose_utils import translate_pose_along_x
+                insert_pose = translate_pose_along_x(target_pose, insert_depth)
+                insert_traj = curobo.plan_place([insert_pose], joint_state)
+                if insert_traj and insert_traj.points:
+                    response.insert_trajectory = insert_traj
+                retract_pose = translate_pose_along_x(target_pose, -retract_depth)
+                retract_traj = curobo.plan_place([retract_pose], joint_state)
+                if retract_traj and retract_traj.points:
+                    response.retract_trajectory = retract_traj
+
+        # Pause TSDF mapping for the duration of the place transit.
+        pause_sec = (_trajectory_duration_sec(response.trajectory)
+                     + _trajectory_duration_sec(
+                         getattr(response, 'insert_trajectory', None))
+                     + _trajectory_duration_sec(
+                         getattr(response, 'retract_trajectory', None))
+                     + _env_float('PIPELINE_GRASP_MAPPING_PAUSE_EXTRA_SEC', 2.0))
+        curobo.pause_mapping(pause_sec)
+
         return response
 
 
@@ -344,6 +503,15 @@ def _trajectory_duration_sec(trajectory) -> float:
         return 0.0
     stamp = trajectory.points[-1].time_from_start
     return float(stamp.sec) + float(stamp.nanosec) * 1e-9
+
+
+def _unwrap_traj(traj_or_wrapper, last_tstep):
+    """Extract a JointTrajectory from either a cuRobo interpolated tensor
+    or a _TrajWrapper (used when plan_pick uses plan_trajectory internally)."""
+    from pipeline_orchestrator.curobo import _TrajWrapper
+    if isinstance(traj_or_wrapper, _TrajWrapper):
+        return traj_or_wrapper.get_ros_traj()
+    return interp_traj_to_ros(traj_or_wrapper, last_tstep=last_tstep)
 
 
 def main(args=None) -> None:

@@ -35,6 +35,7 @@ from curobo.types import JointState as CuRoboJointState
 from curobo.types import Pose as CuRoboPose
 
 from pipeline_orchestrator.pipeline_utils import (
+    ROBOTIQ_2F_85_TCP_Z_OFFSET,
     env_bool as _env_bool,
     env_float as _env_float,
     env_int as _env_int,
@@ -48,7 +49,17 @@ OVERHEAD_FRAME = 'camera_color_optical_frame'
 WRIST_FRAME = 'wrist_camera_color_optical_frame'
 BASE_FRAME = 'base_link'
 MIN_FRAMES = 5
-UR5_CONFIG = '/ros2_ws/src/pipeline_orchestrator/config/ur5_curobo.yml'
+
+def _ur5_config_path() -> str:
+    """Resolve ur5_curobo.yml via ament_index, falling back to the Docker path."""
+    try:
+        from ament_index_python.packages import get_package_share_directory
+        share = get_package_share_directory('pipeline_orchestrator')
+        return os.path.join(share, 'config', 'ur5_curobo.yml')
+    except Exception:
+        return '/ros2_ws/src/pipeline_orchestrator/config/ur5_curobo.yml'
+
+UR5_CONFIG = _ur5_config_path()
 JOINT_NAMES = (
     'shoulder_pan_joint',
     'shoulder_lift_joint',
@@ -60,7 +71,13 @@ JOINT_NAMES = (
 
 TOPK_GRASPS = 10
 INTERP_DT = 0.02
-GRIPPER_TCP_Z_OFFSET = 0.1034
+GRIPPER_TCP_Z_OFFSET = ROBOTIQ_2F_85_TCP_Z_OFFSET  # imported from pipeline_utils
+
+# Robotiq 2F-85: distance from tool0 origin to fingertip contact at full open.
+_FINGERTIP_LEN = 0.136   # m
+# Minimum clearance between fingertip and floor surface before a grasp is rejected.
+# Keep small — cuRobo's floor cuboid handles motion-level avoidance.
+_FLOOR_CLEARANCE_M = 0.010  # m — 1 cm: rejects only sub-table grasps
 
 
 class CuRobo:
@@ -121,6 +138,7 @@ class CuRobo:
         )
 
         self._planner = self._build_planner()
+        self._static_cuboids = self._build_static_cuboids()
         self._subscriptions = []
         self._subscribe_depth_streams(node)
         self._logger.info(
@@ -366,82 +384,195 @@ class CuRobo:
                 f'{type(exc).__name__}: {exc}')
             return depth
 
-    def plan_pick(self, grasp_candidates, joint_states):
-        """Plan approach -> grasp -> lift for ranked GraspGen TCP poses."""
-        with self._cuda_lock:
-            return self._plan_pick_locked(grasp_candidates, joint_states)
+    def plan_pick(self, grasp_candidates, joint_states, object_cloud=None):
+        """Plan approach -> grasp -> lift for ranked GraspGen TCP poses.
 
-    def _plan_pick_locked(self, grasp_candidates, joint_states):
+        Args:
+            grasp_candidates: Ranked grasp pose dicts from GraspGenX.
+            joint_states: Current /joint_states message.
+            object_cloud: (N, 3) float32 ndarray of the segmented object in
+                base_link frame. When provided, the object's voxels are carved
+                out of the TSDF collision world before planning so cuRobo does
+                not treat the target object itself as an obstacle.
+        """
+        with self._cuda_lock:
+            return self._plan_pick_locked(grasp_candidates, joint_states, object_cloud)
+
+    def _plan_pick_locked(self, grasp_candidates, joint_states, object_cloud=None):
+        """Plan pick using plan_trajectory for each candidate (approach + descent + lift).
+
+        Strategy per candidate:
+          1. plan_trajectory → approach pose (approach_offset above grasp in tool-z)
+          2. plan_trajectory → grasp pose (short descent; floor cuboid prevents going too low)
+          3. plan_trajectory → lift pose (lift_offset above grasp in world-z)
+
+        Retries over multiple approach offsets and falls back to relaxed collision world.
+        Results are wrapped in _TrajWrapper so curobo_service._handle_pick's
+        _unwrap_traj → get_ros_traj path is used (bypasses interp_traj_to_ros).
+        """
+        import types
+
         try:
             self.update_joint_state(joint_states)
-            self._update_world_from_tsdf()
+            self._update_world_from_tsdf(object_cloud=object_cloud)
             current = self._ros_js_to_curobo(joint_states)
-            candidates = list(grasp_candidates)
-            collision_links = _pick_disable_collision_links(self._planner)
-            last_status = 'unknown'
+
+            # Floor-clearance pre-filter: reject candidates where the fingertip
+            # would descend into the table. cuRobo collision spheres leave the
+            # fingertip region uncovered intentionally; this guard is the safety net.
+            floor_z = _env_float('PIPELINE_FLOOR_Z', -0.07)
+            min_tool0_z = floor_z + _FINGERTIP_LEN + _FLOOR_CLEARANCE_M
+            candidates = []
+            for i, candidate in enumerate(grasp_candidates):
+                grasp_4x4 = _candidate_pose_4x4(candidate)
+                t_tool_grasp = np.eye(4, dtype=np.float32)
+                t_tool_grasp[2, 3] = _effective_gripper_tcp_z_offset()
+                tool_4x4 = grasp_4x4 @ np.linalg.inv(t_tool_grasp)
+                tool0_z = float(tool_4x4[2, 3])
+                if tool0_z < min_tool0_z:
+                    self._logger.warn(
+                        f'plan_pick: skipping candidate {i} — '
+                        f'tool0_z={tool0_z:.3f} < floor_min {min_tool0_z:.3f}')
+                else:
+                    candidates.append((i, candidate, tool_4x4))
+
+            if not candidates:
+                self._logger.warn('plan_pick: no candidates passed floor clearance filter')
+                return None
+
+            lift_offset = _env_float('PIPELINE_CUROBO_PICK_LIFT_OFFSET', 0.12)
+            approach_offsets = _pick_approach_offsets()
 
             for world_mode in self._pick_world_modes():
                 if world_mode == 'relaxed':
                     self._clear_collision_world()
-                    self._logger.warn(
-                        'CuRobo.plan_pick retrying with relaxed collision world; '
-                        'TSDF may have blocked a grasp segment.')
-                lift_offset = _pick_lift_offset()
-                for approach_offset in _pick_approach_offsets():
-                    for candidate_index, candidate in enumerate(candidates):
-                        goalset = self._grasps_to_goalset([candidate])
-                        _reset_planner_seed(self._planner)
-                        result = self._planner.plan_grasp(
-                            grasp_poses=goalset,
-                            current_state=current,
-                            grasp_approach_offset=approach_offset,
-                            grasp_approach_in_tool_frame=True,
-                            grasp_lift_axis='z',
-                            grasp_lift_offset=lift_offset,
-                            grasp_lift_in_tool_frame=False,
-                            plan_approach_to_grasp=True,
-                            plan_grasp_to_lift=True,
-                            disable_collision_links=collision_links,
-                        )
-                        if _result_success(result):
-                            torch.cuda.synchronize()
-                            self._logger.info(
-                                'CuRobo.plan_pick succeeded: '
-                                f'world={world_mode} '
-                                f'candidate={candidate_index} '
-                                f'approach={approach_offset:.3f}m '
-                                f'lift={lift_offset:.3f}m'
-                            )
-                            return result
-                        last_status = getattr(result, 'status', 'unknown')
-                        torch.cuda.synchronize()
-                        self._logger.warn(
-                            'CuRobo.plan_pick failed: '
-                            f'world={world_mode} '
-                            f'candidate={candidate_index} '
-                            f'approach={approach_offset:.3f}m '
-                            f'lift={lift_offset:.3f}m '
-                            f'status={last_status}'
-                        )
-                        self._logger.warn(
-                            'CuRobo.plan_pick diagnostics: '
-                            + _pick_failure_diagnostics(
-                                result,
-                                [candidate],
-                                world_mode=world_mode,
-                                candidate_index=candidate_index,
-                                approach_offset=approach_offset,
-                                lift_offset=lift_offset,
-                                disabled_collision_links=collision_links,
-                            )
-                        )
+                    self._logger.warn('plan_pick: retrying with relaxed collision world')
 
-            self._logger.warn(
-                f'CuRobo.plan_pick: all attempts exhausted ({last_status})')
+                for approach_offset in approach_offsets:
+                    for orig_i, candidate, tool_4x4 in candidates:
+                        result = self._plan_approach_descent_lift(
+                            orig_i, tool_4x4, current, approach_offset,
+                            lift_offset, world_mode,
+                        )
+                        if result is not None:
+                            return result
+
+            self._logger.warn('plan_pick: all attempts exhausted')
             return None
         except Exception as exc:
             self._logger.error(f'CuRobo.plan_pick error: {exc}')
             return None
+
+    def _plan_approach_descent_lift(
+        self, candidate_index, tool_4x4, current, approach_offset,
+        lift_offset, world_mode,
+    ):
+        """Plan approach → descent → lift using three plan_trajectory calls.
+
+        Returns a SimpleNamespace with _TrajWrapper fields matching the interface
+        curobo_service._handle_pick expects:
+          .approach_interpolated_trajectory  — home → approach pose
+          .grasp_interpolated_trajectory     — approach → grasp pose (descent)
+          .lift_interpolated_trajectory      — grasp → lift pose
+          .success
+        """
+        import types
+
+        z_hat = tool_4x4[:3, 2]  # tool0 z-axis in world frame (points toward object)
+
+        # Approach pose: back off along tool-z by |approach_offset|.
+        # approach_offset is negative (e.g. -0.10); z_hat points down for top grasps,
+        # so approach = grasp - |offset| * z_hat_down = grasp + offset_above.
+        approach_4x4 = tool_4x4.copy()
+        approach_4x4[:3, 3] = tool_4x4[:3, 3] + approach_offset * z_hat
+        approach_pose = self._pose_from_4x4(approach_4x4)
+
+        _reset_planner_seed(self._planner)
+        approach_traj = self._plan_trajectory_locked(approach_pose, None, current=current)
+        if approach_traj is None or not approach_traj.points:
+            self._logger.warn(
+                f'plan_pick: approach failed '
+                f'world={world_mode} candidate={candidate_index} '
+                f'approach={approach_offset:.3f}m')
+            return None
+
+        # Descent: from approach end to grasp pose, with floor clearance clamp.
+        # Clamp tool0_z so the fingertip never physically contacts the table.
+        # cuRobo collision spheres intentionally don't cover the fingertip region
+        # (z=0.095-0.136 from tool0), so this explicit clamp is the safety net.
+        floor_z = _env_float('PIPELINE_FLOOR_Z', -0.07)
+        descent_margin = _env_float('PIPELINE_CUROBO_DESCENT_MARGIN', 0.025)
+        min_descent_z = floor_z + _FINGERTIP_LEN + descent_margin
+        descent_4x4 = tool_4x4.copy()
+        original_z = float(tool_4x4[2, 3])
+        clamped_z = max(original_z, min_descent_z)
+        if clamped_z > original_z:
+            self._logger.info(
+                f'plan_pick: descent z clamped {original_z:.3f} → {clamped_z:.3f}m '
+                f'(floor={floor_z:.3f} + tip={_FINGERTIP_LEN:.3f} + '
+                f'margin={descent_margin:.3f})')
+        descent_4x4[2, 3] = clamped_z
+        grasp_pose = self._pose_from_4x4(descent_4x4)
+        approach_end = self._ros_js_to_curobo(self._traj_end_joint_state(approach_traj))
+        _reset_planner_seed(self._planner)
+        descent_traj = self._plan_trajectory_locked(grasp_pose, None, current=approach_end)
+        if descent_traj is None or not descent_traj.points:
+            self._logger.warn(
+                f'plan_pick: descent failed — closing at approach pose '
+                f'world={world_mode} candidate={candidate_index}')
+            # Fallback: close gripper at approach position (no descent)
+            descent_traj = approach_traj
+
+        # Lift pose: grasp xyz + lift_offset in world-z, same orientation.
+        lift_xyz = tool_4x4[:3, 3].copy()
+        lift_xyz[2] += lift_offset
+        quat_xyzw = R.from_matrix(tool_4x4[:3, :3]).as_quat()
+        lift_pose = [
+            float(lift_xyz[0]), float(lift_xyz[1]), float(lift_xyz[2]),
+            float(quat_xyzw[3]), float(quat_xyzw[0]),
+            float(quat_xyzw[1]), float(quat_xyzw[2]),
+        ]
+        grasp_end = self._ros_js_to_curobo(self._traj_end_joint_state(descent_traj))
+        _reset_planner_seed(self._planner)
+        lift_traj = self._plan_trajectory_locked(lift_pose, None, current=grasp_end)
+        if lift_traj is None or not lift_traj.points:
+            self._logger.warn(
+                f'plan_pick: lift failed '
+                f'world={world_mode} candidate={candidate_index} '
+                f'approach={approach_offset:.3f}m lift={lift_offset:.3f}m')
+            return None
+
+        torch.cuda.synchronize()
+        self._logger.info(
+            f'plan_pick: succeeded '
+            f'world={world_mode} candidate={candidate_index} '
+            f'approach={approach_offset:.3f}m lift={lift_offset:.3f}m')
+
+        result = types.SimpleNamespace()
+        result.success = True
+        result.approach_interpolated_trajectory = _TrajWrapper(approach_traj)
+        result.approach_interpolated_last_tstep = None
+        result.grasp_interpolated_trajectory = _TrajWrapper(descent_traj)
+        result.grasp_interpolated_last_tstep = None
+        result.lift_interpolated_trajectory = _TrajWrapper(lift_traj)
+        result.lift_interpolated_last_tstep = None
+        return result
+
+    def _pose_from_4x4(self, mat: np.ndarray):
+        """Convert 4×4 pose matrix to (x,y,z,qw,qx,qy,qz) tuple."""
+        xyz = mat[:3, 3].tolist()
+        quat_xyzw = R.from_matrix(mat[:3, :3]).as_quat()
+        return [xyz[0], xyz[1], xyz[2],
+                float(quat_xyzw[3]), float(quat_xyzw[0]),
+                float(quat_xyzw[1]), float(quat_xyzw[2])]
+
+    def _traj_end_joint_state(self, traj: 'JointTrajectory'):
+        """Build a minimal JointState from the last point of a JointTrajectory."""
+        from sensor_msgs.msg import JointState as RosJointState
+        js = RosJointState()
+        js.name = list(traj.joint_names)
+        js.position = list(traj.points[-1].positions)
+        return js
 
     def plan_trajectory(self, goal_pose, joint_states):
         """Plan a single tool0 trajectory for place/home style targets."""
@@ -452,10 +583,65 @@ class CuRobo:
             self._logger.error(f'CuRobo.plan_trajectory error: {exc}')
             return None
 
-    def _plan_trajectory_locked(self, goal_pose, joint_states):
-        self.update_joint_state(joint_states)
-        self._update_world_from_tsdf()
+    def plan_place(self, waypoints: list, joint_states) -> 'JointTrajectory | None':
+        """Collision-off safe-Z transit through waypoints to a place destination.
+
+        The carried object is invisible to the TSDF collision world, so we
+        disable collision checking entirely and follow the waypoints with a
+        rule-based lift → traverse → descend path.
+
+        Args:
+            waypoints: List of geometry_msgs/Pose targets (lift, transit, descend).
+            joint_states: Starting /joint_states for the transit.
+
+        Returns:
+            A single concatenated JointTrajectory through all waypoints, or None.
+        """
+        try:
+            with self._cuda_lock:
+                return self._plan_place_locked(waypoints, joint_states)
+        except Exception as exc:
+            self._logger.error(f'CuRobo.plan_place error: {exc}')
+            return None
+
+    def _plan_place_locked(self, waypoints: list, joint_states) -> 'JointTrajectory | None':
+        # Clear collision world: carried object would be treated as obstacle.
+        self._clear_collision_world()
+        self._logger.info(
+            f'CuRobo.plan_place: planning {len(waypoints)}-waypoint transit '
+            '(collision world cleared for carried object).')
+
         current = self._ros_js_to_curobo(joint_states)
+        trajectories = []
+
+        for i, pose in enumerate(waypoints):
+            _reset_planner_seed(self._planner)
+            traj = self._plan_trajectory_locked(pose, None, current=current)
+            if traj is None or not traj.points:
+                self._logger.warn(
+                    f'CuRobo.plan_place: waypoint {i} planning failed.')
+                return None
+            trajectories.append(traj)
+            current = self._ros_js_to_curobo(self._traj_end_joint_state(traj))
+
+        if not trajectories:
+            return None
+
+        result = trajectories[0]
+        for traj in trajectories[1:]:
+            result = concat_trajectories(result, traj)
+
+        self._logger.info(
+            f'CuRobo.plan_place succeeded: '
+            f'{len(result.points)} total points across {len(waypoints)} waypoints.')
+        return result
+
+    def _plan_trajectory_locked(self, goal_pose, joint_states, current=None):
+        if joint_states is not None:
+            self.update_joint_state(joint_states)
+            self._update_world_from_tsdf()
+        if current is None:
+            current = self._ros_js_to_curobo(joint_states)
         goal = self._single_goal(goal_pose)
         last_status = 'unknown'
         for world_mode in self._trajectory_world_modes():
@@ -501,7 +687,7 @@ class CuRobo:
                 f'CuRobo: FK failed: {type(exc).__name__}: {exc}')
             return None
 
-    def _update_world_from_tsdf(self) -> bool:
+    def _update_world_from_tsdf(self, object_cloud: np.ndarray | None = None) -> bool:
         with self._lock:
             frame_count = self._frame_count
             last_update = self._last_world_update_frame
@@ -512,39 +698,225 @@ class CuRobo:
                 f'CuRobo: map not ready ({frame_count}/{required_frames} '
                 'dual-camera frames); planning in current/free collision model.')
             return False
-        if last_update == frame_count:
+        if last_update == frame_count and object_cloud is None:
             return True
 
         torch.cuda.synchronize()
         voxel_grid = self._mapper.compute_esdf()
+        if object_cloud is not None and len(object_cloud) > 0:
+            voxel_grid = self._carve_object_from_voxel_grid(voxel_grid, object_cloud)
         try:
             self._planner.clear_scene_cache()
         except Exception:
             pass
-        self._planner.update_world(SceneCfg(voxel=[voxel_grid]))
+        # Always include static cuboids (floor + baskets) so they survive TSDF updates.
+        self._planner.update_world(SceneCfg(cuboid=self._static_cuboids, voxel=[voxel_grid]))
         torch.cuda.synchronize()
         with self._lock:
             self._last_world_update_frame = frame_count
         if self._enable_viz:
             self._cache_viz_tsdf()
+        carved = f' (carved {len(object_cloud)} object pts)' if object_cloud is not None else ''
         self._logger.info(
-            f'CuRobo: updated TSDF collision world from {frame_count} frames.')
+            f'CuRobo: updated TSDF collision world from {frame_count} frames{carved}.')
         return True
 
+    def _carve_object_from_voxel_grid(self, voxel_grid, object_cloud_np: np.ndarray):
+        """Set voxels near the target object AND its approach corridor to free space.
+
+        Two regions are carved:
+        1. Object voxels (±1 dilation) — prevents false self-collision with target.
+        2. Approach corridor — a vertical column above the object bounding box,
+           clearing floating noise points in the TSDF that would block top-down
+           grasp approach paths.
+
+        Falls back silently so planning always has a relaxed-world retry.
+        """
+        try:
+            feature = voxel_grid.feature_tensor
+            if feature is None:
+                return voxel_grid
+
+            # Normalise shape: drop leading batch dimensions until 3D or 4D.
+            while feature.dim() > 4:
+                feature = feature.squeeze(0)
+
+            # Support both (nx, ny, nz) and (nx, ny, nz, C) layouts.
+            is_4d = feature.dim() == 4
+            nx, ny, nz = feature.shape[0], feature.shape[1], feature.shape[2]
+            voxel_size = float(voxel_grid.voxel_size)
+
+            # Grid centre from pose [x, y, z, qw, qx, qy, qz].
+            pose = voxel_grid.pose
+            center = torch.tensor(
+                [pose[0], pose[1], pose[2]],
+                dtype=torch.float32, device=feature.device)
+            dims = torch.tensor(
+                list(voxel_grid.dims),
+                dtype=torch.float32, device=feature.device)
+            origin = center - dims / 2.0
+
+            # ── region 1: object points (±1 dilation) ───────────────────────
+            pts = torch.tensor(
+                object_cloud_np, dtype=torch.float32, device=feature.device)
+            idx = ((pts - origin) / voxel_size).long()
+
+            offsets = torch.tensor(
+                [[di, dj, dk]
+                 for di in range(-1, 2)
+                 for dj in range(-1, 2)
+                 for dk in range(-1, 2)],
+                dtype=torch.long, device=feature.device,
+            )
+            obj_idx = (idx.unsqueeze(1) + offsets.unsqueeze(0)).reshape(-1, 3)
+
+            # ── region 2: cylindrical approach corridor above object ─────────
+            # Removes floating TSDF noise directly above the target object so
+            # top-down approach paths are not blocked.
+            #
+            # Uses a CYLINDER (not a rectangle) so nearby objects (e.g. a cola
+            # can 10-15 cm away) are NOT accidentally erased from the collision
+            # world.  Rectangle + padding was removing real obstacles that fell
+            # inside the padded bbox of elongated objects like hammers.
+            corridor_radius = _env_float(
+                'PIPELINE_CUROBO_CORRIDOR_RADIUS', 0.06)   # 6 cm radius cylinder
+            corridor_z_above = _env_float(
+                'PIPELINE_CUROBO_CORRIDOR_Z_ABOVE', 0.35)  # 35 cm above object top
+
+            obj_np = np.asarray(object_cloud_np, dtype=np.float32)
+            cx = float(obj_np[:, 0].mean())
+            cy = float(obj_np[:, 1].mean())
+            z_obj_top = float(obj_np[:, 2].max())
+            z_cor_top = z_obj_top + corridor_z_above
+
+            # Sample a grid inside the bounding square, then mask to circle.
+            xs = np.arange(cx - corridor_radius, cx + corridor_radius + voxel_size, voxel_size)
+            ys = np.arange(cy - corridor_radius, cy + corridor_radius + voxel_size, voxel_size)
+            zs = np.arange(z_obj_top, z_cor_top + voxel_size, voxel_size)
+            if xs.size > 0 and ys.size > 0 and zs.size > 0:
+                gx, gy, gz = np.meshgrid(xs, ys, zs, indexing='ij')
+                in_circle = (gx - cx) ** 2 + (gy - cy) ** 2 <= corridor_radius ** 2
+                corridor_pts_np = np.stack(
+                    [gx[in_circle].ravel(),
+                     gy[in_circle].ravel(),
+                     gz[in_circle].ravel()], axis=1
+                ).astype(np.float32)
+                cor_pts = torch.tensor(
+                    corridor_pts_np, dtype=torch.float32, device=feature.device)
+                cor_idx = ((cor_pts - origin) / voxel_size).long()
+            else:
+                cor_idx = torch.zeros((0, 3), dtype=torch.long, device=feature.device)
+
+            # ── merge and clamp to grid bounds ────────────────────────────────
+            all_idx = torch.cat([obj_idx, cor_idx], dim=0)
+            valid = (
+                (all_idx[:, 0] >= 0) & (all_idx[:, 0] < nx) &
+                (all_idx[:, 1] >= 0) & (all_idx[:, 1] < ny) &
+                (all_idx[:, 2] >= 0) & (all_idx[:, 2] < nz)
+            )
+            all_idx = all_idx[valid]
+
+            if all_idx.shape[0] == 0:
+                return voxel_grid
+
+            # Positive ESDF value = free space (distance to nearest surface).
+            if is_4d:
+                feature[all_idx[:, 0], all_idx[:, 1], all_idx[:, 2], 0] = voxel_size
+            else:
+                feature[all_idx[:, 0], all_idx[:, 1], all_idx[:, 2]] = voxel_size
+
+            n_obj = obj_idx.shape[0]
+            n_cor = all_idx.shape[0] - n_obj
+            self._logger.info(
+                f'CuRobo: carved {n_obj} object voxels + {n_cor} corridor voxels '
+                f'({len(object_cloud_np)} pts, voxel_size={voxel_size:.3f}m, '
+                f'corridor r={corridor_radius:.2f}m z_above={corridor_z_above:.2f}m).')
+            return voxel_grid
+        except Exception as exc:
+            self._logger.warn(
+                f'CuRobo: _carve_object_from_voxel_grid failed (non-fatal): '
+                f'{type(exc).__name__}: {exc}')
+            return voxel_grid
+
+    def _build_static_cuboids(self) -> list:
+        """Build permanent collision obstacles: floor/table and storage baskets.
+
+        These are always included in every update_world call so cuRobo never
+        plans a path that goes through the floor or the basket structures,
+        even when TSDF voxels are cleared (e.g. during place motion).
+
+        Coordinate convention (base_link):
+          - Table surface: z ≈ -0.07 m  → floor cuboid top at -0.07 m
+          - Storage baskets sit on the side platforms at y ≈ ±0.5 m.
+            Basket walls extend from table surface up to ~0.28 m.
+            The place poses (tool0 z = 0.37 m) are above the basket tops,
+            so the arm descends from transit height (0.50 m) straight down
+            through the open basket top — basket wall cuboids don't block this.
+
+        All cuboid poses: [x, y, z, qw, qx, qy, qz]
+        """
+        from curobo._src.geom.types import Cuboid
+
+        floor_top_z = float(os.environ.get('PIPELINE_FLOOR_Z', -0.07))
+        floor_thickness = 0.12
+        floor = Cuboid(
+            name='floor',
+            pose=[0.0, 0.0, floor_top_z - floor_thickness / 2, 1.0, 0.0, 0.0, 0.0],
+            dims=[2.5, 2.5, floor_thickness],
+        )
+
+        cuboids = [floor]
+
+        # Storage basket A (positive Y side).
+        # X: [-0.021, 0.099] → center 0.039, span 0.12 + 0.08 margin = 0.20
+        # Y: [ 0.439, 0.649] → center 0.544, span 0.21 + 0.09 margin = 0.30
+        # Basket wall top must be below the gripper collision sphere when at place pose.
+        # place pose tool0 z=0.370 → lowest sphere bottom = 0.370-0.055-0.040 = 0.275 m
+        # With activation_dist=0.05 m: basket_wall_top < 0.275-0.05 = 0.225 m
+        # Use 0.20 m (5 cm margin below the limit). Tune with PIPELINE_BASKET_WALL_TOP.
+        basket_wall_top = float(os.environ.get('PIPELINE_BASKET_WALL_TOP', 0.20))
+        basket_height = basket_wall_top - floor_top_z
+        basket_center_z = floor_top_z + basket_height / 2
+        if _env_bool('PIPELINE_STATIC_BASKETS', True):
+            cuboids.append(Cuboid(
+                name='basket_a',
+                pose=[0.039, 0.544, basket_center_z, 1.0, 0.0, 0.0, 0.0],
+                dims=[0.20, 0.30, basket_height],
+            ))
+            # Storage basket B (negative Y side).
+            # X: [-0.051, 0.069] → center 0.009, span 0.12 + 0.08 = 0.20
+            # Y: [-0.431,-0.611] → center -0.521, span 0.18 + 0.12 = 0.30
+            cuboids.append(Cuboid(
+                name='basket_b',
+                pose=[0.009, -0.521, basket_center_z, 1.0, 0.0, 0.0, 0.0],
+                dims=[0.20, 0.30, basket_height],
+            ))
+
+        self._logger.info(
+            f'CuRobo: static collision world — floor top z={floor_top_z:.3f} m, '
+            f'{"baskets A+B included" if len(cuboids) > 1 else "baskets disabled"}.')
+        return cuboids
+
     def _clear_collision_world(self) -> None:
+        """Reset world to static obstacles only (floor + baskets), clearing TSDF voxels."""
         try:
             self._planner.clear_scene_cache()
         except Exception:
             pass
-        self._planner.update_world(SceneCfg())
+        self._planner.update_world(SceneCfg(cuboid=self._static_cuboids))
         torch.cuda.synchronize()
         with self._lock:
             self._last_world_update_frame = -1
 
     def _pick_world_modes(self) -> tuple:
-        if _env_bool('PIPELINE_CUROBO_PICK_RELAXED_RETRY', True):
+        # Try TSDF first for collision-aware planning, fall back to relaxed.
+        # TSDF was previously disabled due to wrist sphere / IK failures at
+        # low grasp heights. Tuned ur5_curobo.yml (smaller wrist spheres,
+        # extended self_collision_ignore) should fix this.
+        # Disable TSDF with: PIPELINE_CUROBO_PICK_USE_TSDF=false
+        if _env_bool('PIPELINE_CUROBO_PICK_USE_TSDF', True):
             return ('tsdf', 'relaxed')
-        return ('tsdf',)
+        return ('relaxed',)
 
     def _trajectory_world_modes(self) -> tuple:
         if _env_bool('PIPELINE_CUROBO_TRAJ_RELAXED_RETRY', True):
@@ -604,6 +976,7 @@ class CuRobo:
 
     def _build_planner(self):
         collision_cache = {
+            'primitive': 10,  # pre-allocate slots for static cuboids (floor, basket_a, basket_b + margin)
             'voxel': {
                 'layers': 1,
                 'dims': [7.0, 7.0, 7.0],
@@ -616,6 +989,8 @@ class CuRobo:
             collision_cache=collision_cache,
             max_goalset=TOPK_GRASPS,
             use_cuda_graph=_env_bool('PIPELINE_CUROBO_USE_CUDA_GRAPH', False),
+            optimizer_collision_activation_distance=_env_float(
+                'PIPELINE_CUROBO_COLLISION_ACTIVATION_DIST', 0.05),
         )
         planner = MotionPlanner(config)
         use_graph = _env_bool('PIPELINE_CUROBO_USE_CUDA_GRAPH', False)
@@ -749,58 +1124,15 @@ def _candidate_pose_4x4(candidate) -> np.ndarray:
 
 
 def _effective_gripper_tcp_z_offset() -> float:
-    close_extra = _env_float('PIPELINE_CUROBO_GRASP_CLOSE_EXTRA_M', 0.1025)
+    # graspgenX outputs tool0 frame directly, so base offset is 0.0.
+    # PIPELINE_CUROBO_GRASP_CLOSE_EXTRA_M can add extra depth if grasps are
+    # consistently too shallow (positive = push deeper toward object).
+    close_extra = _env_float('PIPELINE_CUROBO_GRASP_CLOSE_EXTRA_M', 0.0)
     if close_extra < 0.0:
         raise ValueError('PIPELINE_CUROBO_GRASP_CLOSE_EXTRA_M must be non-negative')
-    offset = GRIPPER_TCP_Z_OFFSET - close_extra
-    if offset <= 0.0:
-        raise ValueError(
-            'PIPELINE_CUROBO_GRASP_CLOSE_EXTRA_M must be smaller than '
-            'GRIPPER_TCP_Z_OFFSET'
-        )
-    return offset
+    return GRIPPER_TCP_Z_OFFSET + close_extra
 
 
-def _pick_approach_offsets() -> tuple:
-    raw = os.environ.get(
-        'PIPELINE_CUROBO_GRASP_APPROACH_OFFSETS', '-0.035,-0.06,-0.10')
-    return _parse_nonzero_float_list(
-        raw, 'PIPELINE_CUROBO_GRASP_APPROACH_OFFSETS')
-
-
-def _pick_lift_offset() -> float:
-    value = _env_float('PIPELINE_CUROBO_GRASP_LIFT_OFFSET', 0.10)
-    if abs(value) < 1e-6:
-        raise ValueError('PIPELINE_CUROBO_GRASP_LIFT_OFFSET must be nonzero')
-    return value
-
-
-def _parse_nonzero_float_list(raw: str, name: str) -> tuple:
-    offsets = []
-    for item in raw.split(','):
-        item = item.strip()
-        if not item:
-            continue
-        value = float(item)
-        if abs(value) < 1e-6:
-            raise ValueError(f'{name} values must be nonzero')
-        offsets.append(value)
-    if not offsets:
-        raise ValueError(f'{name} must not be empty')
-    return tuple(offsets)
-
-
-def _pick_disable_collision_links(planner) -> list:
-    raw = os.environ.get('PIPELINE_CUROBO_GRASP_DISABLE_COLLISION_LINKS')
-    if raw is not None:
-        return [item.strip() for item in raw.split(',') if item.strip()]
-    try:
-        links = (
-            planner.kinematics.config.kinematics_config.grasp_contact_link_names
-        )
-    except Exception:
-        links = None
-    return list(links) if links else ['tool0']
 
 
 def _pick_failure_diagnostics(
@@ -973,6 +1305,56 @@ def _trajectory_time_scale() -> float:
 
 def _min_tsdf_frames() -> int:
     return max(_env_int('PIPELINE_CUROBO_MIN_PLANNING_FRAMES', 5), MIN_FRAMES)
+
+
+
+def _make_hold_trajectory(traj: 'JointTrajectory') -> 'JointTrajectory':
+    """Return a single-point JointTrajectory that holds the last position
+    of *traj* for a short duration.  Used as the 'grasp' segment when
+    plan_pick uses plan_trajectory internally so that
+    concat_trajectories(approach, grasp) doesn't replay the full approach."""
+    from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+    from builtin_interfaces.msg import Duration as RosDuration
+    hold = JointTrajectory()
+    hold.joint_names = list(traj.joint_names)
+    last = traj.points[-1]
+    pt = JointTrajectoryPoint()
+    pt.positions = list(last.positions)
+    pt.velocities = [0.0] * len(last.positions)
+    pt.accelerations = [0.0] * len(last.positions)
+    # Short hold duration — just long enough for the gripper to close.
+    pt.time_from_start = RosDuration(sec=1, nanosec=0)
+    hold.points.append(pt)
+    return hold
+
+
+class _TrajWrapper:
+    """Wraps a ROS JointTrajectory so interp_traj_to_ros can handle it.
+
+    curobo_service._handle_pick calls interp_traj_to_ros on the
+    *_interpolated_trajectory fields. When plan_pick uses plan_trajectory
+    instead of plan_grasp, the trajectory is already a JointTrajectory,
+    so we just pass it through.
+    """
+
+    def __init__(self, ros_traj):
+        self._traj = ros_traj
+
+    # interp_traj_to_ros squeezes leading batch dims from .position tensor.
+    # We expose a fake tensor interface that returns the pre-built JointTrajectory.
+    def get_ros_traj(self):
+        return self._traj
+
+
+def _pick_approach_offsets() -> tuple:
+    """Approach offsets to try per candidate (negative = back off along tool-z)."""
+    raw = os.environ.get('PIPELINE_CUROBO_GRASP_APPROACH_OFFSETS', '-0.05,-0.10,-0.15')
+    offsets = []
+    for item in raw.split(','):
+        item = item.strip()
+        if item:
+            offsets.append(float(item))
+    return tuple(offsets) if offsets else (-0.05, -0.10, -0.15)
 
 
 def _reset_planner_seed(planner) -> None:

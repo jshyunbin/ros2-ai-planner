@@ -13,12 +13,19 @@ services:
       FASTDDS_BUILTIN_TRANSPORTS: ${FASTDDS_BUILTIN_TRANSPORTS:-UDPv4}
       FASTRTPS_DEFAULT_PROFILES_FILE: /ros2_ws/config/fastdds_no_shm.xml
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
-      GRASPGEN_REPO_DIR: /opt/GraspGen
-      GRASPGEN_MODELS_DIR: /opt/GraspGenModels
+      GRASPGENX_REPO_DIR: /opt/GraspGenX
+      GRASPGENX_CHECKPOINT_DIR: /opt/GraspGenXModel/release
+      GRASPGENX_GRIPPER: robotiq_2f_85
     volumes:
       - ./artifacts:/artifacts
       - ./config:/ros2_ws/config:ro
+      - torch_cache:/root/.cache/torch
+      - triton_cache:/root/.triton
     ipc: host
     stdin_open: true
     tty: true
     command: ["ros2", "launch", "pipeline_orchestrator", "deploy.launch.py"]
+
+volumes:
+  torch_cache:
+  triton_cache:

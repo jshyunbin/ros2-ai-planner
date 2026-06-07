@@ -5,6 +5,9 @@ geometry_msgs/Pose[] grasp_poses
 # Single goal for place/home planning (used when grasp_poses is empty).
 geometry_msgs/Pose grasp_pose
 sensor_msgs/JointState joint_state
+# Named destination for place/home routing (e.g. "home", "storage_1").
+# When set, curobo_service resolves the pose from place_poses.yml and ignores grasp_pose.
+string goal_name
 ---
 bool success
 string message
@@ -12,3 +15,7 @@ string message
 trajectory_msgs/JointTrajectory trajectory
 # Lift trajectory (arm lifts after gripper closes). Only populated for plan_pick().
 trajectory_msgs/JointTrajectory lift_trajectory
+# Bookshelf insertion trajectory. Populated only when goal_name is a bookshelf target.
+trajectory_msgs/JointTrajectory insert_trajectory
+# Bookshelf retraction trajectory. Populated only when insert_trajectory is populated.
+trajectory_msgs/JointTrajectory retract_trajectory
