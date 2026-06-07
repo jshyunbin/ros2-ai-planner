@@ -29,10 +29,15 @@ def load_place_poses(path: "str | PathLike") -> dict:
         raise ValueError(f"place_poses file is not a mapping: {path}")
     if not isinstance(data.get("transit_z"), (int, float)):
         raise ValueError("place_poses: 'transit_z' must be a number")
+    if "transit_floor_z" in data and not isinstance(
+            data["transit_floor_z"], (int, float)):
+        raise ValueError("place_poses: 'transit_floor_z' must be a number")
     if "home" not in data:
         raise ValueError("place_poses: missing 'home' target")
+    # Optional scalar (non-pose) config keys skipped by the per-target validation.
+    scalar_keys = {"transit_z", "transit_floor_z"}
     for name, entry in data.items():
-        if name == "transit_z":
+        if name in scalar_keys:
             continue
         if _looks_like_bookshelf(entry):
             _validate_xyzquat(entry.get("pre_insert"), f"{name}.pre_insert")

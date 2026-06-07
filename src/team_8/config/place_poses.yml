@@ -13,11 +13,22 @@
 
 # Lateral carry height. Capped by UR5 reach: at storage_1's xy radius (~0.65 m)
 # cuRobo IK reaches up to z~0.60; 0.80 was unreachable and broke the lift leg.
-transit_z: 0.55          # safe height for carrying an object laterally
+# Lowered to 0.45 (must stay above the storage drop z=0.37): the arm is now kept
+# off the table by transit_floor_z below, so the carry no longer has to be high,
+# and a lower carry eases reach for far grasps. The lift leg auto-lowers further
+# when even this is unreachable (see CuRobo._plan_lift_leg).
+transit_z: 0.45          # safe height for carrying an object laterally
+
+# Ground-plane floor for the carried-object transit, in base_link z. The transit
+# is collision-OFF for the held object, but cuRobo still checks every arm link
+# against a flat cuboid whose top sits at this z, so the arm can't drop through
+# the table. Set to the table-top height (raise it for more clearance over short
+# objects; keep it below the storage drop z=0.37 so it never blocks the descent).
+transit_floor_z: 0.0
 
 home:      {xyz: [0.152144, -0.010048, 0.615651], quat_xyzw: [-0.685513, 0.687999, -0.179150, 0.156950]}
-storage_1: {xyz: [0.068869,  0.649168, 0.370337], quat_xyzw: [1.0, 0.0, 0.0, 0.0]}
-storage_2: {xyz: [0.068870, -0.430833, 0.370327], quat_xyzw: [1.0, 0.0, 0.0, 0.0]}
+storage_1: {xyz: [0.000000,  0.550000, 0.370337], quat_xyzw: [1.0, 0.0, 0.0, 0.0]}
+storage_2: {xyz: [0.000000, -0.550000, 0.370327], quat_xyzw: [1.0, 0.0, 0.0, 0.0]}
 
 # bookshelf/shelf pose not yet provided — add when available, e.g.:
 # bookshelf:

@@ -456,7 +456,8 @@ def route_place_or_home(curobo, place_poses, goal_name, joint_state, response):
     plan = curobo.plan_place(
         pose, float(place_poses['transit_z']), bookshelf=bookshelf,
         insert_depth=insert_depth, retract_depth=retract_depth,
-        joint_states=joint_state)
+        joint_states=joint_state,
+        floor_z=float(place_poses.get('transit_floor_z', 0.0)))
     if plan is None or plan.move is None or not plan.move.points:
         response.success = False
         response.message = f'CuRobo.plan_place failed for {goal_name!r}.'

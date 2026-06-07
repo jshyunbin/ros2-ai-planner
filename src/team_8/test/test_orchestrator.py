@@ -684,10 +684,11 @@ def test_plan_place_storage_chains_three_collision_off_legs(monkeypatch):
     curobo.update_joint_state = MagicMock()
     curobo._ros_js_to_curobo = MagicMock(return_value='current')
     curobo.tool_pose = MagicMock(return_value=([0.3, 0.1, 0.5], [1.0, 0.0, 0.0, 0.0]))
-    cleared = []
-    curobo._clear_collision_world = MagicMock(side_effect=lambda: cleared.append(1))
+    floor_calls = []
+    curobo._set_transit_floor_world = MagicMock(
+        side_effect=lambda z: floor_calls.append(z))
 
-    def _fake_segment(mat, state, name):
+    def _fake_segment(mat, state, name, in_branch=False):
         jt = JointTrajectory()
         jt.points = [JointTrajectoryPoint()]
         return jt
@@ -702,7 +703,7 @@ def test_plan_place_storage_chains_three_collision_off_legs(monkeypatch):
     plan = curobo.plan_place(place_pose, transit_z=0.80, bookshelf=False,
                              joint_states=MagicMock())
 
-    assert cleared == [1]
+    assert floor_calls == [0.0]   # transit planned over a ground plane, not empty
     assert curobo._plan_pose_segment.call_count == 3
     assert plan.insert is None and plan.retract is None
     assert plan.move is not None
@@ -719,9 +720,9 @@ def test_plan_place_bookshelf_adds_insert_and_retract(monkeypatch):
     curobo.update_joint_state = MagicMock()
     curobo._ros_js_to_curobo = MagicMock(return_value='current')
     curobo.tool_pose = MagicMock(return_value=([0.3, 0.1, 0.5], [1.0, 0.0, 0.0, 0.0]))
-    curobo._clear_collision_world = MagicMock()
+    curobo._set_transit_floor_world = MagicMock()
 
-    def _fake_segment(mat, state, name):
+    def _fake_segment(mat, state, name, in_branch=False):
         jt = JointTrajectory()
         jt.points = [JointTrajectoryPoint()]
         return jt
@@ -741,6 +742,220 @@ def test_plan_place_bookshelf_adds_insert_and_retract(monkeypatch):
     assert plan.insert is not None and plan.retract is not None
     seg_names = [c.args[2] for c in curobo._plan_pose_segment.call_args_list]
     assert seg_names[-2:] == ['insert', 'retract']
+
+
+def test_set_transit_floor_world_builds_ground_plane(monkeypatch):
+    """The transit world is a single cuboid whose top face sits at floor_z."""
+    import team_8.curobo as mod
+
+    curobo = mod.CuRobo.__new__(mod.CuRobo)
+    curobo._logger = MagicMock()
+    curobo._lock = threading.Lock()
+    curobo._last_world_update_frame = 99
+    updates = []
+    planner = MagicMock()
+    planner.update_world = MagicMock(side_effect=lambda scene: updates.append(scene))
+    curobo._planner = planner
+    monkeypatch.setattr(mod.torch.cuda, 'synchronize', lambda: None)
+
+    curobo._set_transit_floor_world(0.05)
+
+    assert len(updates) == 1
+    scene = updates[0]
+    assert len(scene.cuboid) == 1            # exactly one ground plane, no voxels
+    assert len(scene.voxel) == 0
+    floor = scene.cuboid[0]
+    top_face_z = floor.pose[2] + floor.dims[2] / 2.0
+    assert abs(top_face_z - 0.05) < 1e-9     # top of the box is exactly at floor_z
+    assert floor.dims[0] >= 1.0 and floor.dims[1] >= 1.0  # spans the workspace
+    assert curobo._last_world_update_frame == -1
+
+
+def test_plan_place_lift_leg_lowers_height_until_reachable(monkeypatch):
+    """A far grasp's lift leg steps its target height down until IK is reachable.
+
+    Reproduces the far-banana failure: lifting straight to transit_z at a large
+    horizontal radius is unreachable, so the lift leg must lower its target until
+    the arm can reach it instead of aborting the whole place.
+    """
+    import team_8.curobo as mod
+    from geometry_msgs.msg import Pose
+    from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+
+    curobo = mod.CuRobo.__new__(mod.CuRobo)
+    curobo._cuda_lock = threading.Lock()
+    curobo._logger = MagicMock()
+    curobo.update_joint_state = MagicMock()
+    curobo._ros_js_to_curobo = MagicMock(return_value='current')
+    # Current tool sits at a far radius (~0.73 m), low z (post-lift grasp pose).
+    curobo.tool_pose = MagicMock(
+        return_value=([0.717, -0.152, 0.31], [1.0, 0.0, 0.0, 0.0]))
+    curobo._set_transit_floor_world = MagicMock()
+    curobo._final_joint_state = MagicMock(return_value='next')
+    monkeypatch.setattr(mod, 'concat_trajectories', lambda a, b: a)
+    monkeypatch.setenv('PIPELINE_PLACE_LIFT_HEIGHT_STEP_M', '0.05')
+
+    # IK only succeeds at z <= 0.45 at this far radius; higher lift fails.
+    reachable_ceiling = 0.45
+    seg_calls = []
+
+    def _fake_segment(mat, state, name, in_branch=False):
+        z = float(mat[2, 3])
+        seg_calls.append((name, round(z, 3)))
+        if name.startswith('lift@') and z > reachable_ceiling + 1e-9:
+            return None
+        jt = JointTrajectory()
+        jt.points = [JointTrajectoryPoint()]
+        return jt
+    curobo._plan_pose_segment = MagicMock(side_effect=_fake_segment)
+
+    place_pose = Pose()
+    place_pose.position.x, place_pose.position.y, place_pose.position.z = \
+        0.069, 0.649, 0.37
+    place_pose.orientation.x, place_pose.orientation.w = 1.0, 0.0
+
+    plan = curobo.plan_place(place_pose, transit_z=0.55, bookshelf=False,
+                             joint_states=MagicMock())
+
+    assert plan is not None and plan.move is not None
+    lift_calls = [c for c in seg_calls if c[0].startswith('lift@')]
+    assert lift_calls[0][1] == 0.55                       # tried full transit_z
+    assert any(z > reachable_ceiling for _, z in lift_calls)  # stepped down
+    assert lift_calls[-1][1] <= reachable_ceiling + 1e-9  # settled within reach
+    # Exactly one successful lift, plus the traverse + descend legs.
+    assert len([c for c in seg_calls if not c[0].startswith('lift@')]) == 2
+
+
+def test_plan_place_lift_leg_falls_back_to_current_height(monkeypatch):
+    """If no lifted height is reachable, the lift settles at the current height."""
+    import team_8.curobo as mod
+    from geometry_msgs.msg import Pose
+    from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+
+    curobo = mod.CuRobo.__new__(mod.CuRobo)
+    curobo._cuda_lock = threading.Lock()
+    curobo._logger = MagicMock()
+    curobo.update_joint_state = MagicMock()
+    curobo._ros_js_to_curobo = MagicMock(return_value='current')
+    curobo.tool_pose = MagicMock(
+        return_value=([0.75, 0.0, 0.34], [1.0, 0.0, 0.0, 0.0]))
+    curobo._set_transit_floor_world = MagicMock()
+    curobo._final_joint_state = MagicMock(return_value='next')
+    monkeypatch.setattr(mod, 'concat_trajectories', lambda a, b: a)
+    monkeypatch.setenv('PIPELINE_PLACE_LIFT_HEIGHT_STEP_M', '0.05')
+
+    seg_calls = []
+
+    def _fake_segment(mat, state, name, in_branch=False):
+        z = float(mat[2, 3])
+        seg_calls.append((name, round(z, 3)))
+        # Every lifted height fails; only the floor (current height) is reachable.
+        if name == 'lift@current' or not name.startswith('lift@'):
+            jt = JointTrajectory()
+            jt.points = [JointTrajectoryPoint()]
+            return jt
+        return None
+    curobo._plan_pose_segment = MagicMock(side_effect=_fake_segment)
+
+    place_pose = Pose()
+    place_pose.position.x, place_pose.position.y, place_pose.position.z = \
+        0.069, 0.649, 0.37
+    place_pose.orientation.x, place_pose.orientation.w = 1.0, 0.0
+
+    plan = curobo.plan_place(place_pose, transit_z=0.55, bookshelf=False,
+                             joint_states=MagicMock())
+
+    assert plan is not None and plan.move is not None
+    names = [c[0] for c in seg_calls]
+    assert 'lift@current' in names               # fell through to the floor
+    assert names[names.index('lift@current')]    # floor produced the lift leg
+    # Floor lift planned at the current height (0.34), not below it.
+    floor_call = next(c for c in seg_calls if c[0] == 'lift@current')
+    assert floor_call[1] == 0.34
+
+
+def _inbranch_curobo(planner):
+    import team_8.curobo as mod
+    curobo = mod.CuRobo.__new__(mod.CuRobo)
+    curobo._logger = MagicMock()
+    curobo._tool_goal_from_matrix = MagicMock(return_value='goal')
+    curobo._planner = planner
+    return curobo
+
+
+def test_plan_pose_inbranch_selects_nearest_ik_solution(monkeypatch):
+    """In-branch planning picks the IK solution closest to the current config
+    (not the lowest-cost/flipped one) and c-space-plans to that fixed goal."""
+    import team_8.curobo as mod
+    import torch
+
+    cur = torch.tensor([[0.0, -1.5, 1.5, -1.5, -1.5, 0.0]])
+    current_state = mod.CuRoboJointState.from_position(
+        cur, joint_names=list(mod.JOINT_NAMES))
+
+    # Seed 0 is a flipped branch (far in joint space); seed 1 is in-branch (near).
+    flipped = [3.0, 1.5, -1.5, 1.5, 1.5, 3.0]
+    near = [0.1, -1.4, 1.4, -1.4, -1.5, 0.05]
+    ik_result = SimpleNamespace(
+        solution=torch.tensor([[flipped, near]]),   # (1, 2, 6)
+        success=torch.tensor([[True, True]]))
+
+    planner = MagicMock()
+    planner.ik_solver.config.num_seeds = 2
+    planner.ik_solver.solve_pose = MagicMock(return_value=ik_result)
+    cspace_goals = []
+
+    def _fake_cspace(goal_state, current):
+        cspace_goals.append(goal_state)
+        return SimpleNamespace(success=torch.tensor([True]),
+                               get_interpolated_plan=lambda: 'plan',
+                               interpolated_last_tstep=None)
+    planner.plan_cspace = MagicMock(side_effect=_fake_cspace)
+
+    curobo = _inbranch_curobo(planner)
+    monkeypatch.setattr(mod, '_reset_planner_seed', lambda p: None)
+    monkeypatch.setattr(mod.torch.cuda, 'synchronize', lambda: None)
+    monkeypatch.setattr(mod, 'interp_traj_to_ros',
+                        lambda plan, last_tstep=None: 'ros_traj')
+
+    out = curobo._plan_pose_segment('mat', current_state, 'descend',
+                                    in_branch=True)
+
+    assert out == 'ros_traj'
+    # Solved IK across all seeds, then c-space-planned to the NEAR solution.
+    planner.ik_solver.solve_pose.assert_called_once()
+    assert planner.ik_solver.solve_pose.call_args.kwargs['return_seeds'] == 2
+    assert len(cspace_goals) == 1
+    chosen = cspace_goals[0].position.view(-1).tolist()
+    assert chosen == pytest.approx(near, abs=1e-5)
+    # plan_pose (the flip-prone free path) is never used in-branch.
+    planner.plan_pose.assert_not_called()
+
+
+def test_plan_pose_inbranch_fails_safely_when_ik_infeasible(monkeypatch):
+    """No feasible IK solution -> return None (fail the leg, never c-space-plan)."""
+    import team_8.curobo as mod
+    import torch
+
+    cur = torch.tensor([[0.0, -1.5, 1.5, -1.5, -1.5, 0.0]])
+    current_state = mod.CuRoboJointState.from_position(
+        cur, joint_names=list(mod.JOINT_NAMES))
+    ik_result = SimpleNamespace(
+        solution=torch.zeros((1, 2, 6)),
+        success=torch.tensor([[False, False]]))
+
+    planner = MagicMock()
+    planner.ik_solver.config.num_seeds = 2
+    planner.ik_solver.solve_pose = MagicMock(return_value=ik_result)
+
+    curobo = _inbranch_curobo(planner)
+    monkeypatch.setattr(mod, '_reset_planner_seed', lambda p: None)
+
+    out = curobo._plan_pose_segment('mat', current_state, 'descend',
+                                    in_branch=True)
+
+    assert out is None
+    planner.plan_cspace.assert_not_called()
 
 
 # --- route_place_or_home ---
