@@ -26,7 +26,7 @@ docker compose -f docker-compose.yml -f docker-compose.debug.yml up
 docker compose -f docker-compose.yml -f docker-compose.debug.yml run --rm ai_planner bash
 ```
 
-> In debug mode `./src` is live-mounted, so Python edits to node code take effect on the next launch. Changes to `setup.py`, entry points, or `*.launch.py` files still require a workspace rebuild inside the container: `colcon build --packages-select pipeline_orchestrator` (from `/ros2_ws`), then relaunch.
+> In debug mode `./src` is live-mounted, so Python edits to node code take effect on the next launch. Changes to `setup.py`, entry points, or `*.launch.py` files still require a workspace rebuild inside the container: `colcon build --packages-select team_8` (from `/ros2_ws`), then relaunch.
 
 The container uses `network_mode: host` — all ROS2 topics from the host are immediately visible inside.
 
@@ -34,7 +34,7 @@ The container uses `network_mode: host` — all ROS2 topics from the host are im
 
 Two ROS2 packages live under `src/`:
 
-- `pipeline_orchestrator` — all pipeline nodes (below).
+- `team_8` — all pipeline nodes (below).
 - `utils/riro_srvs` — custom service definitions (`StringString`, `PlanTrajectory`, …).
 
 Nodes (each is a `console_scripts` entry point in `setup.py`):
@@ -49,7 +49,7 @@ Nodes (each is a `console_scripts` entry point in `setup.py`):
 | `graspgen_client.py` | — | Minimal ZMQ client to the standalone GraspGen inference server. |
 | `segmentation_utils.py` | — | Pure helpers for segmentation (resize, depth back-projection, downsample, centroid, overlay). |
 | `live_viz_helpers.py` | — | Visualization helpers (point-cloud / TSDF). |
-| `debug_viz.py` | `debug_viz` | Hosts one viser server; subscribes to the segmented/background clouds, `/graspgen/grasp_poses`, and `/curobo/tsdf_voxels` and renders them (grasp frames colored by rank). Debug mode only. |
+| `debug_viz.py` | `debug_viz` | Hosts one viser server; subscribes to the segmented/background/overhead clouds, `/graspgen/grasp_poses`, and `/curobo/tsdf_voxels` and renders them (grasp frames colored by rank; TSDF as voxel-sized squares colored by height; a "Layers" GUI folder toggles each layer's visibility). Debug mode only. |
 | `graspgen_probe.py`, `graspgen_service_caller.py` | `graspgen_probe`, `graspgen_service_caller` | Standalone debugging utilities (not part of the runtime pipeline). |
 
 The orchestrator coordinates stages over **ROS2 services**, not in-process Python calls. Stages exchange point clouds over ROS2 topics; GraspGen talks to its heavy inference model over ZMQ in a separate process.
@@ -83,6 +83,7 @@ Internal:
 | `/curobo/plan_trajectory` | `riro_srvs/PlanTrajectory` | orchestrator → curobo_service |
 | `/graspgen/grasp_poses` | `geometry_msgs/PoseArray` | graspgen_service → debug_viz (debug only) |
 | `/curobo/tsdf_voxels` | `sensor_msgs/PointCloud2` | curobo_service → debug_viz (debug only) |
+| `/curobo/overhead_cloud` | `sensor_msgs/PointCloud2` | curobo_service → debug_viz (overhead depth back-projection, debug only) |
 
 ## Adding Dependencies
 
@@ -93,7 +94,7 @@ Pip dependencies live under `requirements/` (`sam2.txt`, `graspgen.txt`, `curobo
 - `Dockerfile` — single layer-ordered image (CUDA 12.8 + ROS2 Humble + PyTorch + SAM2/GraspGen/cuRobo + baked models; `COPY src` last). No separate base image.
 - `docker-compose.yml` — deploy mode (baked image, runs `deploy.launch.py`).
 - `docker-compose.debug.yml` — override that live-mounts `./src`/`./scripts`/`./config` and runs `debug.launch.py`.
-- `src/pipeline_orchestrator/launch/{pipeline_common,deploy,debug}.launch.py` — shared node graph + the two mode entry points.
-- `src/pipeline_orchestrator/pipeline_orchestrator/` — all pipeline nodes (see table above)
+- `src/team_8/launch/{pipeline_common,deploy,debug}.launch.py` — shared node graph + the two mode entry points.
+- `src/team_8/team_8/` — all pipeline nodes (see table above)
 - `src/utils/riro_srvs/srv/` — custom service definitions
-- `src/pipeline_orchestrator/config/ur5_curobo.yml` — cuRobo robot config (keep ASCII-only: cuRobo's `load_yaml` opens it with the container's default ASCII codec, so non-ASCII bytes crash it)
+- `src/team_8/config/ur5_curobo.yml` — cuRobo robot config (keep ASCII-only: cuRobo's `load_yaml` opens it with the container's default ASCII codec, so non-ASCII bytes crash it)

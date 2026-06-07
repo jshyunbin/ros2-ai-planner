@@ -8,5 +8,5 @@ source /ros2_ws/install/setup.bash
 # lookups (ament index, launch files, config data_files) that need it.
 # colcon --symlink-install is not used because the bundled setuptools
 # rejects setup.py's --editable option.
-export PYTHONPATH="/ros2_ws/src/pipeline_orchestrator:${PYTHONPATH}"
+export PYTHONPATH="/ros2_ws/src/team_8:${PYTHONPATH}"
 exec "$@"
