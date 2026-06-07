@@ -325,6 +325,39 @@ def test_orchestrator_curobo_pick_done_executes_phase_sequence():
     orch._reset_pipeline_state.assert_called_once()
 
 
+def test_reset_pipeline_state_logs_failure_then_success_without_crashing():
+    """Regression: _reset_pipeline_state must not log both severities from one
+    call site.
+
+    rclpy's RcutilsLogger caches the severity per caller location (file, function,
+    line). Aliasing ``info``/``error`` through a single variable and calling it on
+    one line means that line logs at ERROR for a failed task and INFO for a
+    successful one. The second severity raises
+    ``ValueError('Logger severity cannot be changed between calls.')`` from inside
+    the service-done callback, which propagates out of executor.spin() and kills
+    the orchestrator process. A queue that mixes a failed task with a later
+    successful one therefore crashes the node.
+    """
+    from collections import deque
+    from rclpy.impl.rcutils_logger import RcutilsLogger
+
+    orch = _orchestrator_skeleton()
+    # Use a real rclpy logger; a MagicMock logger would not exercise the
+    # per-call-site severity caching that triggers the crash.
+    logger = RcutilsLogger(name='test_reset_pipeline_state')
+    orch.get_logger = lambda: logger
+    orch._auto_run_on_task_command = False
+    orch._holding_object = False
+    orch._task_queue = deque()
+
+    orch._active_task_data = {'object': 'strawberry', 'destination': 'storage_1'}
+    orch._reset_pipeline_state(success=False, reason='pick planning failed')
+
+    orch._active_task_data = {'object': 'strawberry', 'destination': 'storage_1'}
+    # Before the fix this second call raised ValueError from the shared call site.
+    orch._reset_pipeline_state(success=True, reason='pick and place completed')
+
+
 def test_curobo_service_preclose_insertion_extends_grasp(monkeypatch):
     from builtin_interfaces.msg import Duration
     from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint

@@ -704,12 +704,20 @@ class PipelineOrchestrator(Node):
         self._active_task_data = None
 
         if finished is not None:
-            level = self.get_logger().info if success else self.get_logger().error
-            level(
+            # rclpy caches log severity per caller location, so info and error
+            # must live on separate physical lines: aliasing them through one
+            # call site raises ValueError('Logger severity cannot be changed
+            # between calls.') the moment the queue mixes a failed task with a
+            # successful one, killing the node.
+            message = (
                 f"Task {'completed' if success else 'failed'} "
                 f"object={finished.get('object')} "
                 f"destination={finished.get('destination')} "
                 f"reason={reason or 'none'}")
+            if success:
+                self.get_logger().info(message)
+            else:
+                self.get_logger().error(message)
 
         if not success and self._holding_object:
             pending = len(self._task_queue)
