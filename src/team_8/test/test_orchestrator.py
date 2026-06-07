@@ -349,6 +349,8 @@ def test_reset_pipeline_state_logs_failure_then_success_without_crashing():
     orch._auto_run_on_task_command = False
     orch._holding_object = False
     orch._task_queue = deque()
+    # _reset_pipeline_state cancels any pending post-task verification timer.
+    orch._verification_timer = None
 
     orch._active_task_data = {'object': 'strawberry', 'destination': 'storage_1'}
     orch._reset_pipeline_state(success=False, reason='pick planning failed')
@@ -1095,6 +1097,33 @@ def test_orchestrator_pick_done_runs_place_then_home():
     orch._plan_and_execute_place.assert_called_once_with('storage_2')
     orch._plan_and_execute_home.assert_called_once_with()
     orch._reset_pipeline_state.assert_called_once()
+
+
+def test_orchestrator_pick_done_schedules_verification_when_enabled():
+    from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+    orch = _orchestrator_skeleton()
+    orch._send_and_wait = MagicMock()
+    orch._send_gripper = MagicMock()
+    orch._reset_pipeline_state = MagicMock()
+    orch._schedule_post_task_verification = MagicMock()
+    orch._plan_and_execute_place = MagicMock()
+    orch._plan_and_execute_home = MagicMock()
+    orch._enable_post_task_verification = True
+    orch._active_task_data = {'object': 'book', 'destination': 'storage_2'}
+    orch._arm_client = MagicMock()
+    trajectory = JointTrajectory(); trajectory.points = [JointTrajectoryPoint()]
+    lift_trajectory = JointTrajectory(); lift_trajectory.points = [JointTrajectoryPoint()]
+    future = MagicMock()
+    future.result.return_value = MagicMock(
+        success=True, message='planned',
+        trajectory=trajectory, lift_trajectory=lift_trajectory)
+
+    orch._on_curobo_pick_done(future)
+
+    # With verification enabled, pick-done hands off to the verification path
+    # (the teammate's intent) instead of marking the task complete directly.
+    orch._schedule_post_task_verification.assert_called_once()
+    orch._reset_pipeline_state.assert_not_called()
 
 
 def test_orchestrator_home_before_capture_homes_before_opening_gripper():

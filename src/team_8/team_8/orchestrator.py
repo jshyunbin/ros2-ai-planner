@@ -9,9 +9,7 @@ All execution calls are blocking (_send_and_wait); the node is spun with
 MultiThreadedExecutor so spin_until_future_complete works inside callbacks.
 """
 
-import copy
 import json
-import math
 import threading
 import time
 from collections import deque
@@ -29,9 +27,9 @@ try:  # pragma: no cover - runtime dependency
     from rclpy.action import ActionClient
     from rclpy.node import Node
     from rclpy.executors import MultiThreadedExecutor
-    from rclpy.qos import QoSProfile, ReliabilityPolicy
+    from rclpy.qos import QoSDurabilityPolicy, QoSProfile, ReliabilityPolicy
     from sensor_msgs.msg import Image, JointState
-    from std_msgs.msg import String
+    from std_msgs.msg import Bool, String
     from rclpy.callback_groups import ReentrantCallbackGroup
     from control_msgs.action import FollowJointTrajectory
     from geometry_msgs.msg import Pose
@@ -45,6 +43,7 @@ except ImportError:  # pragma: no cover - import-only test fallback
     Image = None
     JointState = None
     QoSProfile = None
+    QoSDurabilityPolicy = None
     ReliabilityPolicy = None
     FollowJointTrajectory = None
     Pose = None
@@ -75,11 +74,7 @@ except ImportError:  # pragma: no cover - runtime dependency
     PlanTrajectory = None
 
 from team_8.gemini_api import GeminiAPI, GeminiAPIError
-from team_8.place_pose_utils import (
-    BOOKSHELF_TARGETS,
-    load_place_poses,
-    resolve_target_pose,
-)
+from team_8.place_pose_utils import load_place_poses
 from team_8.pipeline_utils import as_bool as _as_bool
 from team_8.pipeline_utils import env_float as _env_float
 from team_8.pipeline_utils import pose_from_grasp_row as _pose_from_grasp_row_util
@@ -107,6 +102,14 @@ class PipelineOrchestrator(Node):
             raise ImportError('riro_srvs is required for team_8.')
 
         super().__init__('team_8')
+
+        if get_package_share_directory is None:
+            raise ImportError('ament_index_python is required for team_8.')
+        default_place_poses_path = str(
+            Path(get_package_share_directory('team_8'))
+            / 'config'
+            / 'place_poses.yml'
+        )
 
         self.declare_parameter('segmentation_service_name',
                                '/segmentation/segment_prompt')
@@ -605,218 +608,59 @@ class PipelineOrchestrator(Node):
                 success=False, reason=f'pick/place execution failed: {exc}')
             return
 
-        self._start_place_sequence()
-
-        def _call_curobo_blocking(self, request, label):
-            """Call the CuRobo plan service and block for the response.
-
-            Safe to block from inside the pipeline callback because the node is spun
-            with a MultiThreadedExecutor AND the curobo client lives in a
-            ReentrantCallbackGroup (self._pipeline_cbg) separate from the default
-            group — so the executor can deliver the response on another thread while
-            this callback is blocked. MultiThreadedExecutor alone is NOT enough: if
-            the client shared the blocked callback's MutuallyExclusiveCallbackGroup,
-            the response could never be delivered and this would deadlock.
-            """
-            if self._curobo_client is None:
-                raise RuntimeError(f'{label}: CuRobo service client unavailable.')
-            if not self._curobo_client.wait_for_service(
-                    timeout_sec=self._curobo_service_wait_sec):
-                raise RuntimeError(
-                    f'{label}: CuRobo service unavailable '
-                    f'({self._curobo_service_name}).')
-            timeout_sec = _env_float('PIPELINE_PLAN_SERVICE_TIMEOUT_SEC', 600.0)
-            future = self._curobo_client.call_async(request)
-            result = self._wait_for_future(future, label, 'plan response', timeout_sec)
-            if result is None:
-                raise RuntimeError(f'{label}: CuRobo service returned no result.')
-            return result
-
-        def _plan_and_execute_place(self, goal_name: str) -> None:
-            """Plan (collision-off) + execute the transit to a place destination,
-            release the object, and (bookshelf) retract."""
-            request = PlanTrajectory.Request()
-            request.goal_name = goal_name
-            request.joint_state = self._latest_joints
-            result = self._call_curobo_blocking(request, f'place:{goal_name}')
-            if not result.success:
-                raise RuntimeError(f'place planning failed: {result.message}')
-            self._send_and_wait(self._arm_client, result.trajectory, 'place_transit')
-            if result.insert_trajectory and result.insert_trajectory.points:
-                self._send_and_wait(
-                    self._arm_client, result.insert_trajectory, 'bookshelf_insert')
-            # Release the object onto the basket / shelf board.
-            self._send_gripper(closed=False)
-            if result.retract_trajectory and result.retract_trajectory.points:
-                self._send_and_wait(
-                    self._arm_client, result.retract_trajectory, 'bookshelf_retract')
-
-    # ── place sequence ─────────────────────────────────────────────────────────
-
-    def _start_place_sequence(self) -> None:
-        destination = self._active_destination()
-
-        try:
-            destination_pose = resolve_target_pose(
-                self._place_poses, destination)
-            home_pose = resolve_target_pose(self._place_poses, 'home')
-        except Exception as exc:
-            self.get_logger().error(
-                f"Cannot resolve destination '{destination}': {exc}")
-            self._reset_pipeline_state(
-                success=False, reason=f'invalid destination: {exc}')
-            return
-
-        if destination_pose is None or home_pose is None:
-            self._reset_pipeline_state(
-                success=False, reason='failed to construct place/home Pose')
-            return
-
-        self._motion_steps.clear()
-
-        transit_pose = copy.deepcopy(destination_pose)
-        transit_pose.position.z = float(self._place_poses['transit_z'])
-        self._motion_steps.append({
-            'label': f'transit_to_{destination}',
-            'pose': transit_pose,
-            'release_after': False,
-        })
-
-        if destination in BOOKSHELF_TARGETS:
-            shelf = self._place_poses[destination]
-            pre_insert_pose = destination_pose
-            inserted_pose = _offset_pose_along_local_z(
-                pre_insert_pose, float(shelf['insert_depth_m']))
-            retract_pose = _offset_pose_along_local_z(
-                inserted_pose, -float(shelf['retract_depth_m']))
-
-            self._motion_steps.append({
-                'label': f'{destination}_pre_insert',
-                'pose': pre_insert_pose,
-                'release_after': False,
-            })
-            self._motion_steps.append({
-                'label': f'{destination}_insert',
-                'pose': inserted_pose,
-                'release_after': True,
-            })
-            self._motion_steps.append({
-                'label': f'{destination}_retract',
-                'pose': retract_pose,
-                'release_after': False,
-            })
+        # After place + home, optionally run Gemini post-task verification
+        # (confirm the object actually left the pickup workspace, retrying the
+        # task if not). When verification is disabled the task is marked done.
+        if getattr(self, '_enable_post_task_verification', False):
+            self._schedule_post_task_verification()
         else:
-            self._motion_steps.append({
-                'label': f'place_{destination}',
-                'pose': destination_pose,
-                'release_after': True,
-            })
-
-        if (
-            self._return_home_after_place
-            or self._enable_post_task_verification
-        ):
-            self._motion_steps.append({
-                'label': 'return_home',
-                'pose': home_pose,
-                'release_after': False,
-            })
-
-        self.get_logger().info(
-            f"Built place sequence destination={destination} "
-            f"steps={[step['label'] for step in self._motion_steps]}")
-        self._request_next_motion_step()
-
-    def _request_next_motion_step(self) -> None:
-        if not self._motion_steps:
-            if self._enable_post_task_verification:
-                self._schedule_post_task_verification()
-            else:
-                self._reset_pipeline_state(
-                    success=True, reason='pick and place completed')
-            return
-
-        if self._latest_joints is None:
             self._reset_pipeline_state(
-                success=False, reason='joint state unavailable before place')
-            return
+                success=True, reason='pick and place completed')
 
+    def _call_curobo_blocking(self, request, label):
+        """Call the CuRobo plan service and block for the response.
+
+        Safe to block from inside the pipeline callback because the node is spun
+        with a MultiThreadedExecutor AND the curobo client lives in a
+        ReentrantCallbackGroup (self._pipeline_cbg) separate from the default
+        group — so the executor can deliver the response on another thread while
+        this callback is blocked. MultiThreadedExecutor alone is NOT enough: if
+        the client shared the blocked callback's MutuallyExclusiveCallbackGroup,
+        the response could never be delivered and this would deadlock.
+        """
         if self._curobo_client is None:
-            self._reset_pipeline_state(
-                success=False, reason='CuRobo client unavailable before place')
-            return
-
-        step = self._motion_steps.popleft()
-        request = PlanTrajectory.Request()
-        request.grasp_poses = []
-        request.grasp_pose = step['pose']
-        request.joint_state = self._latest_joints
-
+            raise RuntimeError(f'{label}: CuRobo service client unavailable.')
+        if not self._curobo_client.wait_for_service(
+                timeout_sec=self._curobo_service_wait_sec):
+            raise RuntimeError(
+                f'{label}: CuRobo service unavailable '
+                f'({self._curobo_service_name}).')
+        timeout_sec = _env_float('PIPELINE_PLAN_SERVICE_TIMEOUT_SEC', 600.0)
         future = self._curobo_client.call_async(request)
-        future.add_done_callback(
-            lambda done_future, current_step=step:
-            self._on_motion_step_planned(done_future, current_step)
-        )
-        self.get_logger().info(
-            f"Requested CuRobo single-pose plan: {step['label']}")
+        result = self._wait_for_future(future, label, 'plan response', timeout_sec)
+        if result is None:
+            raise RuntimeError(f'{label}: CuRobo service returned no result.')
+        return result
 
-    def _on_motion_step_planned(self, future, step: dict) -> None:
-        label = str(step['label'])
-        try:
-            result = future.result()
-        except Exception as exc:
-            self.get_logger().error(
-                f"CuRobo place service call failed at {label}: {exc}")
-            self._reset_pipeline_state(
-                success=False, reason=f'{label} service failure: {exc}')
-            return
-
+    def _plan_and_execute_place(self, goal_name: str) -> None:
+        """Plan (collision-off) + execute the transit to a place destination,
+        release the object, and (bookshelf) retract."""
+        request = PlanTrajectory.Request()
+        request.goal_name = goal_name
+        request.joint_state = self._latest_joints
+        result = self._call_curobo_blocking(request, f'place:{goal_name}')
         if not result.success:
-            self.get_logger().error(
-                f"CuRobo place planning failed at {label}: {result.message}")
-            self._reset_pipeline_state(
-                success=False, reason=f'{label} planning failed')
-            return
+            raise RuntimeError(f'place planning failed: {result.message}')
+        self._send_and_wait(self._arm_client, result.trajectory, 'place_transit')
+        if result.insert_trajectory and result.insert_trajectory.points:
+            self._send_and_wait(
+                self._arm_client, result.insert_trajectory, 'bookshelf_insert')
+        # Release the object onto the basket / shelf board.
+        self._send_gripper(closed=False)
+        if result.retract_trajectory and result.retract_trajectory.points:
+            self._send_and_wait(
+                self._arm_client, result.retract_trajectory, 'bookshelf_retract')
 
-        try:
-            self._execute_arm_trajectory(result.trajectory, label)
-            if bool(step.get('release_after')):
-                self.get_logger().info(
-                    f"Reached release pose for {self._active_destination()}; "
-                    "opening gripper.")
-                self._send_gripper(closed=False, strict=True)
-        except Exception as exc:
-            self.get_logger().error(
-                f"Motion step execution failed at {label}: {exc}")
-            self._reset_pipeline_state(
-                success=False, reason=f'{label} execution failed: {exc}')
-            return
-
-        self._request_next_motion_step()
-
-    def _execute_arm_trajectory(
-        self, trajectory: 'JointTrajectory', label: str
-    ) -> None:
-        self._send_and_wait(self._arm_client, trajectory, label)
-        self._update_joint_state_from_trajectory(trajectory)
-
-    def _update_joint_state_from_trajectory(
-        self, trajectory: 'JointTrajectory'
-    ) -> None:
-        points = list(getattr(trajectory, 'points', []) or [])
-        joint_names = list(getattr(trajectory, 'joint_names', []) or [])
-        if not points or not joint_names:
-            return
-
-        final_positions = list(getattr(points[-1], 'positions', []) or [])
-        if len(final_positions) != len(joint_names):
-            return
-
-        state = JointState()
-        state.header.stamp = self.get_clock().now().to_msg()
-        state.name = joint_names
-        state.position = [float(value) for value in final_positions]
-        self._latest_joints = state
     def _home_before_capture(self) -> int:
         """Move the arm to home so the wrist camera observes the workspace, and
         return the ROS time (ns) at which it settled.
@@ -1039,7 +883,6 @@ class PipelineOrchestrator(Node):
         self._cancel_verification_timer()
         self._pipeline_busy = False
         self._active_task = ''
-        self._motion_steps.clear()
         self._latest_segmentation = None
         self._latest_graspgen = None
         self._holding_object = False
@@ -1202,15 +1045,22 @@ class PipelineOrchestrator(Node):
         self._pipeline_busy = False
         self._active_task = ''
         self._active_task_data = None
-        self._motion_steps.clear()
 
         if finished is not None:
-            level = self.get_logger().info if success else self.get_logger().error
-            level(
+            # rclpy caches log severity per caller location, so info and error
+            # must live on separate physical lines: aliasing them through one
+            # call site raises ValueError('Logger severity cannot be changed
+            # between calls.') the moment the queue mixes a failed task with a
+            # successful one, killing the node.
+            message = (
                 f"Task {'completed' if success else 'failed'} "
                 f"object={finished.get('object')} "
                 f"destination={finished.get('destination')} "
                 f"reason={reason or 'none'}")
+            if success:
+                self.get_logger().info(message)
+            else:
+                self.get_logger().error(message)
 
         if not success and self._holding_object:
             pending = len(self._task_queue)
@@ -1230,29 +1080,6 @@ def _stamp_to_ns(stamp) -> int:
         int(getattr(stamp, 'sec', 0)) * 1_000_000_000
         + int(getattr(stamp, 'nanosec', 0))
     )
-
-def _offset_pose_along_local_z(pose: 'Pose', distance_m: float) -> 'Pose':
-    """Copy *pose* and translate it along the pose's local +Z axis."""
-    out = copy.deepcopy(pose)
-
-    x = float(pose.orientation.x)
-    y = float(pose.orientation.y)
-    z = float(pose.orientation.z)
-    w = float(pose.orientation.w)
-    norm = math.sqrt(x * x + y * y + z * z + w * w)
-    if norm <= 1e-9:
-        raise ValueError('Cannot offset pose with a zero quaternion.')
-    x, y, z, w = x / norm, y / norm, z / norm, w / norm
-
-    # Third column of the quaternion rotation matrix: local +Z in world frame.
-    axis_x = 2.0 * (x * z + y * w)
-    axis_y = 2.0 * (y * z - x * w)
-    axis_z = 1.0 - 2.0 * (x * x + y * y)
-
-    out.position.x += float(distance_m) * axis_x
-    out.position.y += float(distance_m) * axis_y
-    out.position.z += float(distance_m) * axis_z
-    return out
 
 def _goal_status_succeeded() -> int:
     if GoalStatus is None:
