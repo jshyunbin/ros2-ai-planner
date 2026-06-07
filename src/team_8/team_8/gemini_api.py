@@ -1,11 +1,10 @@
-"""Centralized Gemini API helpers for the team_8 pipeline.
+"""Gemini command parser for the team_8 manipulation pipeline.
 
-This module owns all direct google-genai usage:
+This module only converts natural-language manipulation instructions into a
+strict JSON-compatible task plan.
 
-1. Natural-language manipulation command -> structured task plan
-2. RGB image + object prompt -> normalized Gemini bounding box
-
-ROS2 nodes should import GeminiAPI instead of constructing genai.Client directly.
+The existing Gemini/SAM2 localization logic in segmentation_service.py remains
+independent and unchanged.
 """
 
 from __future__ import annotations
@@ -16,10 +15,10 @@ import re
 import time
 from typing import Any
 
-try:  # pragma: no cover - runtime dependency
+try:
     from google import genai
     from google.genai import types
-except ImportError:  # pragma: no cover - import-only test fallback
+except ImportError:
     genai = None
     types = None
 
@@ -50,7 +49,6 @@ TASK_PLAN_SCHEMA = {
                     "destination": {
                         "type": "STRING",
                         "enum": list(DESTINATIONS),
-                        "description": "Canonical destination used by team_8.",
                     },
                 },
                 "required": ["object", "destination"],
@@ -60,34 +58,39 @@ TASK_PLAN_SCHEMA = {
     "required": ["tasks"],
 }
 
-DETECTION_SCHEMA = {
-    "type": "ARRAY",
-    "items": {
-        "type": "OBJECT",
-        "properties": {
-            "box_2d": {
-                "type": "ARRAY",
-                "items": {"type": "INTEGER"},
-                "description": (
-                    "Bounding box [ymin, xmin, ymax, xmax] scaled from 0 to 1000."
-                ),
-            },
-            "label": {
-                "type": "STRING",
-                "description": "Descriptive label of the detected item.",
-            },
+TASK_VERIFICATION_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "present_in_source_workspace": {
+            "type": "BOOLEAN",
+            "description": (
+                "True only when the requested object is still visible in the "
+                "original pickup workspace/table area."
+            ),
         },
-        "required": ["box_2d", "label"],
+        "confidence": {
+            "type": "NUMBER",
+            "description": "Confidence from 0.0 to 1.0.",
+        },
+        "reason": {
+            "type": "STRING",
+            "description": "Brief visual reason for the decision.",
+        },
     },
+    "required": [
+        "present_in_source_workspace",
+        "confidence",
+        "reason",
+    ],
 }
 
 
 class GeminiAPIError(RuntimeError):
-    """Raised when Gemini generation or response validation fails."""
+    """Raised when Gemini generation or validation fails."""
 
 
 class GeminiAPI:
-    """Small reusable wrapper around the Google GenAI SDK."""
+    """Gemini wrapper used only for natural-language task parsing."""
 
     def __init__(
         self,
@@ -100,12 +103,20 @@ class GeminiAPI:
     ) -> None:
         if genai is None or types is None:
             raise ImportError(
-                "google-genai is required. Install requirements/planner-runtime.txt."
+                "google-genai is required. "
+                "Install requirements/planner-runtime.txt."
             )
 
         resolved_key = api_key or os.getenv("GEMINI_API_KEY")
         if not resolved_key:
             raise ValueError("GEMINI_API_KEY is not set.")
+
+        resolved_key = resolved_key.strip()
+        if not resolved_key.isascii():
+            raise ValueError(
+                "GEMINI_API_KEY contains non-ASCII characters. "
+                "Set the actual key issued by Google AI Studio."
+            )
 
         self._client = genai.Client(api_key=resolved_key)
         self._model = str(model)
@@ -118,24 +129,7 @@ class GeminiAPI:
         return self._model
 
     def parse_task_command(self, instruction: str) -> dict[str, Any]:
-        """Convert one natural-language command into one task per object.
-
-        The returned dictionary has this form:
-
-        {
-            "tasks": [
-                {"object": "banana", "destination": "storage_1"},
-                ...
-            ]
-        }
-
-        Destination mapping for the current test_run branch:
-          - left storage / left basket  -> storage_1
-          - right storage / right basket -> storage_2
-          - lower / first shelf -> bookshelf_floor1
-          - upper / second shelf -> bookshelf_floor2
-          - no destination -> unspecified
-        """
+        """Convert one instruction into one task per mentioned object."""
         instruction = str(instruction).strip()
         if not instruction:
             raise ValueError("Task instruction is empty.")
@@ -144,23 +138,26 @@ class GeminiAPI:
 You are the command parser for a ROS2 robotic manipulation pipeline.
 
 Convert the instruction into strict JSON containing exactly one task for each
-object mentioned. Preserve object order. If multiple objects share a
-destination, still create a separate task for each object.
+object mentioned.
 
-Normalize object names to lowercase snake_case:
-- "meat can" -> "meat_can"
-- "coke can" -> "coke_can"
-
-Use only these destination values:
-- "storage_1": left storage, left basket
-- "storage_2": right storage, right basket
-- "bookshelf_floor1": first shelf, lower shelf, shelf floor 1
-- "bookshelf_floor2": second shelf, upper shelf, shelf floor 2
-- "unspecified": no destination is stated
-
-When the instruction only names an object, use "unspecified".
-When it says only "shelf" without a floor, use "bookshelf_floor1".
-Do not invent objects.
+Rules:
+1. Preserve the order in which objects appear.
+2. If multiple objects share a destination, create one task per object.
+3. Normalize object names to lowercase snake_case.
+4. Do not invent objects.
+5. Use only these destination values:
+   - storage_1: left storage or left basket
+   - storage_2: right storage or right basket
+   - bookshelf_floor1: first shelf, lower shelf, or unspecified shelf
+   - bookshelf_floor2: second shelf or upper shelf
+   - unspecified: no destination was stated
+6. Examples:
+   - meat can -> meat_can
+   - coke can -> coke_can
+   - Move the banana to the left storage.
+     -> banana, storage_1
+   - banana
+     -> banana, unspecified
 
 Instruction:
 {instruction}
@@ -173,65 +170,88 @@ Instruction:
         )
         return self._validate_task_plan(payload)
 
-    def localize_object(self, pil_image: Any, prompt: str) -> dict[str, Any]:
-        """Locate the first matching object in a PIL image.
+    def verify_object_removed(
+        self,
+        pil_image: Any,
+        *,
+        object_name: str,
+        destination: str,
+    ) -> dict[str, Any]:
+        """Check whether an object remains in the original pickup workspace.
 
-        Returns:
-            {
-                "label": str,
-                "box_2d": [ymin, xmin, ymax, xmax],  # normalized 0..1000
-                "image_size": [width, height]
-            }
+        The image must be captured after the robot has returned home. The
+        destination area is explicitly excluded, so an object correctly placed
+        in a basket or bookshelf is not treated as a failed pick.
         """
-        prompt = str(prompt).strip()
-        if not prompt:
-            raise ValueError("Object localization prompt is empty.")
         if not hasattr(pil_image, "size"):
-            raise TypeError("localize_object expects a PIL image with a size attribute.")
-
-        width, height = pil_image.size
-        full_prompt = (
-            f"Find the object matching this prompt: {prompt}\n"
-            "Return a JSON list. Return the best matching object first. "
-            "For each object, return 'label' and 'box_2d'. "
-            "'box_2d' must contain exactly four integers in this order: "
-            "[ymin, xmin, ymax, xmax], normalized from 0 to 1000."
-        )
-
-        payload = self._generate_json(
-            contents=[full_prompt, pil_image],
-            schema=DETECTION_SCHEMA,
-            temperature=0.1,
-        )
-
-        if not isinstance(payload, list) or not payload:
-            raise GeminiAPIError("Gemini returned no object detections.")
-
-        detection = payload[0]
-        if not isinstance(detection, dict):
-            raise GeminiAPIError(
-                f"Gemini detection must be an object, got {type(detection).__name__}."
+            raise TypeError(
+                "verify_object_removed expects a PIL image with a size attribute."
             )
 
-        label = str(detection.get("label", "")).strip() or "target"
-        raw_box = detection.get("box_2d")
-        if not isinstance(raw_box, list) or len(raw_box) != 4:
-            raise GeminiAPIError(f"Invalid Gemini box_2d: {raw_box!r}")
+        normalized_object = _normalize_object_name(object_name)
+        if not normalized_object:
+            raise ValueError("Verification object name is empty.")
+
+        display_name = normalized_object.replace("_", " ")
+        destination = str(destination).strip() or "unspecified"
+
+        prompt = f"""
+You are verifying the result of a robotic pick-and-place task.
+
+Target object: {display_name}
+Intended destination: {destination}
+
+The image was captured after the robot returned to its home pose.
+Decide whether the target object is STILL PRESENT IN THE ORIGINAL PICKUP
+WORKSPACE, meaning the main table/work area where loose objects are picked up.
+
+Important rules:
+1. Ignore the robot arm and gripper.
+2. Ignore the target object if it is visible inside the intended destination
+   basket, storage area, or bookshelf. A correctly placed object at the
+   destination means present_in_source_workspace must be false.
+3. Do not report another similar object unless it clearly matches the target.
+4. If the target is still lying in the pickup workspace, return true.
+5. If the target is absent from the pickup workspace, return false.
+6. If visibility is ambiguous, return true so the robot can retry safely.
+
+Return strict JSON with:
+- present_in_source_workspace: boolean
+- confidence: number from 0.0 to 1.0
+- reason: one short sentence
+""".strip()
+
+        payload = self._generate_json(
+            contents=[prompt, pil_image],
+            schema=TASK_VERIFICATION_SCHEMA,
+            temperature=0.0,
+        )
+
+        if not isinstance(payload, dict):
+            raise GeminiAPIError(
+                "Task verification response must be a JSON object."
+            )
+
+        present = payload.get("present_in_source_workspace")
+        if not isinstance(present, bool):
+            raise GeminiAPIError(
+                "Verification field present_in_source_workspace must be boolean."
+            )
 
         try:
-            box_2d = [int(value) for value in raw_box]
+            confidence = float(payload.get("confidence", 0.0))
         except (TypeError, ValueError) as exc:
-            raise GeminiAPIError(f"Non-integer Gemini box_2d: {raw_box!r}") from exc
+            raise GeminiAPIError(
+                f"Invalid verification confidence: {payload.get('confidence')!r}"
+            ) from exc
 
-        box_2d = [max(0, min(1000, value)) for value in box_2d]
-        ymin, xmin, ymax, xmax = box_2d
-        if ymax <= ymin or xmax <= xmin:
-            raise GeminiAPIError(f"Degenerate Gemini box_2d: {box_2d!r}")
+        confidence = max(0.0, min(1.0, confidence))
+        reason = str(payload.get("reason", "")).strip()
 
         return {
-            "label": label,
-            "box_2d": box_2d,
-            "image_size": [int(width), int(height)],
+            "present_in_source_workspace": present,
+            "confidence": confidence,
+            "reason": reason,
         }
 
     def _generate_json(
@@ -247,8 +267,6 @@ Instruction:
             "temperature": float(temperature),
         }
 
-        # test_run currently uses gemini-2.5-flash and thinking_budget=0.
-        # Keep this optional so the wrapper remains tolerant of SDK differences.
         try:
             config_kwargs["thinking_config"] = types.ThinkingConfig(
                 thinking_budget=0
@@ -266,10 +284,13 @@ Instruction:
                     contents=contents,
                     config=config,
                 )
+
                 text = getattr(response, "text", None)
                 if not text:
                     raise GeminiAPIError("Gemini returned an empty response.")
+
                 return json.loads(text)
+
             except Exception as exc:
                 last_error = exc
                 self._log(
@@ -277,6 +298,7 @@ Instruction:
                     f"Gemini request failed "
                     f"(attempt {attempt}/{self._max_retries}): {exc}",
                 )
+
                 if attempt < self._max_retries:
                     time.sleep(self._retry_delay_sec * attempt)
 
@@ -287,15 +309,14 @@ Instruction:
 
     def _validate_task_plan(self, payload: Any) -> dict[str, Any]:
         if not isinstance(payload, dict):
-            raise GeminiAPIError(
-                f"Task plan must be a JSON object, got {type(payload).__name__}."
-            )
+            raise GeminiAPIError("Task plan must be a JSON object.")
 
         raw_tasks = payload.get("tasks")
         if not isinstance(raw_tasks, list) or not raw_tasks:
             raise GeminiAPIError("Gemini task plan contains no tasks.")
 
         tasks: list[dict[str, str]] = []
+
         for index, raw_task in enumerate(raw_tasks):
             if not isinstance(raw_task, dict):
                 raise GeminiAPIError(f"Task {index} is not a JSON object.")
@@ -305,9 +326,10 @@ Instruction:
 
             if not object_name:
                 raise GeminiAPIError(f"Task {index} has an empty object name.")
+
             if destination not in DESTINATIONS:
                 raise GeminiAPIError(
-                    f"Task {index} has invalid destination {destination!r}."
+                    f"Task {index} has invalid destination: {destination!r}"
                 )
 
             tasks.append(
@@ -322,6 +344,7 @@ Instruction:
     def _log(self, level: str, message: str) -> None:
         if self._logger is None:
             return
+
         callback = getattr(self._logger, level, None)
         if callable(callback):
             callback(message)
