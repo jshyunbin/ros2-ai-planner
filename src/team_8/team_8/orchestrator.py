@@ -9,8 +9,12 @@ All execution calls are blocking (_send_and_wait); the node is spun with
 MultiThreadedExecutor so spin_until_future_complete works inside callbacks.
 """
 
+import copy
 import json
+import math
 import threading
+from collections import deque
+from pathlib import Path
 
 try:  # pragma: no cover - runtime dependency
     import rclpy
@@ -42,6 +46,12 @@ except ImportError:  # pragma: no cover - import-only test fallback
     class String:  # type: ignore[override]
         pass
 
+
+try:  # pragma: no cover - ROS runtime dependency
+    from ament_index_python.packages import get_package_share_directory
+except ImportError:  # pragma: no cover - import-only test fallback
+    get_package_share_directory = None
+
 try:  # pragma: no cover - runtime dependency
     from riro_srvs.srv import StringString
     from riro_srvs.srv import PlanTrajectory
@@ -49,6 +59,12 @@ except ImportError:  # pragma: no cover - runtime dependency
     StringString = None
     PlanTrajectory = None
 
+from team_8.gemini_api import GeminiAPI, GeminiAPIError
+from team_8.place_pose_utils import (
+    BOOKSHELF_TARGETS,
+    load_place_poses,
+    resolve_target_pose,
+)
 from team_8.pipeline_utils import as_bool as _as_bool
 from team_8.pipeline_utils import env_float as _env_float
 from team_8.pipeline_utils import pose_from_grasp_row as _pose_from_grasp_row_util
@@ -64,6 +80,7 @@ class PipelineOrchestrator(Node):
     """ROS2 orchestrator for segmentation, GraspGen, and motion execution."""
 
     TASK_COMMANDS_TOPIC = '/task_commands'
+    TASK_PLAN_TOPIC = '/gemini/task_plan'
     JOINT_STATES_TOPIC = '/joint_states'
 
     def __init__(self):
@@ -73,6 +90,14 @@ class PipelineOrchestrator(Node):
             raise ImportError('riro_srvs is required for team_8.')
 
         super().__init__('team_8')
+
+        if get_package_share_directory is None:
+            raise ImportError('ament_index_python is required for team_8.')
+        default_place_poses_path = str(
+            Path(get_package_share_directory('team_8'))
+            / 'config'
+            / 'place_poses.yml'
+        )
 
         self.declare_parameter('segmentation_service_name',
                                '/segmentation/segment_prompt')
@@ -87,6 +112,10 @@ class PipelineOrchestrator(Node):
                                '/ur5_controller/follow_joint_trajectory')
         self.declare_parameter('gripper_action_name',
                                '/gripper_controller/follow_joint_trajectory')
+        self.declare_parameter('gemini_model', 'gemini-2.5-flash')
+        self.declare_parameter('task_plan_topic', self.TASK_PLAN_TOPIC)
+        self.declare_parameter('place_poses_path', default_place_poses_path)
+        self.declare_parameter('return_home_after_place', True)
 
         self._segmentation_service_name = str(
             self.get_parameter('segmentation_service_name').value)
@@ -104,11 +133,25 @@ class PipelineOrchestrator(Node):
             self.get_parameter('curobo_service_wait_sec').value)
         self._enable_motion_execution = _as_bool(
             self.get_parameter('enable_motion_execution').value)
+        self._return_home_after_place = _as_bool(
+            self.get_parameter('return_home_after_place').value)
+        self._place_poses_path = str(
+            self.get_parameter('place_poses_path').value)
+        self._place_poses = load_place_poses(self._place_poses_path)
 
         self._task_sub = self.create_subscription(
             String, self.TASK_COMMANDS_TOPIC, self.task_command_callback, 10)
         self._joint_sub = self.create_subscription(
             JointState, self.JOINT_STATES_TOPIC, self._cache_joints, 10)
+        self._task_plan_pub = self.create_publisher(
+            String,
+            str(self.get_parameter('task_plan_topic').value),
+            10,
+        )
+        self._gemini = GeminiAPI(
+            model=str(self.get_parameter('gemini_model').value),
+            logger=self.get_logger(),
+        )
         self._segmentation_client = self.create_client(
             StringString, self._segmentation_service_name)
         self._graspgen_client = self.create_client(
@@ -116,9 +159,13 @@ class PipelineOrchestrator(Node):
 
         self._pipeline_busy = False
         self._active_task = ''
+        self._active_task_data = None
+        self._task_queue = deque()
+        self._motion_steps = deque()
         self._latest_segmentation = None
         self._latest_graspgen = None
         self._latest_joints = None
+        self._holding_object = False
 
         self._curobo_client = None
         self._arm_client = None
@@ -155,9 +202,77 @@ class PipelineOrchestrator(Node):
     # ── ROS2 subscriptions ────────────────────────────────────────────────────
 
     def task_command_callback(self, msg: String) -> None:
-        self.get_logger().info(f'Received task command: {msg.data}')
-        if self._auto_run_on_task_command:
-            self._run_pipeline(msg.data)
+        instruction = str(msg.data).strip()
+        if not instruction:
+            self.get_logger().warn('Ignoring empty task command.')
+            return
+
+        self.get_logger().info(f'Received task command: {instruction}')
+
+        try:
+            plan = self._gemini.parse_task_command(instruction)
+        except (GeminiAPIError, ValueError) as exc:
+            self.get_logger().error(f'Gemini task parsing failed: {exc}')
+            return
+        except Exception as exc:
+            self.get_logger().error(
+                f'Unexpected task parsing failure: {type(exc).__name__}: {exc}')
+            return
+
+        plan_json = json.dumps(plan, ensure_ascii=False)
+        output = String()
+        output.data = plan_json
+        self._task_plan_pub.publish(output)
+        self.get_logger().info(f'Published task plan: {plan_json}')
+
+        if not self._auto_run_on_task_command:
+            return
+
+        for task in plan['tasks']:
+            self._task_queue.append(task)
+
+        self.get_logger().info(
+            f"Queued {len(plan['tasks'])} task(s); "
+            f"total_pending={len(self._task_queue)}")
+        self._start_next_task()
+
+    def _start_next_task(self) -> None:
+        if self._pipeline_busy or not self._task_queue:
+            return
+
+        task = self._task_queue.popleft()
+        self._active_task_data = task
+
+        object_name = str(task['object'])
+        destination = str(task['destination'])
+
+        if self._enable_motion_execution and destination == 'unspecified':
+            self.get_logger().error(
+                f"Cannot execute object={object_name}: destination is unspecified.")
+            self._reset_pipeline_state(
+                success=False, reason='destination is unspecified')
+            return
+
+        segmentation_prompt = self._build_segmentation_prompt(task)
+
+        self.get_logger().info(
+            f"Starting queued task object={object_name} "
+            f"destination={destination} "
+            f"remaining={len(self._task_queue)}")
+        self.get_logger().info(
+            f"Segmentation request prompt: {segmentation_prompt}")
+        self._run_pipeline(segmentation_prompt)
+
+    @staticmethod
+    def _build_segmentation_prompt(task: dict) -> str:
+        object_name = str(task['object']).replace('_', ' ').strip()
+        return (
+            f"Locate exactly one instance of the {object_name} in the image. "
+            "Use the complete visible object as the target. "
+            "Ignore the robot gripper, table, storage baskets, bookshelf, "
+            "and every other object. If multiple candidates are visible, "
+            "select the clearest instance that best matches the object name."
+        )
 
     def _cache_joints(self, msg) -> None:
         self._latest_joints = msg
@@ -168,6 +283,7 @@ class PipelineOrchestrator(Node):
         task = task.strip()
         if not task:
             self.get_logger().warn('Ignoring empty task command.')
+            self._reset_pipeline_state()
             return
         if self._pipeline_busy:
             self.get_logger().warn(
@@ -179,6 +295,7 @@ class PipelineOrchestrator(Node):
             self.get_logger().warn(
                 f'Segmentation service unavailable: {self._segmentation_service_name} '
                 f'(waited {self._segmentation_service_wait_sec:.1f}s)')
+            self._reset_pipeline_state()
             return
 
         self._pipeline_busy = True
@@ -254,11 +371,13 @@ class PipelineOrchestrator(Node):
             f"label={self._latest_segmentation.get('label', 'target')} "
             f"best_translation={top_grasps[0].get('translation')} "
             f"confidence={top_grasps[0].get('confidence')} "
-            f"num_candidates={len(top_grasps)}"
+            f"num_candidates={len(top_grasps)} "
+            f"destination={self._active_destination()}"
         )
 
         if not self._enable_motion_execution:
-            self._reset_pipeline_state()
+            self._reset_pipeline_state(
+                success=True, reason='GraspGen completed; motion disabled')
             return
 
         # Build geometry_msgs/Pose for every ranked grasp candidate.
@@ -313,36 +432,197 @@ class PipelineOrchestrator(Node):
             result = future.result()
         except Exception as exc:
             self.get_logger().error(f'CuRobo service call failed: {exc}')
-            self._reset_pipeline_state()
+            self._reset_pipeline_state(success=False, reason=str(exc))
             return
 
         if not result.success:
             self.get_logger().warn(f'CuRobo pick planning failed: {result.message}')
-            self._reset_pipeline_state()
+            self._reset_pipeline_state(
+                success=False, reason=f'pick planning failed: {result.message}')
             return
 
         self.get_logger().info(result.message)
 
-        # 4-phase pick execution: open gripper → approach+grasp → close → lift.
-        # Opening first is essential: the planned grasp pose assumes open
-        # fingers, so a gripper left closed from a prior cycle would collide
-        # with the object during the approach instead of enclosing it.
         try:
-            self._send_gripper(closed=False)
-            self._send_and_wait(
-                self._arm_client, result.trajectory, 'approach_and_grasp')
-            self._send_gripper(closed=True)
-            self._send_and_wait(
-                self._arm_client, result.lift_trajectory, 'lift')
+            self._send_gripper(closed=False, strict=True)
+            self._execute_arm_trajectory(
+                result.trajectory, 'approach_and_grasp')
+            self._send_gripper(closed=True, strict=True)
+            self._execute_arm_trajectory(
+                result.lift_trajectory, 'lift')
         except Exception as exc:
             self.get_logger().error(f'Pick execution failed: {exc}')
-            # Best-effort: try to open the gripper so we don't drop/drag things.
             try:
-                self._send_gripper(closed=False)
+                self._send_gripper(closed=False, strict=False)
             except Exception:
                 pass
-        finally:
-            self._reset_pipeline_state()
+            self._reset_pipeline_state(
+                success=False, reason=f'pick execution failed: {exc}')
+            return
+
+        self._start_place_sequence()
+
+
+    # ── place sequence ─────────────────────────────────────────────────────────
+
+    def _start_place_sequence(self) -> None:
+        destination = self._active_destination()
+
+        try:
+            destination_pose = resolve_target_pose(
+                self._place_poses, destination)
+            home_pose = resolve_target_pose(self._place_poses, 'home')
+        except Exception as exc:
+            self.get_logger().error(
+                f"Cannot resolve destination '{destination}': {exc}")
+            self._reset_pipeline_state(
+                success=False, reason=f'invalid destination: {exc}')
+            return
+
+        if destination_pose is None or home_pose is None:
+            self._reset_pipeline_state(
+                success=False, reason='failed to construct place/home Pose')
+            return
+
+        self._motion_steps.clear()
+
+        transit_pose = copy.deepcopy(destination_pose)
+        transit_pose.position.z = float(self._place_poses['transit_z'])
+        self._motion_steps.append({
+            'label': f'transit_to_{destination}',
+            'pose': transit_pose,
+            'release_after': False,
+        })
+
+        if destination in BOOKSHELF_TARGETS:
+            shelf = self._place_poses[destination]
+            pre_insert_pose = destination_pose
+            inserted_pose = _offset_pose_along_local_z(
+                pre_insert_pose, float(shelf['insert_depth_m']))
+            retract_pose = _offset_pose_along_local_z(
+                inserted_pose, -float(shelf['retract_depth_m']))
+
+            self._motion_steps.append({
+                'label': f'{destination}_pre_insert',
+                'pose': pre_insert_pose,
+                'release_after': False,
+            })
+            self._motion_steps.append({
+                'label': f'{destination}_insert',
+                'pose': inserted_pose,
+                'release_after': True,
+            })
+            self._motion_steps.append({
+                'label': f'{destination}_retract',
+                'pose': retract_pose,
+                'release_after': False,
+            })
+        else:
+            self._motion_steps.append({
+                'label': f'place_{destination}',
+                'pose': destination_pose,
+                'release_after': True,
+            })
+
+        if self._return_home_after_place:
+            self._motion_steps.append({
+                'label': 'return_home',
+                'pose': home_pose,
+                'release_after': False,
+            })
+
+        self.get_logger().info(
+            f"Built place sequence destination={destination} "
+            f"steps={[step['label'] for step in self._motion_steps]}")
+        self._request_next_motion_step()
+
+    def _request_next_motion_step(self) -> None:
+        if not self._motion_steps:
+            self._reset_pipeline_state(
+                success=True, reason='pick and place completed')
+            return
+
+        if self._latest_joints is None:
+            self._reset_pipeline_state(
+                success=False, reason='joint state unavailable before place')
+            return
+
+        if self._curobo_client is None:
+            self._reset_pipeline_state(
+                success=False, reason='CuRobo client unavailable before place')
+            return
+
+        step = self._motion_steps.popleft()
+        request = PlanTrajectory.Request()
+        request.grasp_poses = []
+        request.grasp_pose = step['pose']
+        request.joint_state = self._latest_joints
+
+        future = self._curobo_client.call_async(request)
+        future.add_done_callback(
+            lambda done_future, current_step=step:
+            self._on_motion_step_planned(done_future, current_step)
+        )
+        self.get_logger().info(
+            f"Requested CuRobo single-pose plan: {step['label']}")
+
+    def _on_motion_step_planned(self, future, step: dict) -> None:
+        label = str(step['label'])
+        try:
+            result = future.result()
+        except Exception as exc:
+            self.get_logger().error(
+                f"CuRobo place service call failed at {label}: {exc}")
+            self._reset_pipeline_state(
+                success=False, reason=f'{label} service failure: {exc}')
+            return
+
+        if not result.success:
+            self.get_logger().error(
+                f"CuRobo place planning failed at {label}: {result.message}")
+            self._reset_pipeline_state(
+                success=False, reason=f'{label} planning failed')
+            return
+
+        try:
+            self._execute_arm_trajectory(result.trajectory, label)
+            if bool(step.get('release_after')):
+                self.get_logger().info(
+                    f"Reached release pose for {self._active_destination()}; "
+                    "opening gripper.")
+                self._send_gripper(closed=False, strict=True)
+        except Exception as exc:
+            self.get_logger().error(
+                f"Motion step execution failed at {label}: {exc}")
+            self._reset_pipeline_state(
+                success=False, reason=f'{label} execution failed: {exc}')
+            return
+
+        self._request_next_motion_step()
+
+    def _execute_arm_trajectory(
+        self, trajectory: 'JointTrajectory', label: str
+    ) -> None:
+        self._send_and_wait(self._arm_client, trajectory, label)
+        self._update_joint_state_from_trajectory(trajectory)
+
+    def _update_joint_state_from_trajectory(
+        self, trajectory: 'JointTrajectory'
+    ) -> None:
+        points = list(getattr(trajectory, 'points', []) or [])
+        joint_names = list(getattr(trajectory, 'joint_names', []) or [])
+        if not points or not joint_names:
+            return
+
+        final_positions = list(getattr(points[-1], 'positions', []) or [])
+        if len(final_positions) != len(joint_names):
+            return
+
+        state = JointState()
+        state.header.stamp = self.get_clock().now().to_msg()
+        state.name = joint_names
+        state.position = [float(value) for value in final_positions]
+        self._latest_joints = state
 
     # ── execution helpers ─────────────────────────────────────────────────────
 
@@ -355,13 +635,9 @@ class PipelineOrchestrator(Node):
     ) -> None:
         """Send a JointTrajectory action goal and block until it completes."""
         if trajectory is None or not trajectory.points:
-            self.get_logger().warn(
-                f'_send_and_wait({label}): refusing empty trajectory.')
-            return
+            raise RuntimeError(f'{label}: empty trajectory')
         if client is None:
-            self.get_logger().warn(
-                f'_send_and_wait({label}): action client unavailable.')
-            return
+            raise RuntimeError(f'{label}: action client unavailable')
         if not client.wait_for_server(timeout_sec=server_timeout_sec):
             raise RuntimeError(
                 f'{label} action server unavailable '
@@ -415,12 +691,15 @@ class PipelineOrchestrator(Node):
             raise RuntimeError(f'Timed out waiting for {label} action {phase}')
         return future.result()
 
-    def _send_gripper(self, closed: bool) -> None:
-        """Send open / close command to the gripper controller and wait."""
+    def _send_gripper(self, closed: bool, *, strict: bool = False) -> None:
+        """Send open/close and track whether the robot is holding an object."""
         if self._gripper_client is None:
-            self.get_logger().warn(
-                '_send_gripper: gripper action client unavailable; skipping.')
+            message = '_send_gripper: gripper action client unavailable.'
+            if strict:
+                raise RuntimeError(message)
+            self.get_logger().warn(message)
             return
+
         jt = JointTrajectory()
         jt.joint_names = [_GRIPPER_JOINT]
         pt = JointTrajectoryPoint()
@@ -428,15 +707,72 @@ class PipelineOrchestrator(Node):
         pt.time_from_start = RosDuration(sec=1, nanosec=0)
         jt.points.append(pt)
         label = 'gripper_close' if closed else 'gripper_open'
+
         try:
             self._send_and_wait(self._gripper_client, jt, label)
+            self._holding_object = bool(closed)
         except Exception as exc:
+            if strict:
+                raise
             self.get_logger().warn(f'{label} failed (non-fatal): {exc}')
 
-    def _reset_pipeline_state(self) -> None:
+    def _active_destination(self) -> str:
+        if not self._active_task_data:
+            return 'unspecified'
+        return str(self._active_task_data.get('destination', 'unspecified'))
+
+    def _reset_pipeline_state(
+        self, *, success: bool = False, reason: str = ''
+    ) -> None:
+        finished = self._active_task_data
         self._pipeline_busy = False
         self._active_task = ''
+        self._active_task_data = None
+        self._motion_steps.clear()
 
+        if finished is not None:
+            level = self.get_logger().info if success else self.get_logger().error
+            level(
+                f"Task {'completed' if success else 'failed'} "
+                f"object={finished.get('object')} "
+                f"destination={finished.get('destination')} "
+                f"reason={reason or 'none'}")
+
+        if not success and self._holding_object:
+            pending = len(self._task_queue)
+            self._task_queue.clear()
+            self.get_logger().error(
+                'Stopping the queue because the gripper may still hold an object; '
+                f'cleared {pending} pending task(s).')
+            return
+
+        if self._auto_run_on_task_command:
+            self._start_next_task()
+
+
+
+def _offset_pose_along_local_z(pose: 'Pose', distance_m: float) -> 'Pose':
+    """Copy *pose* and translate it along the pose's local +Z axis."""
+    out = copy.deepcopy(pose)
+
+    x = float(pose.orientation.x)
+    y = float(pose.orientation.y)
+    z = float(pose.orientation.z)
+    w = float(pose.orientation.w)
+    norm = math.sqrt(x * x + y * y + z * z + w * w)
+    if norm <= 1e-9:
+        raise ValueError('Cannot offset pose with a zero quaternion.')
+    x, y, z, w = x / norm, y / norm, z / norm, w / norm
+
+    # Third column of the quaternion rotation matrix: local +Z in world frame.
+    axis_x = 2.0 * (x * z + y * w)
+    axis_y = 2.0 * (y * z - x * w)
+    axis_z = 1.0 - 2.0 * (x * x + y * y)
+
+    out.position.x += float(distance_m) * axis_x
+    out.position.y += float(distance_m) * axis_y
+    out.position.z += float(distance_m) * axis_z
+    return out
 
 def _goal_status_succeeded() -> int:
     if GoalStatus is None:
