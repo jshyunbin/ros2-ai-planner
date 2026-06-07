@@ -11,6 +11,7 @@ MultiThreadedExecutor so spin_until_future_complete works inside callbacks.
 
 import json
 import threading
+from collections import deque
 
 try:  # pragma: no cover - runtime dependency
     import rclpy
@@ -46,6 +47,12 @@ except ImportError:  # pragma: no cover - import-only test fallback
     class String:  # type: ignore[override]
         pass
 
+
+try:  # pragma: no cover - ROS runtime dependency
+    from ament_index_python.packages import get_package_share_directory
+except ImportError:  # pragma: no cover - import-only test fallback
+    get_package_share_directory = None
+
 try:  # pragma: no cover - runtime dependency
     from riro_srvs.srv import StringString
     from riro_srvs.srv import PlanTrajectory
@@ -53,6 +60,7 @@ except ImportError:  # pragma: no cover - runtime dependency
     StringString = None
     PlanTrajectory = None
 
+from team_8.gemini_api import GeminiAPI, GeminiAPIError
 from team_8.pipeline_utils import as_bool as _as_bool
 from team_8.pipeline_utils import env_float as _env_float
 from team_8.pipeline_utils import pose_from_grasp_row as _pose_from_grasp_row_util
@@ -68,6 +76,7 @@ class PipelineOrchestrator(Node):
     """ROS2 orchestrator for segmentation, GraspGen, and motion execution."""
 
     TASK_COMMANDS_TOPIC = '/task_commands'
+    TASK_PLAN_TOPIC = '/gemini/task_plan'
     JOINT_STATES_TOPIC = '/joint_states'
     CUROBO_READY_TOPIC = '/curobo/ready'
 
@@ -95,8 +104,8 @@ class PipelineOrchestrator(Node):
                                '/ur5_controller/follow_joint_trajectory')
         self.declare_parameter('gripper_action_name',
                                '/gripper_controller/follow_joint_trajectory')
-        self.declare_parameter('target_goal', 'storage_1')
-        self._target_goal = str(self.get_parameter('target_goal').value)
+        self.declare_parameter('gemini_model', 'gemini-2.5-flash')
+        self.declare_parameter('task_plan_topic', self.TASK_PLAN_TOPIC)
 
         self._segmentation_service_name = str(
             self.get_parameter('segmentation_service_name').value)
@@ -145,6 +154,15 @@ class PipelineOrchestrator(Node):
         self._curobo_ready_sub = self.create_subscription(
             Bool, self.CUROBO_READY_TOPIC, self._on_curobo_ready, ready_qos,
             callback_group=ReentrantCallbackGroup())
+        self._task_plan_pub = self.create_publisher(
+            String,
+            str(self.get_parameter('task_plan_topic').value),
+            10,
+        )
+        self._gemini = GeminiAPI(
+            model=str(self.get_parameter('gemini_model').value),
+            logger=self.get_logger(),
+        )
         self._segmentation_client = self.create_client(
             StringString, self._segmentation_service_name,
             callback_group=self._pipeline_cbg)
@@ -154,9 +172,12 @@ class PipelineOrchestrator(Node):
 
         self._pipeline_busy = False
         self._active_task = ''
+        self._active_task_data = None
+        self._task_queue = deque()
         self._latest_segmentation = None
         self._latest_graspgen = None
         self._latest_joints = None
+        self._holding_object = False
 
         self._curobo_client = None
         self._arm_client = None
@@ -196,9 +217,77 @@ class PipelineOrchestrator(Node):
     # ── ROS2 subscriptions ────────────────────────────────────────────────────
 
     def task_command_callback(self, msg: String) -> None:
-        self.get_logger().info(f'Received task command: {msg.data}')
-        if self._auto_run_on_task_command:
-            self._run_pipeline(msg.data)
+        instruction = str(msg.data).strip()
+        if not instruction:
+            self.get_logger().warn('Ignoring empty task command.')
+            return
+
+        self.get_logger().info(f'Received task command: {instruction}')
+
+        try:
+            plan = self._gemini.parse_task_command(instruction)
+        except (GeminiAPIError, ValueError) as exc:
+            self.get_logger().error(f'Gemini task parsing failed: {exc}')
+            return
+        except Exception as exc:
+            self.get_logger().error(
+                f'Unexpected task parsing failure: {type(exc).__name__}: {exc}')
+            return
+
+        plan_json = json.dumps(plan, ensure_ascii=False)
+        output = String()
+        output.data = plan_json
+        self._task_plan_pub.publish(output)
+        self.get_logger().info(f'Published task plan: {plan_json}')
+
+        if not self._auto_run_on_task_command:
+            return
+
+        for task in plan['tasks']:
+            self._task_queue.append(task)
+
+        self.get_logger().info(
+            f"Queued {len(plan['tasks'])} task(s); "
+            f"total_pending={len(self._task_queue)}")
+        self._start_next_task()
+
+    def _start_next_task(self) -> None:
+        if self._pipeline_busy or not self._task_queue:
+            return
+
+        task = self._task_queue.popleft()
+        self._active_task_data = task
+
+        object_name = str(task['object'])
+        destination = str(task['destination'])
+
+        if self._enable_motion_execution and destination == 'unspecified':
+            self.get_logger().error(
+                f"Cannot execute object={object_name}: destination is unspecified.")
+            self._reset_pipeline_state(
+                success=False, reason='destination is unspecified')
+            return
+
+        segmentation_prompt = self._build_segmentation_prompt(task)
+
+        self.get_logger().info(
+            f"Starting queued task object={object_name} "
+            f"destination={destination} "
+            f"remaining={len(self._task_queue)}")
+        self.get_logger().info(
+            f"Segmentation request prompt: {segmentation_prompt}")
+        self._run_pipeline(segmentation_prompt)
+
+    @staticmethod
+    def _build_segmentation_prompt(task: dict) -> str:
+        object_name = str(task['object']).replace('_', ' ').strip()
+        return (
+            f"Locate exactly one instance of the {object_name} in the image. "
+            "Use the complete visible object as the target. "
+            "Ignore the robot gripper, table, storage baskets, bookshelf, "
+            "and every other object. If multiple candidates are visible, "
+            "select the clearest instance that best matches the object name."
+        )
 
     def _cache_joints(self, msg) -> None:
         self._latest_joints = msg
@@ -215,6 +304,7 @@ class PipelineOrchestrator(Node):
         task = task.strip()
         if not task:
             self.get_logger().warn('Ignoring empty task command.')
+            self._reset_pipeline_state()
             return
         if self._pipeline_busy:
             self.get_logger().warn(
@@ -226,6 +316,7 @@ class PipelineOrchestrator(Node):
             self.get_logger().warn(
                 f'Segmentation service unavailable: {self._segmentation_service_name} '
                 f'(waited {self._segmentation_service_wait_sec:.1f}s)')
+            self._reset_pipeline_state()
             return
 
         self._pipeline_busy = True
@@ -315,11 +406,13 @@ class PipelineOrchestrator(Node):
             f"label={self._latest_segmentation.get('label', 'target')} "
             f"best_translation={top_grasps[0].get('translation')} "
             f"confidence={top_grasps[0].get('confidence')} "
-            f"num_candidates={len(top_grasps)}"
+            f"num_candidates={len(top_grasps)} "
+            f"destination={self._active_destination()}"
         )
 
         if not self._enable_motion_execution:
-            self._reset_pipeline_state()
+            self._reset_pipeline_state(
+                success=True, reason='GraspGen completed; motion disabled')
             return
 
         # Build geometry_msgs/Pose for every ranked grasp candidate.
@@ -374,12 +467,13 @@ class PipelineOrchestrator(Node):
             result = future.result()
         except Exception as exc:
             self.get_logger().error(f'CuRobo service call failed: {exc}')
-            self._reset_pipeline_state()
+            self._reset_pipeline_state(success=False, reason=str(exc))
             return
 
         if not result.success:
             self.get_logger().warn(f'CuRobo pick planning failed: {result.message}')
-            self._reset_pipeline_state()
+            self._reset_pipeline_state(
+                success=False, reason=f'pick planning failed: {result.message}')
             return
 
         self.get_logger().info(result.message)
@@ -387,7 +481,8 @@ class PipelineOrchestrator(Node):
         # pick (open → approach+grasp → close → lift) → place → release → home.
         # Opening first is essential: the planned grasp pose assumes open
         # fingers, so a gripper left closed from a prior cycle would collide
-        # with the object during the approach instead of enclosing it.
+        # with the object during the approach instead of enclosing it. The place
+        # destination comes from the Gemini-parsed task (_active_destination).
         try:
             self._send_gripper(closed=False)
             self._send_and_wait(
@@ -395,7 +490,7 @@ class PipelineOrchestrator(Node):
             self._send_gripper(closed=True)
             self._send_and_wait(
                 self._arm_client, result.lift_trajectory, 'lift')
-            self._plan_and_execute_place(self._target_goal)
+            self._plan_and_execute_place(self._active_destination())
             self._plan_and_execute_home()
         except Exception as exc:
             self.get_logger().error(f'Pick/place execution failed: {exc}')
@@ -404,8 +499,12 @@ class PipelineOrchestrator(Node):
                 self._send_gripper(closed=False)
             except Exception:
                 pass
-        finally:
-            self._reset_pipeline_state()
+            self._reset_pipeline_state(
+                success=False, reason=f'pick/place execution failed: {exc}')
+            return
+
+        self._reset_pipeline_state(
+            success=True, reason='pick and place completed')
 
     def _call_curobo_blocking(self, request, label):
         """Call the CuRobo plan service and block for the response.
@@ -510,13 +609,9 @@ class PipelineOrchestrator(Node):
     ) -> None:
         """Send a JointTrajectory action goal and block until it completes."""
         if trajectory is None or not trajectory.points:
-            self.get_logger().warn(
-                f'_send_and_wait({label}): refusing empty trajectory.')
-            return
+            raise RuntimeError(f'{label}: empty trajectory')
         if client is None:
-            self.get_logger().warn(
-                f'_send_and_wait({label}): action client unavailable.')
-            return
+            raise RuntimeError(f'{label}: action client unavailable')
         if not client.wait_for_server(timeout_sec=server_timeout_sec):
             raise RuntimeError(
                 f'{label} action server unavailable '
@@ -570,12 +665,15 @@ class PipelineOrchestrator(Node):
             raise RuntimeError(f'Timed out waiting for {label} action {phase}')
         return future.result()
 
-    def _send_gripper(self, closed: bool) -> None:
-        """Send open / close command to the gripper controller and wait."""
+    def _send_gripper(self, closed: bool, *, strict: bool = False) -> None:
+        """Send open/close and track whether the robot is holding an object."""
         if self._gripper_client is None:
-            self.get_logger().warn(
-                '_send_gripper: gripper action client unavailable; skipping.')
+            message = '_send_gripper: gripper action client unavailable.'
+            if strict:
+                raise RuntimeError(message)
+            self.get_logger().warn(message)
             return
+
         jt = JointTrajectory()
         jt.joint_names = [_GRIPPER_JOINT]
         pt = JointTrajectoryPoint()
@@ -583,14 +681,46 @@ class PipelineOrchestrator(Node):
         pt.time_from_start = RosDuration(sec=1, nanosec=0)
         jt.points.append(pt)
         label = 'gripper_close' if closed else 'gripper_open'
+
         try:
             self._send_and_wait(self._gripper_client, jt, label)
+            self._holding_object = bool(closed)
         except Exception as exc:
+            if strict:
+                raise
             self.get_logger().warn(f'{label} failed (non-fatal): {exc}')
 
-    def _reset_pipeline_state(self) -> None:
+    def _active_destination(self) -> str:
+        if not self._active_task_data:
+            return 'unspecified'
+        return str(self._active_task_data.get('destination', 'unspecified'))
+
+    def _reset_pipeline_state(
+        self, *, success: bool = False, reason: str = ''
+    ) -> None:
+        finished = self._active_task_data
         self._pipeline_busy = False
         self._active_task = ''
+        self._active_task_data = None
+
+        if finished is not None:
+            level = self.get_logger().info if success else self.get_logger().error
+            level(
+                f"Task {'completed' if success else 'failed'} "
+                f"object={finished.get('object')} "
+                f"destination={finished.get('destination')} "
+                f"reason={reason or 'none'}")
+
+        if not success and self._holding_object:
+            pending = len(self._task_queue)
+            self._task_queue.clear()
+            self.get_logger().error(
+                'Stopping the queue because the gripper may still hold an object; '
+                f'cleared {pending} pending task(s).')
+            return
+
+        if self._auto_run_on_task_command:
+            self._start_next_task()
 
 
 def _goal_status_succeeded() -> int:

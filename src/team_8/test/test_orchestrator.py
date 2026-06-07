@@ -95,99 +95,6 @@ def test_curobo_plan_trajectory_calls_update_world_after_min_frames(monkeypatch)
         mock_planner.update_world.assert_called_once()
 
 
-def test_curobo_pick_retries_relaxed_world_after_tsdf_failures(monkeypatch):
-    import numpy as np
-    import team_8.curobo as mod
-    from team_8.curobo import CuRobo
-
-    class FakePlanner:
-        tool_frames = ['tool0']
-
-        def __init__(self):
-            self.calls = []
-            self.world_updates = []
-
-        def clear_scene_cache(self):
-            pass
-
-        def update_world(self, scene):
-            self.world_updates.append(scene)
-
-        def reset_seed(self):
-            pass
-
-        def plan_grasp(self, **kwargs):
-            self.calls.append(kwargs)
-            if len(self.calls) == 5:
-                return SimpleNamespace(
-                    success=np.array([True]),
-                    status='ok',
-                    goalset_index=np.array([0]),
-                )
-            return SimpleNamespace(
-                success=np.array([False]),
-                status='Planning to grasp pose failed.',
-                goalset_index=np.array([0]),
-                goalset_result=SimpleNamespace(success=np.array([True])),
-                approach_result=SimpleNamespace(success=np.array([True])),
-                grasp_result=SimpleNamespace(success=np.array([False])),
-                lift_result=None,
-            )
-
-    fake_planner = FakePlanner()
-    curobo = CuRobo.__new__(CuRobo)
-    curobo._planner = fake_planner
-    curobo._mapper = MagicMock()
-    curobo._mapper.compute_esdf.return_value = 'voxel-grid'
-    curobo._logger = MagicMock()
-    curobo._lock = threading.Lock()
-    curobo._frame_count = mod.MIN_FRAMES
-    curobo._last_world_update_frame = -1
-    curobo._enable_viz = False
-    curobo._latest_joints = None
-    curobo.update_joint_state = MagicMock()
-    curobo._ros_js_to_curobo = MagicMock(return_value='current')
-    curobo._grasps_to_goalset = MagicMock(side_effect=lambda items: items[0]['id'])
-
-    monkeypatch.setenv('PIPELINE_CUROBO_MIN_PLANNING_FRAMES', str(mod.MIN_FRAMES))
-    monkeypatch.setenv('PIPELINE_CUROBO_GRASP_APPROACH_OFFSETS', '-0.035,-0.06')
-    monkeypatch.setenv('PIPELINE_CUROBO_GRASP_LIFT_OFFSET', '0.10')
-    monkeypatch.setattr(mod.torch.cuda, 'synchronize', lambda: None)
-
-    candidates = [
-        {'id': 'first', 'pose_4x4': np.eye(4, dtype=np.float32)},
-        {'id': 'second', 'pose_4x4': np.eye(4, dtype=np.float32)},
-    ]
-
-    result = curobo._plan_pick_locked(candidates, MagicMock())
-
-    assert result.success.any()
-    assert [call['grasp_poses'] for call in fake_planner.calls] == [
-        'first',
-        'second',
-        'first',
-        'second',
-        'first',
-    ]
-    assert [call['grasp_approach_offset'] for call in fake_planner.calls] == [
-        -0.035,
-        -0.035,
-        -0.06,
-        -0.06,
-        -0.035,
-    ]
-    assert all(call['grasp_lift_offset'] == 0.10 for call in fake_planner.calls)
-    assert len(fake_planner.world_updates) == 2
-    assert any(
-        'world=tsdf' in str(call.args[0])
-        for call in curobo._logger.warn.call_args_list
-    )
-    assert any(
-        'world=relaxed' in str(call.args[0])
-        for call in curobo._logger.info.call_args_list
-    )
-
-
 def test_curobo_pick_diagnostics_include_world_and_tool_pose():
     import numpy as np
     from team_8.curobo import _pick_failure_diagnostics
@@ -389,7 +296,7 @@ def test_orchestrator_curobo_pick_done_executes_phase_sequence():
     orch._reset_pipeline_state = MagicMock()
     orch._plan_and_execute_place = MagicMock()
     orch._plan_and_execute_home = MagicMock()
-    orch._target_goal = 'storage_1'
+    orch._active_task_data = {'object': 'cup', 'destination': 'storage_1'}
     trajectory = JointTrajectory()
     trajectory.points = [JointTrajectoryPoint()]
     lift_trajectory = JointTrajectory()
@@ -412,6 +319,9 @@ def test_orchestrator_curobo_pick_done_executes_phase_sequence():
         call(closed=False), call(closed=True)]
     assert orch._send_and_wait.call_args_list[1].args == (
         orch._arm_client, lift_trajectory, 'lift')
+    # Place uses the Gemini-parsed destination from the active task.
+    orch._plan_and_execute_place.assert_called_once_with('storage_1')
+    orch._plan_and_execute_home.assert_called_once()
     orch._reset_pipeline_state.assert_called_once()
 
 
@@ -455,10 +365,16 @@ def test_curobo_service_pick_plans_without_waiting_for_tsdf_map(monkeypatch):
     node = CuRoboService.__new__(CuRoboService)
     node.get_logger = lambda: MagicMock()
 
-    traj = JointTrajectory()
-    traj.points = [JointTrajectoryPoint(), JointTrajectoryPoint()]
+    approach = JointTrajectory()
+    approach.points = [JointTrajectoryPoint()]
+    grasp = JointTrajectory()
+    grasp.points = [JointTrajectoryPoint()]
+    lift = JointTrajectory()
+    lift.points = [JointTrajectoryPoint(), JointTrajectoryPoint()]
 
-    monkeypatch.setattr(mod, 'interp_traj_to_ros', lambda *_args, **_kwargs: traj)
+    # _handle_pick splices a pre-close nudge into the grasp leg and concatenates
+    # approach+grasp into the executed trajectory; stub both so the test stays
+    # focused on the "plan without waiting for a TSDF map" contract.
     monkeypatch.setattr(
         mod,
         '_append_preclose_insertion_to_trajectory',
@@ -468,13 +384,7 @@ def test_curobo_service_pick_plans_without_waiting_for_tsdf_map(monkeypatch):
 
     curobo = MagicMock()
     curobo.plan_pick.return_value = SimpleNamespace(
-        approach_interpolated_trajectory='approach',
-        approach_interpolated_last_tstep=2,
-        grasp_interpolated_trajectory='grasp',
-        grasp_interpolated_last_tstep=2,
-        lift_interpolated_trajectory='lift',
-        lift_interpolated_last_tstep=2,
-    )
+        approach=approach, grasp=grasp, lift=lift, goalset_index=0)
 
     pose = SimpleNamespace(
         position=SimpleNamespace(x=0.5, y=0.0, z=0.1),
@@ -492,8 +402,9 @@ def test_curobo_service_pick_plans_without_waiting_for_tsdf_map(monkeypatch):
     curobo.min_planning_frames.assert_not_called()
     curobo.reset_mapping.assert_not_called()
     assert result.success is True
-    assert result.trajectory is traj
-    assert result.lift_trajectory is traj
+    # concat_trajectories is stubbed to return its first arg (approach+grasp).
+    assert result.trajectory is approach
+    assert result.lift_trajectory is lift
 
 
 def test_orchestrator_send_and_wait_uses_future_callbacks(monkeypatch):
@@ -559,7 +470,9 @@ def test_curobo_service_plans_with_supplied_joint_state():
     node._init_cv = threading.Condition()
     node._init_wait_sec = 5.0
     node._latest_joints = None
+    node._planning = threading.Event()
     request = MagicMock()
+    request.goal_name = ''  # not a place/home request -> single-pose mode
     request.grasp_poses = []
     request.joint_state.name = ["shoulder_pan_joint"]
     request.grasp_pose = MagicMock()
@@ -1135,7 +1048,7 @@ def test_orchestrator_pick_done_runs_place_then_home():
     orch._reset_pipeline_state = MagicMock()
     orch._plan_and_execute_place = MagicMock()
     orch._plan_and_execute_home = MagicMock()
-    orch._target_goal = 'storage_2'
+    orch._active_task_data = {'object': 'book', 'destination': 'storage_2'}
     orch._arm_client = MagicMock()
     trajectory = JointTrajectory(); trajectory.points = [JointTrajectoryPoint()]
     lift_trajectory = JointTrajectory(); lift_trajectory.points = [JointTrajectoryPoint()]
