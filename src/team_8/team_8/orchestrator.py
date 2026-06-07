@@ -13,16 +13,24 @@ import copy
 import json
 import math
 import threading
+import time
 from collections import deque
 from pathlib import Path
 
 try:  # pragma: no cover - runtime dependency
+    from PIL import Image as PILImage
+except ImportError:  # pragma: no cover - runtime dependency
+    PILImage = None
+
+try:  # pragma: no cover - runtime dependency
     import rclpy
     from action_msgs.msg import GoalStatus
+    from cv_bridge import CvBridge
     from rclpy.action import ActionClient
     from rclpy.node import Node
     from rclpy.executors import MultiThreadedExecutor
-    from sensor_msgs.msg import JointState
+    from rclpy.qos import QoSProfile, ReliabilityPolicy
+    from sensor_msgs.msg import Image, JointState
     from std_msgs.msg import String
     from control_msgs.action import FollowJointTrajectory
     from geometry_msgs.msg import Pose
@@ -31,8 +39,12 @@ try:  # pragma: no cover - runtime dependency
 except ImportError:  # pragma: no cover - import-only test fallback
     rclpy = None
     ActionClient = None
+    CvBridge = None
     GoalStatus = None
+    Image = None
     JointState = None
+    QoSProfile = None
+    ReliabilityPolicy = None
     FollowJointTrajectory = None
     Pose = None
     JointTrajectory = None
@@ -81,6 +93,7 @@ class PipelineOrchestrator(Node):
 
     TASK_COMMANDS_TOPIC = '/task_commands'
     TASK_PLAN_TOPIC = '/gemini/task_plan'
+    TASK_VERIFICATION_TOPIC = '/gemini/task_verification'
     JOINT_STATES_TOPIC = '/joint_states'
 
     def __init__(self):
@@ -116,6 +129,17 @@ class PipelineOrchestrator(Node):
         self.declare_parameter('task_plan_topic', self.TASK_PLAN_TOPIC)
         self.declare_parameter('place_poses_path', default_place_poses_path)
         self.declare_parameter('return_home_after_place', True)
+        self.declare_parameter(
+            'verification_rgb_topic',
+            '/wrist_camera/wrist_camera/color/image_raw')
+        self.declare_parameter('enable_post_task_verification', True)
+        self.declare_parameter('verification_settle_sec', 1.0)
+        self.declare_parameter('verification_frame_timeout_sec', 3.0)
+        self.declare_parameter('max_task_attempts', 2)
+        self.declare_parameter(
+            'verification_result_topic', self.TASK_VERIFICATION_TOPIC)
+        self.declare_parameter(
+            'verification_debug_dir', '.')
 
         self._segmentation_service_name = str(
             self.get_parameter('segmentation_service_name').value)
@@ -135,17 +159,47 @@ class PipelineOrchestrator(Node):
             self.get_parameter('enable_motion_execution').value)
         self._return_home_after_place = _as_bool(
             self.get_parameter('return_home_after_place').value)
+        self._verification_rgb_topic = str(
+            self.get_parameter('verification_rgb_topic').value)
+        self._enable_post_task_verification = _as_bool(
+            self.get_parameter('enable_post_task_verification').value)
+        self._verification_settle_sec = max(
+            0.0, float(self.get_parameter('verification_settle_sec').value))
+        self._verification_frame_timeout_sec = max(
+            0.1,
+            float(self.get_parameter('verification_frame_timeout_sec').value),
+        )
+        self._max_task_attempts = max(
+            1, int(self.get_parameter('max_task_attempts').value))
+        self._verification_debug_dir = Path(
+            str(self.get_parameter('verification_debug_dir').value))
+        self._verification_debug_dir.mkdir(parents=True, exist_ok=True)
         self._place_poses_path = str(
             self.get_parameter('place_poses_path').value)
         self._place_poses = load_place_poses(self._place_poses_path)
+
+        self._bridge = CvBridge()
+        image_qos = QoSProfile(depth=10)
+        image_qos.reliability = ReliabilityPolicy.BEST_EFFORT
 
         self._task_sub = self.create_subscription(
             String, self.TASK_COMMANDS_TOPIC, self.task_command_callback, 10)
         self._joint_sub = self.create_subscription(
             JointState, self.JOINT_STATES_TOPIC, self._cache_joints, 10)
+        self._verification_rgb_sub = self.create_subscription(
+            Image,
+            self._verification_rgb_topic,
+            self._cache_verification_rgb,
+            image_qos,
+        )
         self._task_plan_pub = self.create_publisher(
             String,
             str(self.get_parameter('task_plan_topic').value),
+            10,
+        )
+        self._task_verification_pub = self.create_publisher(
+            String,
+            str(self.get_parameter('verification_result_topic').value),
             10,
         )
         self._gemini = GeminiAPI(
@@ -166,6 +220,11 @@ class PipelineOrchestrator(Node):
         self._latest_graspgen = None
         self._latest_joints = None
         self._holding_object = False
+        self._latest_verification_rgb = None
+        self._latest_verification_rgb_stamp_ns = 0
+        self._verification_reference_stamp_ns = 0
+        self._verification_deadline_monotonic = 0.0
+        self._verification_timer = None
 
         self._curobo_client = None
         self._arm_client = None
@@ -196,7 +255,9 @@ class PipelineOrchestrator(Node):
             f'segmentation={self._segmentation_service_name} '
             f'graspgen={self._graspgen_service_name} '
             f'curobo={self._curobo_service_name} '
-            f'motion_execution={self._enable_motion_execution}'
+            f'motion_execution={self._enable_motion_execution} '
+            f'verification={self._enable_post_task_verification} '
+            f'max_attempts={self._max_task_attempts}'
         )
 
     # ── ROS2 subscriptions ────────────────────────────────────────────────────
@@ -229,7 +290,9 @@ class PipelineOrchestrator(Node):
             return
 
         for task in plan['tasks']:
-            self._task_queue.append(task)
+            queued_task = dict(task)
+            queued_task['_attempt_count'] = 0
+            self._task_queue.append(queued_task)
 
         self.get_logger().info(
             f"Queued {len(plan['tasks'])} task(s); "
@@ -241,14 +304,25 @@ class PipelineOrchestrator(Node):
             return
 
         task = self._task_queue.popleft()
+        self._start_task_attempt(task)
+
+    def _start_task_attempt(self, task: dict) -> None:
+        if self._pipeline_busy:
+            self.get_logger().warn(
+                'Cannot start a task attempt while the pipeline is busy.')
+            return
+
+        task['_attempt_count'] = int(task.get('_attempt_count', 0)) + 1
         self._active_task_data = task
 
         object_name = str(task['object'])
         destination = str(task['destination'])
+        attempt_count = int(task['_attempt_count'])
 
         if self._enable_motion_execution and destination == 'unspecified':
             self.get_logger().error(
-                f"Cannot execute object={object_name}: destination is unspecified.")
+                f"Cannot execute object={object_name}: "
+                "destination is unspecified.")
             self._reset_pipeline_state(
                 success=False, reason='destination is unspecified')
             return
@@ -256,8 +330,8 @@ class PipelineOrchestrator(Node):
         segmentation_prompt = self._build_segmentation_prompt(task)
 
         self.get_logger().info(
-            f"Starting queued task object={object_name} "
-            f"destination={destination} "
+            f"Starting task attempt={attempt_count}/{self._max_task_attempts} "
+            f"object={object_name} destination={destination} "
             f"remaining={len(self._task_queue)}")
         self.get_logger().info(
             f"Segmentation request prompt: {segmentation_prompt}")
@@ -276,6 +350,19 @@ class PipelineOrchestrator(Node):
 
     def _cache_joints(self, msg) -> None:
         self._latest_joints = msg
+
+    def _cache_verification_rgb(self, msg: 'Image') -> None:
+        try:
+            image = self._bridge.imgmsg_to_cv2(
+                msg, desired_encoding='bgr8')
+        except Exception as exc:
+            self.get_logger().warn(
+                f'Failed to decode verification RGB frame: {exc}')
+            return
+
+        self._latest_verification_rgb = image.copy()
+        self._latest_verification_rgb_stamp_ns = _stamp_to_ns(
+            msg.header.stamp)
 
     # ── pipeline entry ────────────────────────────────────────────────────────
 
@@ -524,7 +611,10 @@ class PipelineOrchestrator(Node):
                 'release_after': True,
             })
 
-        if self._return_home_after_place:
+        if (
+            self._return_home_after_place
+            or self._enable_post_task_verification
+        ):
             self._motion_steps.append({
                 'label': 'return_home',
                 'pose': home_pose,
@@ -538,8 +628,11 @@ class PipelineOrchestrator(Node):
 
     def _request_next_motion_step(self) -> None:
         if not self._motion_steps:
-            self._reset_pipeline_state(
-                success=True, reason='pick and place completed')
+            if self._enable_post_task_verification:
+                self._schedule_post_task_verification()
+            else:
+                self._reset_pipeline_state(
+                    success=True, reason='pick and place completed')
             return
 
         if self._latest_joints is None:
@@ -623,6 +716,237 @@ class PipelineOrchestrator(Node):
         state.name = joint_names
         state.position = [float(value) for value in final_positions]
         self._latest_joints = state
+
+    # ── post-task Gemini verification ────────────────────────────────────────
+
+    def _schedule_post_task_verification(self) -> None:
+        if self._active_task_data is None:
+            self._reset_pipeline_state(
+                success=False, reason='verification requested without active task')
+            return
+
+        self._verification_reference_stamp_ns = (
+            self._latest_verification_rgb_stamp_ns)
+        self._verification_deadline_monotonic = (
+            time.monotonic()
+            + self._verification_settle_sec
+            + self._verification_frame_timeout_sec
+        )
+
+        self.get_logger().info(
+            'Robot returned home; waiting for a fresh verification image ' 
+            f'from {self._verification_rgb_topic}.')
+        self._schedule_verification_timer(self._verification_settle_sec)
+
+    def _schedule_verification_timer(self, delay_sec: float) -> None:
+        self._cancel_verification_timer()
+
+        def callback() -> None:
+            timer = self._verification_timer
+            self._verification_timer = None
+            if timer is not None:
+                timer.cancel()
+            self._run_post_task_verification()
+
+        self._verification_timer = self.create_timer(
+            max(0.05, float(delay_sec)), callback)
+
+    def _cancel_verification_timer(self) -> None:
+        timer = self._verification_timer
+        self._verification_timer = None
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+
+    def _run_post_task_verification(self) -> None:
+        task = self._active_task_data
+        if task is None:
+            return
+
+        has_image = self._latest_verification_rgb is not None
+        has_fresh_image = (
+            has_image
+            and self._latest_verification_rgb_stamp_ns
+            > self._verification_reference_stamp_ns
+        )
+
+        if not has_fresh_image:
+            if time.monotonic() < self._verification_deadline_monotonic:
+                self._schedule_verification_timer(0.2)
+                return
+
+            self.get_logger().error(
+                'No fresh RGB frame arrived after the robot returned home; ' 
+                'skipping verification and continuing to the next JSON task.')
+            self._reset_pipeline_state(
+                success=False,
+                reason='verification image unavailable; skipped task',
+            )
+            return
+
+        if PILImage is None:
+            self._reset_pipeline_state(
+                success=False,
+                reason='Pillow unavailable for verification image',
+            )
+            return
+
+        image_bgr = self._latest_verification_rgb.copy()
+        image_rgb = image_bgr[:, :, ::-1].copy()
+        pil_image = PILImage.fromarray(image_rgb)
+
+        object_name = str(task['object'])
+        destination = str(task['destination'])
+        attempt_count = int(task.get('_attempt_count', 1))
+
+        try:
+            result = self._gemini.verify_object_removed(
+                pil_image,
+                object_name=object_name,
+                destination=destination,
+            )
+        except Exception as exc:
+            self.get_logger().error(
+                f'Gemini post-task verification failed: {exc}; ' 
+                'continuing to the next JSON task.')
+            self._publish_verification_result(
+                task=task,
+                result={
+                    'verification_success': False,
+                    'error': str(exc),
+                },
+            )
+            self._save_verification_artifacts(
+                image_rgb=image_rgb,
+                task=task,
+                result={'error': str(exc)},
+            )
+            self._reset_pipeline_state(
+                success=False,
+                reason='Gemini verification failed; skipped task',
+            )
+            return
+
+        present = bool(result['present_in_source_workspace'])
+        confidence = float(result.get('confidence', 0.0))
+        reason = str(result.get('reason', ''))
+
+        verification_payload = {
+            'verification_success': True,
+            'object': object_name,
+            'destination': destination,
+            'attempt': attempt_count,
+            'max_attempts': self._max_task_attempts,
+            **result,
+        }
+        self._publish_verification_result(
+            task=task, result=verification_payload)
+        self._save_verification_artifacts(
+            image_rgb=image_rgb,
+            task=task,
+            result=verification_payload,
+        )
+
+        self.get_logger().info(
+            'Gemini verification result ' 
+            f'object={object_name} attempt={attempt_count}/'
+            f'{self._max_task_attempts} ' 
+            f'present_in_source_workspace={present} ' 
+            f'confidence={confidence:.3f} reason={reason}')
+
+        if not present:
+            self._reset_pipeline_state(
+                success=True,
+                reason='verified removed from source workspace',
+            )
+            return
+
+        if attempt_count < self._max_task_attempts:
+            self.get_logger().warn(
+                f"Object '{object_name}' is still visible in the source "
+                f"workspace; retrying the same task "
+                f"({attempt_count + 1}/{self._max_task_attempts}).")
+            self._restart_active_task()
+            return
+
+        self.get_logger().warn(
+            f"Object '{object_name}' is still visible after "
+            f"{attempt_count} attempts; skipping it and continuing to the "
+            "next JSON task.")
+        self._reset_pipeline_state(
+            success=False,
+            reason=(
+                f'object still present after {attempt_count} attempts; skipped'
+            ),
+        )
+
+    def _restart_active_task(self) -> None:
+        task = self._active_task_data
+        if task is None:
+            self._reset_pipeline_state(
+                success=False, reason='retry requested without active task')
+            return
+
+        self._cancel_verification_timer()
+        self._pipeline_busy = False
+        self._active_task = ''
+        self._motion_steps.clear()
+        self._latest_segmentation = None
+        self._latest_graspgen = None
+        self._holding_object = False
+
+        self._start_task_attempt(task)
+
+    def _publish_verification_result(
+        self, *, task: dict, result: dict
+    ) -> None:
+        payload = {
+            'object': str(task.get('object', '')),
+            'destination': str(task.get('destination', '')),
+            'attempt': int(task.get('_attempt_count', 0)),
+            **result,
+        }
+        message = String()
+        message.data = json.dumps(payload, ensure_ascii=False)
+        self._task_verification_pub.publish(message)
+
+    def _save_verification_artifacts(
+        self, *, image_rgb, task: dict, result: dict
+    ) -> None:
+        try:
+            stamp = time.strftime('%Y%m%d-%H%M%S')
+            suffix = f"{time.time_ns() % 1_000_000_000:09d}"
+            object_name = str(task.get('object', 'object'))
+            attempt = int(task.get('_attempt_count', 0))
+            output_dir = (
+                self._verification_debug_dir
+                / f'{stamp}-{suffix}-{object_name}-attempt{attempt}'
+            )
+            output_dir.mkdir(parents=True, exist_ok=True)
+            PILImage.fromarray(image_rgb).save(output_dir / 'verification_rgb.png')
+            with open(
+                output_dir / 'result.json', 'w', encoding='utf-8'
+            ) as handle:
+                json.dump(
+                    {
+                        'task': {
+                            'object': task.get('object'),
+                            'destination': task.get('destination'),
+                            'attempt': attempt,
+                        },
+                        'result': result,
+                    },
+                    handle,
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            self.get_logger().info(
+                f'Saved verification artifacts: {output_dir}')
+        except Exception as exc:
+            self.get_logger().warn(
+                f'Failed to save verification artifacts: {exc}')
 
     # ── execution helpers ─────────────────────────────────────────────────────
 
@@ -725,6 +1049,9 @@ class PipelineOrchestrator(Node):
         self, *, success: bool = False, reason: str = ''
     ) -> None:
         finished = self._active_task_data
+        self._cancel_verification_timer()
+        self._verification_reference_stamp_ns = 0
+        self._verification_deadline_monotonic = 0.0
         self._pipeline_busy = False
         self._active_task = ''
         self._active_task_data = None
@@ -750,6 +1077,12 @@ class PipelineOrchestrator(Node):
             self._start_next_task()
 
 
+
+def _stamp_to_ns(stamp) -> int:
+    return (
+        int(getattr(stamp, 'sec', 0)) * 1_000_000_000
+        + int(getattr(stamp, 'nanosec', 0))
+    )
 
 def _offset_pose_along_local_z(pose: 'Pose', distance_m: float) -> 'Pose':
     """Copy *pose* and translate it along the pose's local +Z axis."""
