@@ -6,10 +6,21 @@
 #   quat_xyzw [1, 0, 0, 0]         -> tool0 +z points down (top-down drops / home)
 #   quat_xyzw [0.5, 0.5, 0.5, 0.5] -> tool0 +z points +x (into the bookshelf)
 #
-# Real poses. home is the tool0 FK of the home joint configuration
-#   [pan, lift, elbow, w1, w2, w3] = [-1.332, -2.402, 1.538, -0.863, -1.114, -1.292]
-# (computed with the planner's own cuRobo kinematics). storage_1/storage_2 are
-# the basket drop points (storageA_1 / storageB_1) with a top-down orientation.
+# Real poses. storage_1/storage_2 are the basket drop points
+# (storageA_1 / storageB_1) with a top-down orientation.
+#
+# home is a fixed JOINT configuration, not an IK pose: the arm returns to it via
+# a collision-aware c-space plan, so it always settles in the same posture instead
+# of whatever branch free IK happened to pick (which made the arm swing far from
+# the Gazebo initial state). Order matches the cuRobo cspace joint_names:
+# [pan, lift, elbow, wrist_1, wrist_2, wrist_3].
+#
+# Set to the manip_challenge Gazebo startup pose (init_joints.py sends
+# [0, -pi/2, 1, -pi/3, -pi/2, 0]): the arm starts here, so homing barely moves it,
+# and this raised/extended posture lets the wrist camera see the whole storage
+# (the more-tucked cuRobo default didn't cover it). Tune with
+# `ros2 run team_8 home_config_tuner` against the live sim.
+home_joint_config: [0.0, -1.5708, 1.0, -1.0472, -1.5708, 0.0]
 
 # Lateral carry height. Capped by UR5 reach: at storage_1's xy radius (~0.65 m)
 # cuRobo IK reaches up to z~0.60; 0.80 was unreachable and broke the lift leg.
@@ -26,12 +37,13 @@ transit_z: 0.45          # safe height for carrying an object laterally
 # objects; keep it below the storage drop z=0.37 so it never blocks the descent).
 transit_floor_z: 0.0
 
-home:      {xyz: [0.152144, -0.010048, 0.615651], quat_xyzw: [-0.685513, 0.687999, -0.179150, 0.156950]}
 storage_1: {xyz: [0.000000,  0.550000, 0.370337], quat_xyzw: [1.0, 0.0, 0.0, 0.0]}
 storage_2: {xyz: [0.000000, -0.550000, 0.370327], quat_xyzw: [1.0, 0.0, 0.0, 0.0]}
 
-# bookshelf/shelf pose not yet provided — add when available, e.g.:
-# bookshelf:
-#   pre_insert:      {xyz: [..., ..., ...], quat_xyzw: [0.5, 0.5, 0.5, 0.5]}
-#   insert_depth_m:  0.22
-#   retract_depth_m: 0.22
+# bookshelf/shelf pose. pre_insert is the staging pose in front of the shelf;
+# tool0 +z points +x (into the shelf) so the insert leg drives +x by
+# insert_depth_m, then retract_depth_m pulls back along -x after release.
+bookshelf:
+  pre_insert:      {xyz: [0.75, -0.3, 0.78], quat_xyzw: [-0.5, 0.5, -0.5, 0.5]}
+  insert_depth_m:  0.22
+  retract_depth_m: 0.22

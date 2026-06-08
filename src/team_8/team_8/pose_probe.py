@@ -9,7 +9,10 @@ tuned in the live sim. One-shot run() mirrors graspgen_service_caller.
 Run (inside the container, workspace sourced):
 
   ros2 run team_8 pose_probe --ros-args \
-    -p target:=home -p execute:=false
+    -p target:=storage_1 -p execute:=false
+
+(home is no longer a pose target — it is a joint configuration planned in
+c-space; tune it with home_config_tuner instead.)
 """
 
 import rclpy
@@ -36,7 +39,10 @@ class PoseProbe(Node):
             "poses_file",
             "/ros2_ws/src/team_8/config/place_poses.yml",
         )
-        self.declare_parameter("target", "home")
+        # home is no longer a pose target (it's a joint config planned in c-space;
+        # use home_config_tuner for that). pose_probe validates xyz/quat place
+        # targets like storage_1 / storage_2 / bookshelf.
+        self.declare_parameter("target", "storage_1")
         self.declare_parameter("execute", True)
         self.declare_parameter("service_name", "/curobo/plan_trajectory")
         self.declare_parameter(

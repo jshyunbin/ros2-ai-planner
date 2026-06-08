@@ -39,6 +39,7 @@ from team_8.pipeline_utils import as_bool as _as_bool
 from team_8.pipeline_utils import env_float as _env_float
 from team_8.pipeline_utils import make_xyz_cloud
 from team_8.place_pose_utils import (
+    get_home_joint_config,
     is_bookshelf_target,
     load_place_poses,
     resolve_target_pose,
@@ -422,21 +423,16 @@ def _poses_to_candidates(ros_poses) -> list[dict]:
 def route_place_or_home(curobo, place_poses, goal_name, joint_state, response):
     """Route a goal_name request to home (collision-aware) or place (off).
 
-    Resolves *goal_name* from *place_poses* and fills *response*. ``home`` uses
-    the collision-aware single-pose planner; any other key uses the collision-off
-    ``plan_place`` transit, populating insert/retract for bookshelf destinations.
+    Fills *response*. ``home`` is a fixed joint configuration reached by a
+    collision-aware c-space plan; any other key resolves to a pose and uses the
+    collision-off ``plan_place`` transit, populating insert/retract for bookshelf
+    destinations.
     """
-    try:
-        pose = resolve_target_pose(place_poses, goal_name)
-    except KeyError:
-        response.success = False
-        response.message = f'Unknown goal_name: {goal_name!r}'
-        return response
-
     curobo.update_joint_state(joint_state)
 
     if goal_name == 'home':
-        trajectory = curobo.plan_trajectory(pose, joint_state)
+        trajectory = curobo.plan_home_config(
+            get_home_joint_config(place_poses), joint_state)
         if trajectory is None or not trajectory.points:
             response.success = False
             response.message = 'CuRobo home planning failed.'
@@ -444,6 +440,13 @@ def route_place_or_home(curobo, place_poses, goal_name, joint_state, response):
         response.trajectory = trajectory
         response.success = True
         response.message = f'CuRobo home planned: {len(trajectory.points)} points.'
+        return response
+
+    try:
+        pose = resolve_target_pose(place_poses, goal_name)
+    except KeyError:
+        response.success = False
+        response.message = f'Unknown goal_name: {goal_name!r}'
         return response
 
     bookshelf = is_bookshelf_target(place_poses, goal_name)

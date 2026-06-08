@@ -911,7 +911,7 @@ def test_plan_pose_inbranch_fails_safely_when_ik_infeasible(monkeypatch):
 def _place_data():
     return {
         "transit_z": 0.80,
-        "home": {"xyz": [0.55, 0.07, 0.90], "quat_xyzw": [1.0, 0.0, 0.0, 0.0]},
+        "home_joint_config": [0.0, -2.2, 1.9, -1.383, -1.57, 0.0],
         "storage_1": {"xyz": [0.0, 0.55, 0.70], "quat_xyzw": [1.0, 0.0, 0.0, 0.0]},
         "bookshelf": {
             "pre_insert": {"xyz": [0.60, -0.30, 0.76],
@@ -921,16 +921,19 @@ def _place_data():
     }
 
 
-def test_route_home_uses_collision_aware_plan_trajectory():
+def test_route_home_uses_collision_aware_joint_config_plan():
     from riro_srvs.srv import PlanTrajectory
     from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
     from team_8.curobo_service import route_place_or_home
     curobo = MagicMock()
     traj = JointTrajectory(); traj.points = [JointTrajectoryPoint()]
-    curobo.plan_trajectory.return_value = traj
+    curobo.plan_home_config.return_value = traj
     resp = route_place_or_home(curobo, _place_data(), "home",
                                MagicMock(), PlanTrajectory.Response())
-    curobo.plan_trajectory.assert_called_once()
+    curobo.plan_home_config.assert_called_once()
+    # home plans to the fixed joint config, not an IK pose or a place transit.
+    assert curobo.plan_home_config.call_args.args[0] == [
+        0.0, -2.2, 1.9, -1.383, -1.57, 0.0]
     curobo.plan_place.assert_not_called()
     assert resp.success is True
     assert resp.trajectory is traj

@@ -19,9 +19,10 @@ except ImportError:  # pragma: no cover - import-only test fallback
 def load_place_poses(path: "str | PathLike") -> dict:
     """Parse place_poses.yml into a plain dict, validating its structure.
 
-    Data-driven: requires a numeric ``transit_z`` and a simple ``home`` target.
-    Every other top-level entry is validated as either a simple xyz/quat target
-    or a bookshelf-style entry (``pre_insert`` + numeric insert/retract depths).
+    Data-driven: requires a numeric ``transit_z`` and a ``home_joint_config``
+    (six joint angles; home is reached by a c-space plan, not an IK pose). Every
+    other top-level entry is validated as either a simple xyz/quat target or a
+    bookshelf-style entry (``pre_insert`` + numeric insert/retract depths).
     Raises ValueError on any malformed entry.
     """
     data = yaml.safe_load(Path(path).read_text())
@@ -32,10 +33,9 @@ def load_place_poses(path: "str | PathLike") -> dict:
     if "transit_floor_z" in data and not isinstance(
             data["transit_floor_z"], (int, float)):
         raise ValueError("place_poses: 'transit_floor_z' must be a number")
-    if "home" not in data:
-        raise ValueError("place_poses: missing 'home' target")
+    _validate_home_joint_config(data.get("home_joint_config"))
     # Optional scalar (non-pose) config keys skipped by the per-target validation.
-    scalar_keys = {"transit_z", "transit_floor_z"}
+    scalar_keys = {"transit_z", "transit_floor_z", "home_joint_config"}
     for name, entry in data.items():
         if name in scalar_keys:
             continue
@@ -58,6 +58,27 @@ def is_bookshelf_target(data, key) -> bool:
     """True when *key* resolves to a bookshelf-style entry (insert/retract)."""
     entry = data.get(key)
     return _looks_like_bookshelf(entry) and "insert_depth_m" in entry
+
+
+def _validate_home_joint_config(entry) -> None:
+    """Raise ValueError unless *entry* is a list of six numeric joint angles."""
+    if entry is None:
+        raise ValueError("place_poses: missing 'home_joint_config'")
+    if not (isinstance(entry, list) and len(entry) == 6):
+        raise ValueError(
+            "place_poses: 'home_joint_config' must be a 6-list of joint angles")
+    if not all(isinstance(v, (int, float)) for v in entry):
+        raise ValueError(
+            "place_poses: 'home_joint_config' values must all be numbers")
+
+
+def get_home_joint_config(data) -> list:
+    """Return the six home joint angles as a list of floats.
+
+    Order matches the cuRobo cspace joint_names
+    (pan, lift, elbow, wrist_1, wrist_2, wrist_3).
+    """
+    return [float(v) for v in data["home_joint_config"]]
 
 
 def _validate_xyzquat(entry, label) -> None:

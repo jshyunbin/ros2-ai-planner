@@ -26,8 +26,7 @@ except ImportError:
 DESTINATIONS = (
     "storage_1",
     "storage_2",
-    "bookshelf_floor1",
-    "bookshelf_floor2",
+    "bookshelf",
     "unspecified",
 )
 
@@ -148,8 +147,7 @@ Rules:
 5. Use only these destination values:
    - storage_1: left storage or left basket
    - storage_2: right storage or right basket
-   - bookshelf_floor1: first shelf, lower shelf, or unspecified shelf
-   - bookshelf_floor2: second shelf or upper shelf
+   - bookshelf: any shelf of the bookshelf (lower, upper, first, second, or unspecified shelf)
    - unspecified: no destination was stated
 6. Examples:
    - meat can -> meat_can

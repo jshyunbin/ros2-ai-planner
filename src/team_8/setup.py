@@ -31,6 +31,7 @@ setup(
             'curobo_service = team_8.curobo_service:main',
             'debug_viz = team_8.debug_viz:main',
             'graspgen_probe = team_8.graspgen_probe:main',
+            'home_config_tuner = team_8.home_config_tuner:main',
             'graspgen_service = team_8.graspgen_service:main',
             'graspgen_service_caller = team_8.graspgen_service_caller:main',
             'segmentation_service = team_8.segmentation_service:main',
