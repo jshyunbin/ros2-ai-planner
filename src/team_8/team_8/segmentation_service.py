@@ -21,8 +21,10 @@ from team_8.pipeline_utils import make_xyz_cloud
 from team_8.segmentation_utils import (
     build_overlay_image,
     compute_centroid,
+    compute_mask_centroid_pixel,
     compute_mask_roi,
     depth_to_masked_points,
+    detect_gripper_sphere,
     resize_for_api,
     stable_downsample,
 )
@@ -366,6 +368,72 @@ class SegmentationService(Node):
             assert roi is not None
             x_min, y_min, x_max, y_max = roi
 
+            # ── White-sphere visual centering correction ─────────────────────
+            # Detect the white sphere at the Robotiq 2F-85 gripper palm center.
+            # When the wrist camera points straight down (home/scan pose), the
+            # sphere appears near the image center and the object mask shows where
+            # the object is.  Back-projecting both to world frame gives the lateral
+            # offset by which every grasp candidate should be shifted so the
+            # gripper center lands on the object center.
+            grasp_xy_correction = None
+            sphere_pixel = detect_gripper_sphere(rgb_bgr)
+            mask_centroid_px = compute_mask_centroid_pixel(mask)
+            if sphere_pixel is not None and mask_centroid_px is not None:
+                try:
+                    u_s, v_s = sphere_pixel
+                    u_o, v_o = mask_centroid_px
+                    depth_scale = float(self.get_parameter("depth_unit_scale").value)
+                    # Clamp indices to image bounds
+                    h_img, w_img = depth_image.shape[:2]
+                    u_s_i = int(np.clip(u_s, 0, w_img - 1))
+                    v_s_i = int(np.clip(v_s, 0, h_img - 1))
+                    u_o_i = int(np.clip(u_o, 0, w_img - 1))
+                    v_o_i = int(np.clip(v_o, 0, h_img - 1))
+                    d_s = float(depth_image[v_s_i, u_s_i]) * depth_scale
+                    d_o = float(depth_image[v_o_i, u_o_i]) * depth_scale
+                    min_d = float(self.get_parameter("min_depth_m").value)
+                    if d_s > min_d and d_o > min_d:
+                        # Back-project both to camera frame (metric)
+                        sphere_cam = np.array([
+                            (u_s - cx) * d_s / fx,
+                            (v_s - cy) * d_s / fy,
+                            d_s,
+                        ], dtype=np.float32)
+                        obj_cam = np.array([
+                            (u_o - cx) * d_o / fx,
+                            (v_o - cy) * d_o / fy,
+                            d_o,
+                        ], dtype=np.float32)
+                        # Transform to output (world) frame using existing helper
+                        sphere_world = self._transform_points_to_output_frame(
+                            sphere_cam.reshape(1, 3),
+                            source_frame=source_frame,
+                            target_frame=output_frame,
+                            stamp=snap_stamp,
+                        )[0]
+                        # centroid is already in world frame; correction = Δxy
+                        dx = float(centroid[0] - sphere_world[0])
+                        dy = float(centroid[1] - sphere_world[1])
+                        # Ignore sub-mm corrections and guard against runaway values
+                        if abs(dx) > 0.002 and abs(dx) < 0.15 \
+                                and abs(dy) > 0.002 and abs(dy) < 0.15:
+                            grasp_xy_correction = [round(dx, 5), round(dy, 5)]
+                            self.get_logger().info(
+                                f'Gripper-sphere centering: '
+                                f'sphere_px=({u_s:.0f},{v_s:.0f}) '
+                                f'obj_px=({u_o:.0f},{v_o:.0f}) '
+                                f'correction=[{dx:.4f}, {dy:.4f}]m')
+                        else:
+                            self.get_logger().info(
+                                f'Gripper-sphere centering: correction too small/large '
+                                f'[{dx:.4f}, {dy:.4f}]m — skipped.')
+                except Exception as _sphere_exc:
+                    self.get_logger().warn(
+                        f'Gripper-sphere centering failed (non-fatal): {_sphere_exc}')
+            elif sphere_pixel is None:
+                self.get_logger().info(
+                    'Gripper-sphere centering: white sphere not detected in image.')
+
             cloud_stamp = snap_stamp
             self._segmented_pub.publish(
                 make_xyz_cloud(object_points, output_frame, stamp=cloud_stamp))
@@ -408,6 +476,10 @@ class SegmentationService(Node):
                 "gemini_bbox_xyxy": list(prompt_bbox),
                 "sam2_model": self._sam2_model_name,
                 "debug_dir": str(debug_path),
+                # White-sphere gripper centering (None if sphere not detected)
+                "grasp_xy_correction": grasp_xy_correction,
+                "gripper_sphere_pixel": [round(sphere_pixel[0], 1), round(sphere_pixel[1], 1)]
+                    if sphere_pixel is not None else None,
             }
             response.data = json.dumps(response_payload)
             self._save_debug_artifacts(

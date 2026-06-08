@@ -9,6 +9,7 @@ All execution calls are blocking (_send_and_wait); the node is spun with
 MultiThreadedExecutor so spin_until_future_complete works inside callbacks.
 """
 
+import copy
 import json
 import os
 import threading
@@ -439,6 +440,25 @@ class PipelineOrchestrator(Node):
                 'skipping motion execution.')
             self._reset_pipeline_state()
             return
+
+        # ── White-sphere gripper centering correction ────────────────────────
+        # segmentation_service detects the gripper's white sphere and the object
+        # centroid in the wrist camera image, back-projects both to world frame,
+        # and returns the lateral offset needed to align the gripper center with
+        # the object center.  Apply it to all grasp candidates before planning.
+        xy_corr = self._latest_segmentation.get('grasp_xy_correction')
+        if xy_corr and len(xy_corr) == 2:
+            dx, dy = float(xy_corr[0]), float(xy_corr[1])
+            self.get_logger().info(
+                f'Applying gripper-sphere centering: dx={dx:+.4f}m dy={dy:+.4f}m '
+                f'to {len(grasp_poses)} candidates.')
+            corrected = []
+            for p in grasp_poses:
+                pc = copy.deepcopy(p)
+                pc.position.x += dx
+                pc.position.y += dy
+                corrected.append(pc)
+            grasp_poses = corrected
 
         self._plan_and_execute_pick(grasp_poses)
 

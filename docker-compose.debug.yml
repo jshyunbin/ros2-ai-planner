@@ -75,20 +75,18 @@ services:
 
       # ── Approach corridor carving (noise above object) ───────────────────
       # Cylindrical corridor directly above object centroid.
-      # Narrower than bbox+pad so nearby objects (cola can etc.) stay visible.
-      - PIPELINE_CUROBO_CORRIDOR_RADIUS=0.06
+      # 0.03 m (was 0.06 m): tighter so nearby objects remain in collision world.
+      - PIPELINE_CUROBO_CORRIDOR_RADIUS=0.03
       - PIPELINE_CUROBO_CORRIDOR_Z_ABOVE=0.35
 
       # ── Direct-to-grasp sphere carving ───────────────────────────────────
       # Radius (metres) of the sphere carved around each grasp tool0 position
       # in the TSDF.  Removes local TSDF noise right at the grasp site so that
       # cuRobo's end-state collision check does not reject valid grasp poses.
-      # 0.15 m covers the full fingertip extent (0.145 m) plus a 5 mm margin.
-      - PIPELINE_CUROBO_GRASP_SPHERE_CARVE_RADIUS=0.15
+      # 0.08 m (was 0.15 m): covers fingertip zone without removing neighbour voxels.
+      - PIPELINE_CUROBO_GRASP_SPHERE_CARVE_RADIUS=0.08
       # Max number of grasp positions to carve spheres around (top-K only).
-      # Limits memory usage of vectorized carving: N_voxels × K × 3 × 4 bytes.
-      # Top 10 covers the most likely candidates; raising to 30 gives full coverage.
-      - PIPELINE_CUROBO_GRASP_SPHERE_MAX_POSES=10
+      - PIPELINE_CUROBO_GRASP_SPHERE_MAX_POSES=5
 
       # ── Grasp verticality preference ─────────────────────────────────────────
       # Hard filter: reject grasps whose approach direction deviates more than

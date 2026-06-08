@@ -539,11 +539,13 @@ class CuRobo:
                     f'CuRobo.plan_pick: {tier_label} failed, trying next tier.')
 
             if not _result_success(grasp_result):
-                # Final fallback: wipe TSDF world entirely, try all candidates.
+                # Final fallback: clear only the object region (keep neighbour
+                # objects in the collision world so the arm doesn't sweep through
+                # them).  Full world clear is used only when object_cloud is None.
                 self._logger.warn(
                     'CuRobo.plan_pick: all TSDF tiers failed; '
-                    'retrying with cleared world.')
-                self._clear_collision_world()
+                    'retrying with object-region clear (neighbours preserved).')
+                self._clear_object_region(object_cloud)
                 _reset_planner_seed(self._planner)
                 self._planner.disable_link_collision(collision_links)
                 try:
@@ -571,15 +573,25 @@ class CuRobo:
                 last_tstep=getattr(grasp_result, 'interpolated_last_tstep', None),
             )
 
-            # ── Lift: clear world then plan straight up ──────────────────────────
+            # ── Lift: clear object region, then plan straight up ─────────────────
+            # Use object-region clear so neighbouring objects stay in the world.
+            # If that fails (rare: arm is squeezed between objects), fall back to
+            # full clear which guarantees a straight-up path.
             lift_offset = _pick_lift_offset()
             chosen_mat = winning_mats[idx]  # pose from the tier that succeeded
             lift_tool = chosen_mat.copy()
             lift_tool[:3, 3] += np.array([0.0, 0.0, lift_offset], dtype=np.float32)
 
-            self._clear_collision_world()
+            self._clear_object_region(object_cloud)
             lift_jt = self._plan_pose_segment(
                 lift_tool, self._final_joint_state(grasp_jt), 'lift')
+            if lift_jt is None:
+                self._logger.warn(
+                    'CuRobo.plan_pick: lift with object-region clear failed; '
+                    'retrying with full world clear.')
+                self._clear_collision_world()
+                lift_jt = self._plan_pose_segment(
+                    lift_tool, self._final_joint_state(grasp_jt), 'lift')
             if lift_jt is None:
                 return None
             t_lift = time.perf_counter()
@@ -813,9 +825,11 @@ class CuRobo:
                     obj_max = obj_np.max(axis=0) + 0.02
                     in_obj = np.all((xyz >= obj_min) & (xyz <= obj_max), axis=1)
 
-                    # Carve cylindrical corridor above object centroid
+                    # Carve cylindrical corridor above object centroid.
+                    # 0.03 m (was 0.06 m): tighter corridor prevents removing
+                    # voxels of neighbouring objects that are close by.
                     corridor_radius = _env_float(
-                        'PIPELINE_CUROBO_CORRIDOR_RADIUS', 0.06)
+                        'PIPELINE_CUROBO_CORRIDOR_RADIUS', 0.03)
                     corridor_z_above = _env_float(
                         'PIPELINE_CUROBO_CORRIDOR_Z_ABOVE', 0.35)
                     cx = float(obj_np[:, 0].mean())
@@ -836,11 +850,13 @@ class CuRobo:
             # local TSDF noise that would block a direct-to-grasp plan.
             # Use vectorized distance computation (one broadcast op, not a loop)
             # to avoid O(N_voxels × N_candidates) Python overhead.
+            # 0.08 m covers the fingertip contact zone without removing
+            # neighbouring objects (previous default 0.15 m was too aggressive).
             sphere_radius = _env_float(
-                'PIPELINE_CUROBO_GRASP_SPHERE_CARVE_RADIUS', 0.15)
+                'PIPELINE_CUROBO_GRASP_SPHERE_CARVE_RADIUS', 0.08)
             # Limit to top-K to keep memory bounded: (N_voxels × K × 3 × 4 bytes)
             max_sphere_poses = int(os.environ.get(
-                'PIPELINE_CUROBO_GRASP_SPHERE_MAX_POSES', '10'))
+                'PIPELINE_CUROBO_GRASP_SPHERE_MAX_POSES', '5'))
             if grasp_positions is not None and sphere_radius > 0:
                 positions_arr = np.stack(
                     [np.asarray(p, dtype=np.float32).reshape(3)
@@ -888,6 +904,54 @@ class CuRobo:
         torch.cuda.synchronize()
         with self._lock:
             self._last_world_update_frame = -1
+
+    def _clear_object_region(self, object_cloud) -> None:
+        """Clear only the target object's region from the TSDF collision world.
+
+        Unlike _clear_collision_world(), this preserves voxels for neighbouring
+        objects so cuRobo still routes around them.  The object region is defined
+        as its bounding box plus a 0.10 m margin in all directions.
+
+        Falls back to a full clear if object_cloud is None or ESDF recomputation
+        fails.
+        """
+        if object_cloud is None:
+            self._clear_collision_world()
+            return
+        try:
+            obj_np = np.asarray(object_cloud, dtype=np.float32)
+            if obj_np.ndim != 2 or obj_np.shape[1] != 3 or obj_np.shape[0] == 0:
+                self._clear_collision_world()
+                return
+            vg = self._mapper.compute_esdf()
+            if vg is None or vg.xyzr_tensor is None:
+                self._clear_collision_world()
+                return
+            centers = vg.xyzr_tensor.cpu().numpy()   # (N,4)
+            xyz = centers[:, :3]
+            margin = 0.10
+            obj_min = obj_np.min(axis=0) - margin
+            obj_max = obj_np.max(axis=0) + margin
+            in_region = np.all((xyz >= obj_min) & (xyz <= obj_max), axis=1)
+            keep = ~in_region
+            new_xyzr = torch.tensor(centers[keep], dtype=torch.float32, device='cuda')
+            vg.xyzr_tensor = new_xyzr
+            try:
+                self._planner.clear_scene_cache()
+            except Exception:
+                pass
+            self._planner.update_world(SceneCfg(voxel=[vg], cuboid=[_floor_cuboid()]))
+            torch.cuda.synchronize()
+            with self._lock:
+                self._last_world_update_frame = -1
+            self._logger.info(
+                f'CuRobo: object-region clear: removed {int(in_region.sum())} voxels, '
+                f'kept {int(keep.sum())} (neighbours preserved).')
+        except Exception as exc:
+            self._logger.warning(
+                f'CuRobo: object-region clear failed ({exc}); '
+                'falling back to full world clear.')
+            self._clear_collision_world()
 
     def _pick_world_modes(self) -> tuple:
         if _env_bool('PIPELINE_CUROBO_PICK_RELAXED_RETRY', True):

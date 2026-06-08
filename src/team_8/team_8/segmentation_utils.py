@@ -96,6 +96,73 @@ def compute_centroid(points: np.ndarray, surface_band_m: float) -> np.ndarray | 
     return surface_points.mean(axis=0).astype(np.float32)
 
 
+def compute_mask_centroid_pixel(mask: np.ndarray) -> tuple[float, float] | None:
+    """Return (u, v) pixel centroid of a binary mask.
+
+    Returns None if the mask is empty.
+    """
+    ys, xs = np.where(mask)
+    if len(xs) == 0:
+        return None
+    return (float(xs.mean()), float(ys.mean()))
+
+
+def detect_gripper_sphere(rgb_bgr: np.ndarray) -> tuple[float, float] | None:
+    """Detect the white sphere at the Robotiq 2F-85 gripper palm center.
+
+    The sphere is used as a visual reference to measure the lateral offset
+    between the gripper center and the object centroid in the wrist camera
+    image, enabling correction of systematic grasp misalignment.
+
+    Detection strategy:
+      - HSV threshold for white (very low saturation, high value)
+      - Morphological opening to remove noise
+      - Circularity + proximity-to-center scoring to pick the sphere blob
+        (gripper center ≈ image center when arm points straight down)
+
+    Returns (u, v) pixel coords of the sphere center, or None if not found.
+    """
+    hsv = cv2.cvtColor(rgb_bgr, cv2.COLOR_BGR2HSV)
+    # White: saturation < 35, value > 190
+    white_mask = cv2.inRange(hsv, (0, 0, 190), (180, 35, 255))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN, kernel)
+
+    contours, _ = cv2.findContours(
+        white_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    h, w = rgb_bgr.shape[:2]
+    img_cx, img_cy = w / 2.0, h / 2.0
+
+    best: tuple[float, float] | None = None
+    best_score = -1.0
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < 80:  # sub-pixel noise
+            continue
+        perimeter = cv2.arcLength(cnt, True)
+        if perimeter < 1e-6:
+            continue
+        circularity = 4.0 * np.pi * area / (perimeter ** 2)
+        if circularity < 0.45:  # reject clearly non-circular blobs
+            continue
+        M = cv2.moments(cnt)
+        if M['m00'] == 0:
+            continue
+        cx_cnt = M['m10'] / M['m00']
+        cy_cnt = M['m01'] / M['m00']
+        dist = float(np.sqrt((cx_cnt - img_cx) ** 2 + (cy_cnt - img_cy) ** 2))
+        # Prefer circular blobs near image center — gripper center ≈ image center
+        # when the wrist camera points straight down.
+        score = circularity - 0.002 * dist
+        if score > best_score:
+            best_score = score
+            best = (cx_cnt, cy_cnt)
+    return best
+
+
 def build_overlay_image(
     image_bgr: np.ndarray,
     mask: np.ndarray,
