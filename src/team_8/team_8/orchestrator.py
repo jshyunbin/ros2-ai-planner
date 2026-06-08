@@ -67,6 +67,7 @@ except ImportError:  # pragma: no cover - runtime dependency
 from team_8.pipeline_utils import as_bool as _as_bool
 from team_8.pipeline_utils import env_float as _env_float
 from team_8.pipeline_utils import pose_from_grasp_row as _pose_from_grasp_row_util
+from team_8.pipeline_utils import TimedLoggerMixin
 
 try:
     from team_8.gemini_api import (
@@ -106,7 +107,7 @@ _DESTINATION_TO_GOAL: dict[str, str] = {
 }
 
 
-class PipelineOrchestrator(Node):
+class PipelineOrchestrator(TimedLoggerMixin, Node):
     """ROS2 orchestrator for segmentation, GraspGen, and motion execution."""
 
     TASK_COMMANDS_TOPIC = '/task_commands'

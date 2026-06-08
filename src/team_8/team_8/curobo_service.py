@@ -46,6 +46,7 @@ from team_8.pipeline_utils import cloud_to_xyz
 from team_8.pipeline_utils import env_float as _env_float
 from team_8.pipeline_utils import env_int as _env_int
 from team_8.pipeline_utils import make_xyz_cloud
+from team_8.pipeline_utils import TimedLoggerMixin
 from team_8.place_pose_utils import (
     build_transit_waypoints,
     get_home_joint_config,
@@ -64,7 +65,7 @@ from riro_srvs.srv import PlanTrajectory
 _VIZ_PUBLISH_HZ = 5.0
 
 
-class CuRoboService(Node):
+class CuRoboService(TimedLoggerMixin, Node):
     """ROS2 service wrapper around the long-lived CuRobo planner instance."""
 
     JOINT_STATES_TOPIC = '/joint_states'

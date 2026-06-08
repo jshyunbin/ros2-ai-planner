@@ -3,6 +3,23 @@
 Kept dependency-light so it can be imported by every node (env parsing, bool
 coercion, the XYZ PointCloud2 builder, and the grasp-row pose /
 rotation-to-quaternion helpers).
+
+Timing utilities
+----------------
+``TimingLogger``    — wraps a rclpy logger, prepending ``[+Δt | total]`` to
+                      every message so bottlenecks are visible in docker logs.
+``TimedLoggerMixin``— mixin for rclpy Node subclasses; overrides
+                      ``get_logger()`` to return a ``TimingLogger`` without
+                      touching any existing log call-sites.
+
+Usage::
+
+    from team_8.pipeline_utils import TimedLoggerMixin
+
+    class MyNode(TimedLoggerMixin, Node):
+        ...
+
+    # All existing self.get_logger().info(...) calls now emit timing info.
 """
 
 # graspgenX outputs the tool0 frame directly (translation = where tool0 should go).
@@ -140,3 +157,85 @@ def pose_from_grasp_row(row: dict):
     pose.orientation.y = y
     pose.orientation.z = z
     return pose
+
+
+# ── Timing logger ─────────────────────────────────────────────────────────────
+
+import threading as _threading
+import time as _time
+
+
+class TimingLogger:
+    """Thin wrapper around a rclpy logger that prepends elapsed-time tags.
+
+    Every log line becomes::
+
+        [+  0.123s |   4.567s] original message
+         ^^^^^^^^^   ^^^^^^^^
+         delta from  total from
+         last call   node start
+
+    The delta quickly shows which step is slow; the total gives an absolute
+    timeline for cross-node comparison.
+
+    Thread-safe: a single lock serialises ``_last_t`` updates so concurrent
+    callbacks don't produce garbled timestamps.
+    """
+
+    def __init__(self, ros_logger):
+        self._log = ros_logger
+        self._t0 = _time.monotonic()
+        self._last_t = self._t0
+        self._lock = _threading.Lock()
+
+    def _tag(self) -> str:
+        now = _time.monotonic()
+        with self._lock:
+            delta = now - self._last_t
+            total = now - self._t0
+            self._last_t = now
+        return f'[+{delta:6.3f}s |{total:7.3f}s] '
+
+    def debug(self, msg, *args, **kwargs):
+        self._log.debug(self._tag() + str(msg), *args, **kwargs)
+
+    def info(self, msg, *args, **kwargs):
+        self._log.info(self._tag() + str(msg), *args, **kwargs)
+
+    def warning(self, msg, *args, **kwargs):
+        self._log.warning(self._tag() + str(msg), *args, **kwargs)
+
+    # rclpy exposes both .warn() and .warning() — support both
+    def warn(self, msg, *args, **kwargs):
+        self._log.warning(self._tag() + str(msg), *args, **kwargs)
+
+    def error(self, msg, *args, **kwargs):
+        self._log.error(self._tag() + str(msg), *args, **kwargs)
+
+    def fatal(self, msg, *args, **kwargs):
+        self._log.fatal(self._tag() + str(msg), *args, **kwargs)
+
+    # Pass through any attribute access not defined here (e.g. set_level)
+    def __getattr__(self, name):
+        return getattr(self._log, name)
+
+
+class TimedLoggerMixin:
+    """Mixin for rclpy Node subclasses that makes get_logger() return a
+    ``TimingLogger`` without requiring any changes to existing log call-sites.
+
+    Usage::
+
+        class MyNode(TimedLoggerMixin, Node):
+            ...
+
+    MRO note: ``TimedLoggerMixin`` must appear *before* ``Node`` in the base
+    list so that its ``get_logger()`` shadows ``Node.get_logger()``.
+    """
+
+    def get_logger(self):  # type: ignore[override]
+        if not hasattr(self, '_timed_logger'):
+            # super().get_logger() resolves to Node.get_logger()
+            object.__setattr__(
+                self, '_timed_logger', TimingLogger(super().get_logger()))
+        return self._timed_logger  # type: ignore[attr-defined]

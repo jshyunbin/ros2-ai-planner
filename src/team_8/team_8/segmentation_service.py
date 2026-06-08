@@ -18,6 +18,7 @@ from sensor_msgs.msg import CameraInfo, Image, PointCloud2
 from tf2_ros import Buffer, TransformException, TransformListener
 
 from team_8.pipeline_utils import make_xyz_cloud
+from team_8.pipeline_utils import TimedLoggerMixin
 from team_8.segmentation_utils import (
     build_overlay_image,
     compute_centroid,
@@ -85,7 +86,7 @@ def transform_to_matrix(msg) -> np.ndarray:
     return out
 
 
-class SegmentationService(Node):
+class SegmentationService(TimedLoggerMixin, Node):
     """Prompted 2D segmentation service that publishes masked point clouds for GraspGen."""
 
     def __init__(self) -> None:

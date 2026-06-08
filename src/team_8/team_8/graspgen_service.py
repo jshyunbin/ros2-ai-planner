@@ -16,6 +16,7 @@ from sensor_msgs_py import point_cloud2
 
 from team_8.graspgen_client import GraspGenClient
 from team_8.pipeline_utils import pose_from_grasp_row
+from team_8.pipeline_utils import TimedLoggerMixin
 
 try:  # pragma: no cover - runtime dependency
     from riro_srvs.srv import StringString
@@ -39,7 +40,7 @@ _MAX_REACH = 0.82                 # m — UR5 kinematic reach limit
 _MIN_TOOL_Z = 0.01                # m — near-floor grasps allowed; cuRobo clamps descent
 
 
-class GraspGenService(Node):
+class GraspGenService(TimedLoggerMixin, Node):
     """Serve filtered GraspGen results for the latest segmented point cloud."""
 
     def __init__(self):
