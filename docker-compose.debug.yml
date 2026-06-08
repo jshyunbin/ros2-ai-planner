@@ -32,8 +32,10 @@ services:
       - PIPELINE_CUROBO_COLLISION_ACTIVATION_DIST=0.05
 
       # Approach offsets to try per candidate (tool-z, negative = above grasp).
-      # Start from 15 cm above for safer descent; fall back to 20 cm if needed.
-      - PIPELINE_CUROBO_GRASP_APPROACH_OFFSETS=-0.15,-0.20,-0.25
+      # 1 offset only: each failed candidate costs 1 cuRobo call instead of 3.
+      # With 3 offsets & chosen_idx=4, we paid 13 attempts x ~10s = 138s.
+      # With 1 offset, same scenario = 5 attempts x ~10s = ~50s.
+      - PIPELINE_CUROBO_GRASP_APPROACH_OFFSETS=-0.15
 
       # Height to lift above grasp pose after closing gripper (world-z).
       - PIPELINE_CUROBO_PICK_LIFT_OFFSET=0.15
@@ -105,6 +107,14 @@ services:
       # value are tried first.  0.85 ≈ grasps within 32° of straight-down.
       # If tier-0 produces no plan, cuRobo falls back to all candidates.
       - PIPELINE_CUROBO_TIER0_MIN_APPROACH_Z=0.85
+      # Hard cap on tier-0 batch size sent to plan_pose.
+      # plan_pose optimises all goals simultaneously; each extra goal adds GPU
+      # memory pressure and extends planning time. 8 goals with 1 offset:
+      # banana run had 12 goals → 138s; 8 goals → expected ~90s.
+      - PIPELINE_CUROBO_TIER0_MAX_CANDIDATES=8
+      # Total candidates forwarded from GraspGen to pick planner (goalset limit).
+      # Was hardcoded 30; 10 is enough since tier0 filter further reduces this.
+      - PIPELINE_CUROBO_TOPK_GRASPS=10
 
       # ── cuRobo GPU / CUDA graph ───────────────────────────────────────────────
       # CUDA graphs require a static collision world. This cuRobo version does

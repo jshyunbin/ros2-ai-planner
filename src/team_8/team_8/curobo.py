@@ -59,7 +59,11 @@ JOINT_NAMES = (
     'wrist_3_joint',
 )
 
-TOPK_GRASPS = 30
+# Maximum number of grasp candidates forwarded from GraspGen to the cuRobo
+# pick planner.  Larger values increase the chance of finding a valid grasp but
+# also increase GPU memory pressure in plan_pose's batched optimisation.
+# Override with PIPELINE_CUROBO_TOPK_GRASPS (default 10).
+TOPK_GRASPS = int(os.environ.get('PIPELINE_CUROBO_TOPK_GRASPS', '10'))
 INTERP_DT = 0.02
 GRIPPER_TCP_Z_OFFSET = 0.1034
 
@@ -525,6 +529,13 @@ class CuRobo:
             tier0_min_az = _env_float('PIPELINE_CUROBO_TIER0_MIN_APPROACH_Z', 0.85)
             tier0_mats = [m for m in grasp_tool_mats
                           if abs(float(m[2, 2])) >= tier0_min_az]
+            # Cap tier0 to a maximum batch size.  plan_pose optimises all goals
+            # simultaneously on GPU; a large batch increases memory pressure and
+            # planning time roughly linearly.  Take the most-vertical ones first
+            # (already sorted by approach_z descending from GraspGen ranking).
+            tier0_max = _env_int('PIPELINE_CUROBO_TIER0_MAX_CANDIDATES', 8)
+            if len(tier0_mats) > tier0_max:
+                tier0_mats = tier0_mats[:tier0_max]
 
             # Build (mat_list, label) pairs in priority order.
             plan_tiers: list[tuple[list, str]] = []

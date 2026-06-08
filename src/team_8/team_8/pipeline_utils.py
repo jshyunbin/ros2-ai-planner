@@ -234,8 +234,10 @@ class TimedLoggerMixin:
     """
 
     def get_logger(self):  # type: ignore[override]
-        if not hasattr(self, '_timed_logger'):
-            # super().get_logger() resolves to Node.get_logger()
-            object.__setattr__(
-                self, '_timed_logger', TimingLogger(super().get_logger()))
-        return self._timed_logger  # type: ignore[attr-defined]
+        # Use __dict__ directly to bypass any __setattr__ override in rclpy Node
+        # and avoid AttributeError from __slots__-based implementations.
+        tl = self.__dict__.get('_timed_logger')
+        if tl is None:
+            tl = TimingLogger(super().get_logger())
+            self.__dict__['_timed_logger'] = tl
+        return tl
