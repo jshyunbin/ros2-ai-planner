@@ -1277,10 +1277,13 @@ class CuRobo:
             # Default is 2 which is too small; 'primitive' is the cuRobo key for cuboids.
             'primitive': 10,
         }
-        # CUDA graph: pre-compiles GPU kernels → ~2-3× faster planning per call
-        # after warmup.  Enabled by default; disable if cuRobo aborts with CUDA
-        # graph capture errors (set PIPELINE_CUROBO_USE_CUDA_GRAPH=false).
-        use_graph = _env_bool('PIPELINE_CUROBO_USE_CUDA_GRAPH', True)
+        # CUDA graph pre-compiles GPU kernels but requires a static collision
+        # world — cuRobo must reset the graph every time the TSDF updates, and
+        # this version does NOT support graph reset.  Enabling it causes
+        # "CUDA graph reset is not available" → illegal memory access → crash.
+        # Keep False (the cuRobo default) until a version that supports dynamic
+        # graph reset is available.
+        use_graph = _env_bool('PIPELINE_CUROBO_USE_CUDA_GRAPH', False)
         config = MotionPlannerCfg.create(
             robot=UR5_CONFIG,
             scene_model='collision_test.yml',

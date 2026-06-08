@@ -107,9 +107,9 @@ services:
       - PIPELINE_CUROBO_TIER0_MIN_APPROACH_Z=0.85
 
       # ── cuRobo GPU / CUDA graph ───────────────────────────────────────────────
-      # CUDA graphs pre-compile GPU kernels → ~2-3× faster planning per call.
-      # Default true.  Set false only if cuRobo aborts with graph capture errors.
-      - PIPELINE_CUROBO_USE_CUDA_GRAPH=true
+      # CUDA graphs require a static collision world. This cuRobo version does
+      # NOT support graph reset when the TSDF updates → crash. Keep false.
+      - PIPELINE_CUROBO_USE_CUDA_GRAPH=false
       # Warmup iterations at startup: more = more kernel paths pre-compiled.
       - PIPELINE_CUROBO_WARMUP_ITERS=5
       # Home joint config for "already at home?" check in orchestrator.
