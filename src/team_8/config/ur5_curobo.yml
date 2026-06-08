@@ -69,14 +69,20 @@ robot_cfg:
           radius: 0.05
         - center: [0, 0, 0.10]
           radius: 0.05
+    # A small per-link margin grows each collision sphere when checking the arm
+    # against itself, so a contorted / near-self-touching IK branch is rejected
+    # (IK feasibility + trajopt) instead of executed. 0.0 only rejected actual
+    # sphere overlap, letting "links almost touching" flipped configs through on
+    # the collision-off place transit. Keep modest so it doesn't reject the
+    # legitimate folded pick poses.
     self_collision_buffer:
       shoulder_link: 0.05
-      upper_arm_link: 0.0
-      forearm_link: 0.0
-      wrist_1_link: 0.0
-      wrist_2_link: 0.0
-      wrist_3_link: 0.0
-      tool0: 0.0
+      upper_arm_link: 0.02
+      forearm_link: 0.02
+      wrist_1_link: 0.02
+      wrist_2_link: 0.02
+      wrist_3_link: 0.02
+      tool0: 0.02
     self_collision_ignore:
       upper_arm_link:
         - shoulder_link

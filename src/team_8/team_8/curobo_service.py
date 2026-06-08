@@ -23,11 +23,14 @@ import traceback
 import numpy as np
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSDurabilityPolicy, QoSProfile
 from scipy.spatial.transform import Rotation as R
 from sensor_msgs.msg import JointState
+from std_msgs.msg import Bool
 
 from team_8.curobo import (
     BASE_FRAME,
+    MIN_FRAMES,
     CuRobo,
     concat_trajectories,
 )
@@ -35,6 +38,11 @@ from sensor_msgs.msg import PointCloud2
 from team_8.pipeline_utils import as_bool as _as_bool
 from team_8.pipeline_utils import env_float as _env_float
 from team_8.pipeline_utils import make_xyz_cloud
+from team_8.place_pose_utils import (
+    is_bookshelf_target,
+    load_place_poses,
+    resolve_target_pose,
+)
 from riro_srvs.srv import PlanTrajectory
 
 
@@ -42,6 +50,9 @@ from riro_srvs.srv import PlanTrajectory
 # rather than ROS timers, so a long blocking plan_trajectory call on the
 # single-threaded executor can't starve them. Republishing cached numpy is cheap.
 _VIZ_PUBLISH_HZ = 5.0
+
+# Latched topic the orchestrator waits on before issuing the first plan.
+READY_TOPIC = '/curobo/ready'
 
 
 class CuRoboService(Node):
@@ -57,6 +68,19 @@ class CuRoboService(Node):
         self.declare_parameter('tsdf_voxels_topic', '/curobo/tsdf_voxels')
         self.declare_parameter('overhead_cloud_topic', '/curobo/overhead_cloud')
         self.declare_parameter('init_wait_sec', 120.0)
+        self.declare_parameter(
+            'place_poses_path', '/ros2_ws/src/team_8/config/place_poses.yml')
+        self._place_poses = None
+        place_poses_path = str(self.get_parameter('place_poses_path').value)
+        try:
+            self._place_poses = load_place_poses(place_poses_path)
+            self.get_logger().info(
+                f'Loaded place poses from {place_poses_path}: '
+                f'{sorted(self._place_poses)}')
+        except Exception as exc:
+            self.get_logger().error(
+                f'Failed to load place poses from {place_poses_path}: '
+                f'{type(exc).__name__}: {exc}')
 
         self._latest_joints = None
         # Set while a plan is in flight so the debug viz thread pauses its
@@ -86,6 +110,17 @@ class CuRoboService(Node):
             f'curobo_service advertised {service_name}; '
             'initialising CuRobo in background.'
         )
+
+        # Latched readiness signal: published once, when init has finished AND
+        # the TSDF has at least MIN_FRAMES. Clients (the orchestrator) wait for
+        # this before issuing the first plan, so they don't park the single
+        # executor thread before the depth callbacks have built the map. The
+        # condition is monotonic, so this is a one-shot at startup.
+        self._ready_published = False
+        ready_qos = QoSProfile(
+            depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+        self._ready_pub = self.create_publisher(Bool, READY_TOPIC, ready_qos)
+        self._ready_timer = self.create_timer(0.5, self._check_ready)
 
         self._tsdf_pub = None
         self._overhead_pub = None
@@ -219,6 +254,29 @@ class CuRoboService(Node):
         )
         self._overhead_pub.publish(cloud)
 
+    # ── readiness signal ──────────────────────────────────────────────────────
+
+    def _check_ready(self) -> None:
+        """Publish the latched /curobo/ready=true once init is done AND the TSDF
+        has >= MIN_FRAMES. One-shot: the condition only ever becomes true.
+
+        Uses the base MIN_FRAMES (not PIPELINE_CUROBO_MIN_PLANNING_FRAMES, which
+        can be raised arbitrarily to force free-collision planning): we only need
+        the map to be non-empty so the first home plan isn't planned cold.
+        """
+        if self._ready_published:
+            return
+        with self._init_cv:
+            curobo = self._curobo
+            done = self._init_done
+        if not done or curobo is None or curobo.frame_count < MIN_FRAMES:
+            return
+        self._ready_pub.publish(Bool(data=True))
+        self._ready_published = True
+        self._ready_timer.cancel()
+        self.get_logger().info(
+            f'{READY_TOPIC} published (init done, {curobo.frame_count} TSDF frames).')
+
     # ── init gating ───────────────────────────────────────────────────────────
 
     def _wait_for_init(self, timeout_sec: float):
@@ -270,6 +328,14 @@ class CuRoboService(Node):
 
         self._planning.set()
         try:
+            goal_name = (request.goal_name or '').strip()
+            if goal_name:
+                if self._place_poses is None:
+                    response.success = False
+                    response.message = 'place_poses.yml not loaded; cannot place.'
+                    return response
+                return route_place_or_home(
+                    curobo, self._place_poses, goal_name, joint_state, response)
             if request.grasp_poses:
                 return self._handle_pick(curobo, request, joint_state, response)
             return self._handle_single_pose(curobo, request, joint_state, response)
@@ -351,6 +417,77 @@ def _poses_to_candidates(ros_poses) -> list[dict]:
         ]
         candidates.append({'pose_4x4': mat})
     return candidates
+
+
+def route_place_or_home(curobo, place_poses, goal_name, joint_state, response):
+    """Route a goal_name request to home (collision-aware) or place (off).
+
+    Resolves *goal_name* from *place_poses* and fills *response*. ``home`` uses
+    the collision-aware single-pose planner; any other key uses the collision-off
+    ``plan_place`` transit, populating insert/retract for bookshelf destinations.
+    """
+    try:
+        pose = resolve_target_pose(place_poses, goal_name)
+    except KeyError:
+        response.success = False
+        response.message = f'Unknown goal_name: {goal_name!r}'
+        return response
+
+    curobo.update_joint_state(joint_state)
+
+    if goal_name == 'home':
+        trajectory = curobo.plan_trajectory(pose, joint_state)
+        if trajectory is None or not trajectory.points:
+            response.success = False
+            response.message = 'CuRobo home planning failed.'
+            return response
+        response.trajectory = trajectory
+        response.success = True
+        response.message = f'CuRobo home planned: {len(trajectory.points)} points.'
+        return response
+
+    bookshelf = is_bookshelf_target(place_poses, goal_name)
+    insert_depth = retract_depth = 0.0
+    if bookshelf:
+        entry = place_poses[goal_name]
+        insert_depth = float(entry['insert_depth_m'])
+        retract_depth = float(entry['retract_depth_m'])
+
+    plan = curobo.plan_place(
+        pose, float(place_poses['transit_z']), bookshelf=bookshelf,
+        insert_depth=insert_depth, retract_depth=retract_depth,
+        joint_states=joint_state,
+        floor_z=float(place_poses.get('transit_floor_z', 0.0)))
+    if plan is None or plan.move is None or not plan.move.points:
+        response.success = False
+        response.message = f'CuRobo.plan_place failed for {goal_name!r}.'
+        return response
+
+    response.trajectory = plan.move
+    if plan.insert is not None:
+        response.insert_trajectory = plan.insert
+    if plan.retract is not None:
+        response.retract_trajectory = plan.retract
+
+    # Pause TSDF mapping while the object is carried through the place, so the
+    # carried object doesn't fuse into the collision world (home, planned after
+    # release, deliberately keeps mapping live for collision-aware planning).
+    pause_sec = (
+        _trajectory_duration_sec(plan.move)
+        + _trajectory_duration_sec(plan.insert)
+        + _trajectory_duration_sec(plan.retract)
+        + _env_float('PIPELINE_GRASP_MAPPING_PAUSE_EXTRA_SEC', 2.0)
+    )
+    try:
+        curobo.pause_mapping(pause_sec)
+    except Exception:
+        pass
+
+    response.success = True
+    response.message = (
+        f'CuRobo place planned for {goal_name!r}: '
+        f'move={len(plan.move.points)}pts bookshelf={bookshelf}')
+    return response
 
 
 def _append_preclose_insertion_to_trajectory(trajectory):

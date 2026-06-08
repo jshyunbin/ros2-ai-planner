@@ -66,11 +66,19 @@ the planner is ready.
 
 ## Step 5 — Send a task command
 
-From the host (or any sourced ROS2 shell):
+From the host (or any sourced ROS2 shell). `/task_commands` takes a
+**natural-language instruction**; Gemini parses it into one or more
+`{object, destination}` tasks, which are queued and executed one at a time:
 
 ```bash
-ros2 topic pub --once /task_commands std_msgs/msg/String "{data: 'banana'}"
+# single object
+ros2 topic pub --once /task_commands std_msgs/msg/String "{data: 'put the banana in the left basket'}"
+
+# multiple objects (one queued task each)
+ros2 topic pub --once /task_commands std_msgs/msg/String "{data: 'move the banana and the apple to the right basket'}"
 ```
 
-The pipeline then runs segmentation → grasp generation → motion planning and
-executes the trajectory on the UR5.
+For each task the pipeline runs segmentation → grasp generation → motion
+planning, executes the trajectory on the UR5, then transits the object to the
+parsed destination, releases it, and returns home before starting the next
+task. The parsed plan is also published on `/gemini/task_plan`.

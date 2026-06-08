@@ -5,13 +5,18 @@ CS477 manipulation challenge를 위한 Dockerized ROS2 AI 플래닝 스택.
 ## 파이프라인
 
 ```text
-task_command → 세그멘테이션 (Gemini bbox + SAM2)
+task_command (자연어 명령) → Gemini 태스크 파싱 ({object, destination} 작업 큐)
+             → 세그멘테이션 (Gemini bbox + SAM2)
              → GraspGen (세그멘테이션된 포인트클라우드에서 파지 포즈)
              → cuRobo (실시간 듀얼 RGBD TSDF 기반 관절 궤적 계획)
              → UR5 실행 (/ur5_controller/follow_joint_trajectory)
+             → 목적지 이송 (충돌 미고려 safe-transit_z 경로; 책장은 +x 삽입 / −x 후퇴)
+             → 물체 놓기 → 홈 복귀 (충돌 고려)
 ```
 
-세 AI 단계는 각각 별도의 ROS2 노드로 구현되며, 오케스트레이터가 ROS2 서비스를 통해 조율한다.
+`/task_commands`로 들어온 **자연어 명령**은 Gemini가 하나 이상의 `{물체, 목적지}` 작업으로 파싱해 큐에 넣고, 오케스트레이터가 작업을 **하나씩 순차 실행**한다. 각 작업의 목적지는 파싱 결과에서 결정된다 (`storage_1`/`storage_2` 바구니, `bookshelf_floor1`/`bookshelf_floor2` 책장).
+
+이후 AI 단계(세그멘테이션 · GraspGen · cuRobo)는 각각 별도의 ROS2 노드로 구현되며, 오케스트레이터가 ROS2 서비스를 통해 조율한다.
 
 **cuRobo가 전체 깊이 파이프라인을 담당한다.** 두 D435 깊이 스트림을 직접 구독해 `base_link` 좌표계에서 GPU 기반 블록-스파스 TSDF/ESDF로 융합하고, 이 맵을 충돌 회피 모션 플래닝에 사용한다.
 
@@ -51,10 +56,14 @@ docker compose -f docker-compose.yml -f docker-compose.debug.yml up
 docker compose -f docker-compose.yml -f docker-compose.debug.yml run --rm ai_planner bash
 ```
 
-태스크 커맨드 발행 (호스트 또는 소싱된 컨테이너 셸에서):
+태스크 커맨드 발행 (호스트 또는 소싱된 컨테이너 셸에서). `/task_commands`는 **자연어 명령**을 받으며, Gemini가 하나 이상의 작업으로 파싱한다:
 
 ```bash
-ros2 topic pub --once /task_commands std_msgs/msg/String "{data: 'banana'}"
+# 단일 물체
+ros2 topic pub --once /task_commands std_msgs/msg/String "{data: 'put the banana in the left basket'}"
+
+# 복수 물체 (각 물체가 별도 작업으로 큐에 적재되어 순차 실행)
+ros2 topic pub --once /task_commands std_msgs/msg/String "{data: 'move the banana and the apple to the right basket'}"
 ```
 
 cuRobo 플래너 초기화가 완료되기 전에 요청이 도착해도 실패하지 않고 초기화 완료까지 블록된다.
@@ -66,7 +75,7 @@ ROS_DOMAIN_ID=0
 ROS_LOCALHOST_ONLY=0
 RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 FASTDDS_BUILTIN_TRANSPORTS=UDPv4
-GEMINI_API_KEY=<키>   # segmentation_service에서 필요
+GEMINI_API_KEY=<키>   # orchestrator(태스크 파싱) + segmentation_service(bbox)에서 필요
 ```
 
 ## 패키지 구조
@@ -80,13 +89,14 @@ GEMINI_API_KEY=<키>   # segmentation_service에서 필요
 
 | 모듈 | 엔트리포인트 | 역할 |
 |---|---|---|
-| `orchestrator.py` | `orchestrator` | `/task_commands` 구독 → 세그멘테이션 → GraspGen → cuRobo 서비스 순차 호출 → FollowJointTrajectory 실행 |
+| `orchestrator.py` | `orchestrator` | `/task_commands`(자연어) 구독 → Gemini로 `{물체, 목적지}` 작업 리스트 파싱 후 `/gemini/task_plan`에 발행하고 큐에 적재 → 작업을 하나씩 순차 실행. 각 작업: 세그멘테이션 → GraspGen → cuRobo 순차 호출 → FollowJointTrajectory 실행. pick 이후 파싱된 목적지를 cuRobo `goal_name` 모드에 전달해 이송 → 놓기 → 홈 복귀 수행 |
 | `segmentation_service.py` | `segmentation_service` | `/segmentation/segment_prompt` 서비스. Gemini로 bbox 추출, SAM2로 마스크 정제, 깊이 역투영 후 세그멘테이션/배경 포인트클라우드 발행 |
 | `graspgen_service.py` | `graspgen_service` | `/graspgen/infer` 서비스. 세그멘테이션된 클라우드를 수신해 ZMQ로 GraspGen 서버에 추론 요청, 운동학/충돌 필터링 후 파지 순위 JSON 반환 |
-| `curobo_service.py` | `curobo_service` | `/curobo/plan_trajectory` 서비스. cuRobo 플래너 래퍼; pick(접근+파지/들기) 또는 단일 포즈(place/home) 계획 |
+| `curobo_service.py` | `curobo_service` | `/curobo/plan_trajectory` 서비스. cuRobo 플래너 래퍼; pick(접근+파지/들기), 단일 포즈(`grasp_pose`), 또는 `goal_name` 모드 — `place_poses.yml` 키를 충돌 미고려 safe-transit_z 이송(+책장 삽입/후퇴)으로, `home`은 충돌 고려 복귀로 계획 |
 | `curobo.py` | — | `CuRobo` 클래스: 듀얼 RGBD TSDF 매핑 + 모션 플래닝 |
 | `graspgen_client.py` | — | 독립 GraspGen 추론 서버에 대한 ZMQ 클라이언트 |
 | `segmentation_utils.py` | — | 세그멘테이션 헬퍼 (리사이즈, 깊이 역투영, 다운샘플, 중심점, 오버레이) |
+| `gemini_api.py` | — | Gemini 호출 래퍼 (자연어 명령 → 작업 리스트 파싱, RGB → bbox 추출) |
 | `debug_viz.py` | `debug_viz` | viser 서버 호스팅; 세그멘테이션/배경 클라우드, 파지 포즈, TSDF 복셀 시각화 (디버그 모드 전용) |
 | `live_viz_helpers.py` | — | 포인트클라우드/TSDF 시각화 헬퍼 |
 | `graspgen_probe.py` | `graspgen_probe` | 독립 디버그 유틸리티 (런타임 파이프라인 외부) |
@@ -114,6 +124,7 @@ GEMINI_API_KEY=<키>   # segmentation_service에서 필요
 
 | 인터페이스 | 타입 | 방향 |
 |---|---|---|
+| `/gemini/task_plan` | `std_msgs/String` (JSON) | orchestrator (파싱된 작업 계획 발행) |
 | `/segmentation/segment_prompt` | `riro_srvs/StringString` | orchestrator → segmentation_service |
 | `/graspgen/segmented_object`, `/graspgen/background` | `sensor_msgs/PointCloud2` | segmentation_service → graspgen_service |
 | `/graspgen/infer` | `riro_srvs/StringString` | orchestrator → graspgen_service |
@@ -205,7 +216,11 @@ source install/setup.bash
 ### 태스크 발행
 
 ```bash
-ros2 topic pub --once /task_commands std_msgs/msg/String "{data: 'banana'}"
+# 자연어 명령 → Gemini가 {물체, 목적지} 작업으로 파싱
+ros2 topic pub --once /task_commands std_msgs/msg/String "{data: 'put the banana in the left basket'}"
+
+# 파싱된 작업 계획 확인
+ros2 topic echo /gemini/task_plan
 ```
 
 ### 수동 서비스 호출

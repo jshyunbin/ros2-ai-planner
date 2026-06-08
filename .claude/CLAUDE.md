@@ -6,7 +6,7 @@ This file provides guidance to Claude Code when working in this repository.
 
 `ros2-ai-planner` is a standalone Dockerized ROS2 system that acts as an external AI planning stack for the CS477 `manip_challenge` pick-and-place project. It runs on the same machine as the `manip_challenge` simulation (Gazebo + ROS2 Humble) and communicates over a shared host network.
 
-**Pipeline:** task command → segmentation (Gemini bounding box + SAM2) → GraspGen (grasp poses from the segmented point cloud) → cuRobo (plan joint trajectory against a live dual-RGBD TSDF) → execute on the UR5 via `/ur5_controller/follow_joint_trajectory`.
+**Pipeline:** task command → segmentation (Gemini bounding box + SAM2) → GraspGen (grasp poses from the segmented point cloud) → cuRobo (plan joint trajectory against a live dual-RGBD TSDF) → execute on the UR5 via `/ur5_controller/follow_joint_trajectory`, then move the grasped object to a goal destination (collision-off safe-`transit_z` transit; bookshelf gets a +x insert / −x retract), release it, and return the empty arm home (collision-aware).
 
 All three AI stages are implemented and run as **separate ROS2 nodes**, coordinated by the orchestrator over ROS2 services. This is no longer a single stub node.
 
@@ -41,10 +41,10 @@ Nodes (each is a `console_scripts` entry point in `setup.py`):
 
 | Module | Node / entry point | Role |
 |---|---|---|
-| `orchestrator.py` | `orchestrator` | Drives the pipeline: subscribes `/task_commands`, calls the segmentation, GraspGen, and cuRobo services in turn, then executes the trajectory via FollowJointTrajectory actions. |
-| `segmentation_service.py` | `segmentation_service` | `StringString` service `/segmentation/segment_prompt`. Localizes the prompt with Gemini, refines with SAM2, back-projects depth, and **publishes** the segmented + background point clouds (in `base_link`). |
+| `orchestrator.py` | `orchestrator` | Drives the pipeline: subscribes `/task_commands`, calls the segmentation, GraspGen, and cuRobo services in turn, then executes the trajectory via FollowJointTrajectory actions. At the start of each `/task_commands` cycle it first waits for the latched `/curobo/ready` signal (so it never issues a plan before CuRobo has initialised and built the TSDF — only blocks on the first cycle), then moves the arm to the `home` pose (collision-aware), opens the gripper, and captures the home-arrival time, passing it to segmentation as a freshness gate so each pick-and-place segments a wrist frame taken *after* the arm settled at home. After the pick lift it forwards a destination key (`target_goal` param — placeholder until upstream NL parsing resolves it) to the cuRobo `goal_name` mode and executes the returned place → release → home sequence. |
+| `segmentation_service.py` | `segmentation_service` | `StringString` service `/segmentation/segment_prompt`. Localizes the prompt with Gemini, refines with SAM2, back-projects depth, and **publishes** the segmented + background point clouds (in `base_link`). The request is a JSON object `{prompt, min_stamp_ns}` (a bare prompt string still works); when `min_stamp_ns > 0` the service blocks until RGB+depth frames are stamped after that time (`PIPELINE_SEG_FRESH_FRAME_TIMEOUT_SEC`, default 5s) before segmenting. Runs under a `MultiThreadedExecutor` with the camera subscriptions in a reentrant group so frames keep arriving while the handler waits. |
 | `graspgen_service.py` | `graspgen_service` | `StringString` service `/graspgen/infer`. The request carries a cloud-stamp token (empty = latest); GraspGen waits for the matching segmented cloud, runs inference (via a ZMQ client to a separate inference server), applies kinematic/collision filtering and ranking, and returns ranked grasp poses as JSON (with a `success` field). |
-| `curobo_service.py` | `curobo_service` | `PlanTrajectory` service `/curobo/plan_trajectory`. Wraps the long-lived `CuRobo` planner; plans pick (approach+grasp / lift) or single-pose (place/home). |
+| `curobo_service.py` | `curobo_service` | `PlanTrajectory` service `/curobo/plan_trajectory`. Wraps the long-lived `CuRobo` planner. Three modes: pick (`grasp_poses` → approach+grasp / lift), single-pose (`grasp_pose`), and **`goal_name`** — resolves a `place_poses.yml` key to a collision-off safe-`transit_z` place transit (`trajectory` + bookshelf `insert_trajectory`/`retract_trajectory`) or, for `home`, a collision-aware return motion. Also publishes a latched `/curobo/ready` (`std_msgs/Bool`) once background init is done **and** the TSDF has ≥`MIN_FRAMES`, so the orchestrator can hold the first plan until the single-threaded executor has built the map (issuing one earlier parks that thread and starves the depth callbacks). |
 | `curobo.py` | — | `CuRobo` class: dual-RGBD TSDF occupancy mapping + cuRobo motion planning. Owns only depth/CameraInfo/TF; fed joints via `update_joint_state()`. |
 | `graspgen_client.py` | — | Minimal ZMQ client to the standalone GraspGen inference server. |
 | `segmentation_utils.py` | — | Pure helpers for segmentation (resize, depth back-projection, downsample, centroid, overlay). |
@@ -82,6 +82,7 @@ Internal:
 | `/graspgen/infer` | `riro_srvs/StringString` | orchestrator → graspgen_service (request = cloud-stamp token, response = JSON) |
 | `/curobo/plan_trajectory` | `riro_srvs/PlanTrajectory` | orchestrator → curobo_service |
 | `/graspgen/grasp_poses` | `geometry_msgs/PoseArray` | graspgen_service → debug_viz (debug only) |
+| `/curobo/ready` | `std_msgs/Bool` (latched) | curobo_service → orchestrator (init done + TSDF ready) |
 | `/curobo/tsdf_voxels` | `sensor_msgs/PointCloud2` | curobo_service → debug_viz (debug only) |
 | `/curobo/overhead_cloud` | `sensor_msgs/PointCloud2` | curobo_service → debug_viz (overhead depth back-projection, debug only) |
 

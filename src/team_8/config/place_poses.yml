@@ -1,30 +1,37 @@
-# Hardcoded place/home poses for the manip_challenge environment.
+# Place/home poses for the manip_challenge environment.
 #
-# All poses are the tool0 link expressed in base_link (world == base_link,
-# verified via TF). tool0 +z is the approach axis; the gripper fingertips are
-# +0.1034 m along +z, so a tool0 target sits 0.1034 m behind the fingertip
-# contact point along the approach axis.
+# All poses are the tool0 link expressed in base_link (world == base_link).
+# tool0 +z is the approach axis; the gripper fingertips are +0.1034 m along +z.
 #
-#   quat_xyzw [1, 0, 0, 0]        -> tool0 +z points down (world -z): top-down
-#                                    drops / wrist-cam home.
-#   quat_xyzw [0.5, 0.5, 0.5, 0.5] -> tool0 +z points +x (world): horizontal,
-#                                    pointing into the bookshelf opening.
+#   quat_xyzw [1, 0, 0, 0]         -> tool0 +z points down (top-down drops / home)
+#   quat_xyzw [0.5, 0.5, 0.5, 0.5] -> tool0 +z points +x (into the bookshelf)
 #
-# Values below are STARTING GUESSES. Tune them in the live sim with the
-# pose_probe node (see docs/superpowers/plans/2026-06-04-place-home-poses.md).
+# Real poses. home is the tool0 FK of the home joint configuration
+#   [pan, lift, elbow, w1, w2, w3] = [-1.332, -2.402, 1.538, -0.863, -1.114, -1.292]
+# (computed with the planner's own cuRobo kinematics). storage_1/storage_2 are
+# the basket drop points (storageA_1 / storageB_1) with a top-down orientation.
 
-transit_z: 0.80          # safe height for carrying an object laterally
+# Lateral carry height. Capped by UR5 reach: at storage_1's xy radius (~0.65 m)
+# cuRobo IK reaches up to z~0.60; 0.80 was unreachable and broke the lift leg.
+# Lowered to 0.45 (must stay above the storage drop z=0.37): the arm is now kept
+# off the table by transit_floor_z below, so the carry no longer has to be high,
+# and a lower carry eases reach for far grasps. The lift leg auto-lowers further
+# when even this is unreachable (see CuRobo._plan_lift_leg).
+transit_z: 0.45          # safe height for carrying an object laterally
 
-home:      {xyz: [0.55, 0.07, 0.90], quat_xyzw: [1.0, 0.0, 0.0, 0.0]}
-storage_1: {xyz: [0.0,  0.55, 0.62], quat_xyzw: [1.0, 0.0, 0.0, 0.0]}
-storage_2: {xyz: [0.0, -0.55, 0.62], quat_xyzw: [1.0, 0.0, 0.0, 0.0]}
+# Ground-plane floor for the carried-object transit, in base_link z. The transit
+# is collision-OFF for the held object, but cuRobo still checks every arm link
+# against a flat cuboid whose top sits at this z, so the arm can't drop through
+# the table. Set to the table-top height (raise it for more clearance over short
+# objects; keep it below the storage drop z=0.37 so it never blocks the descent).
+transit_floor_z: 0.0
 
-bookshelf_floor1:
-  pre_insert:      {xyz: [0.60, -0.30, 0.55], quat_xyzw: [0.5, 0.5, 0.5, 0.5]}
-  insert_depth_m:  0.22
-  retract_depth_m: 0.22
+home:      {xyz: [0.152144, -0.010048, 0.615651], quat_xyzw: [-0.685513, 0.687999, -0.179150, 0.156950]}
+storage_1: {xyz: [0.000000,  0.550000, 0.370337], quat_xyzw: [1.0, 0.0, 0.0, 0.0]}
+storage_2: {xyz: [0.000000, -0.550000, 0.370327], quat_xyzw: [1.0, 0.0, 0.0, 0.0]}
 
-bookshelf_floor2:
-  pre_insert:      {xyz: [0.60, -0.30, 0.76], quat_xyzw: [0.5, 0.5, 0.5, 0.5]}
-  insert_depth_m:  0.22
-  retract_depth_m: 0.22
+# bookshelf/shelf pose not yet provided — add when available, e.g.:
+# bookshelf:
+#   pre_insert:      {xyz: [..., ..., ...], quat_xyzw: [0.5, 0.5, 0.5, 0.5]}
+#   insert_depth_m:  0.22
+#   retract_depth_m: 0.22
