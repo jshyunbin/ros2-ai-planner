@@ -26,6 +26,7 @@ import numpy as np
 import rclpy
 from rclpy.action import ActionClient
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy
 from builtin_interfaces.msg import Duration
 from control_msgs.action import FollowJointTrajectory
 from cv_bridge import CvBridge
@@ -75,11 +76,15 @@ class HomeConfigTuner(Node):
         self._bridge = CvBridge()
         self._latest_image = None
         self._latest_image_stamp_ns = 0
+        # The camera publishes sensor data as BEST_EFFORT; a RELIABLE
+        # subscription (the default) is QoS-incompatible and receives nothing.
+        image_qos = QoSProfile(depth=10)
+        image_qos.reliability = ReliabilityPolicy.BEST_EFFORT
         self.create_subscription(
             Image,
             str(self.get_parameter("wrist_image_topic").value),
             self._cache_image,
-            10,
+            image_qos,
         )
         self._arm = ActionClient(
             self, FollowJointTrajectory, self._arm_action_name)
@@ -175,8 +180,14 @@ class HomeConfigTuner(Node):
         return True
 
     def _capture_fresh_image(self):
-        """Spin until a wrist frame stamped after now arrives (freshness gate)."""
-        reference_ns = self.get_clock().now().nanoseconds
+        """Spin until a wrist frame newer than the one present at arrival arrives.
+
+        The reference is the *image's own* header stamp at arrival, not the node
+        clock — so the gate works whether the camera is publishing sim time or
+        wall time (mixing the two never fires). The arm has just settled, so the
+        next strictly-newer frame reflects the new pose.
+        """
+        reference_ns = self._latest_image_stamp_ns
         deadline = time.monotonic() + self._fresh_timeout
         while rclpy.ok() and time.monotonic() < deadline:
             rclpy.spin_once(self, timeout_sec=0.1)
