@@ -32,6 +32,9 @@ mcp/
 
 # External dependencies cloned at runtime
 ext/*
+# ...but vendor the gripper_descriptions assets (needed by start_graspgen_server.sh).
+# Checkpoints (ext/graspgenx_checkpoints) stay ignored — see root .gitignore.
+!ext/gripper_descriptions/
 
 # end2end: generated merged robot URDFs/configs + run outputs (not committed)
 end2end/curobo_assets/

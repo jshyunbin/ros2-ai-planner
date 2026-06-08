@@ -18,3 +18,6 @@ artifacts/*
 .vscode/
 .idea/
 *.swp
+
+# GraspGenX checkpoints — downloaded from HF at build time, never commit (~1.7GB)
+GraspGenX/ext/graspgenx_checkpoints/
