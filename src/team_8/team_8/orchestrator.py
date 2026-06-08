@@ -856,46 +856,34 @@ class PipelineOrchestrator(Node):
         object_name = str(task['object'])
         destination = str(task['destination'])
         attempt_count = int(task.get('_attempt_count', 1))
+        before_count = task.get('_before_count')
 
         try:
-            result = self._gemini.verify_object_removed(
-                pil_image,
-                object_name=object_name,
-                destination=destination,
-            )
+            count_result = self._gemini.count_objects(
+                pil_image, object_name=object_name)
+            after_count = int(count_result['count'])
+            reason = str(count_result.get('reason', ''))
         except Exception as exc:
-            self.get_logger().error(
-                f'Gemini post-task verification failed: {exc}; ' 
-                'continuing to the next JSON task.')
-            self._publish_verification_result(
-                task=task,
-                result={
-                    'verification_success': False,
-                    'error': str(exc),
-                },
-            )
-            self._save_verification_artifacts(
-                image_rgb=image_rgb,
-                task=task,
-                result={'error': str(exc)},
-            )
-            self._reset_pipeline_state(
-                success=False,
-                reason='Gemini verification failed; skipped task',
-            )
-            return
+            after_count = None
+            reason = f'count failed: {exc}'
+            self.get_logger().warn(
+                f'Post-task object count failed (object={object_name}): {exc}')
 
-        present = bool(result['present_in_source_workspace'])
-        confidence = float(result.get('confidence', 0.0))
-        reason = str(result.get('reason', ''))
+        removed = (
+            before_count is not None
+            and after_count is not None
+            and after_count < before_count)
 
         verification_payload = {
-            'verification_success': True,
+            'count_available': after_count is not None,
             'object': object_name,
             'destination': destination,
             'attempt': attempt_count,
             'max_attempts': self._max_task_attempts,
-            **result,
+            'before_count': before_count,
+            'after_count': after_count,
+            'removed': removed,
+            'reason': reason,
         }
         self._publish_verification_result(
             task=task, result=verification_payload)
@@ -906,36 +894,49 @@ class PipelineOrchestrator(Node):
         )
 
         self.get_logger().info(
-            'Gemini verification result ' 
+            'Post-task count result '
             f'object={object_name} attempt={attempt_count}/'
-            f'{self._max_task_attempts} ' 
-            f'present_in_source_workspace={present} ' 
-            f'confidence={confidence:.3f} reason={reason}')
+            f'{self._max_task_attempts} before={before_count} '
+            f'after={after_count} removed={removed} reason={reason}')
 
-        if not present:
+        # Count unavailable (Gemini error / no fresh frame on either side): we
+        # cannot tell if the pick worked. Succeed without retry — re-picking when
+        # duplicates exist risks removing a second instance, which is worse than
+        # a missed verification.
+        if before_count is None or after_count is None:
+            self.get_logger().warn(
+                'Object count unavailable; marking task done without retry '
+                f'(object={object_name}).')
             self._reset_pipeline_state(
                 success=True,
-                reason='verified removed from source workspace',
+                reason='object count unavailable; assumed removed',
+            )
+            return
+
+        if removed:
+            self._reset_pipeline_state(
+                success=True,
+                reason=(
+                    f'count dropped {before_count}->{after_count}; removed'),
             )
             return
 
         if attempt_count < self._max_task_attempts:
             self.get_logger().warn(
-                f"Object '{object_name}' is still visible in the source "
-                f"workspace; retrying the same task "
+                f"Count for '{object_name}' did not drop "
+                f"({before_count}->{after_count}); retrying the same task "
                 f"({attempt_count + 1}/{self._max_task_attempts}).")
             self._restart_active_task()
             return
 
         self.get_logger().warn(
-            f"Object '{object_name}' is still visible after "
+            f"Count for '{object_name}' did not drop after "
             f"{attempt_count} attempts; skipping it and continuing to the "
-            "next JSON task.")
+            "next task.")
         self._reset_pipeline_state(
             success=False,
             reason=(
-                f'object still present after {attempt_count} attempts; skipped'
-            ),
+                f'count did not drop after {attempt_count} attempts; skipped'),
         )
 
     def _restart_active_task(self) -> None:

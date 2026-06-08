@@ -1458,3 +1458,79 @@ def test_run_pipeline_captures_before_count_after_home():
     # stored on the active task for the post-task comparison.
     orch._count_target_in_workspace.assert_called_once_with('coke_can', 777)
     assert orch._active_task_data['_before_count'] == 2
+
+
+def _verification_orch(before_count, after_count):
+    """Orchestrator wired so _run_post_task_verification reaches the decision.
+
+    after_count drives the mocked _gemini.count_objects; a None after_count
+    raises to exercise the count-unavailable branch.
+    """
+    import numpy as np
+    orch = _orchestrator_skeleton()
+    orch._active_task_data = {
+        'object': 'coke_can', 'destination': 'storage_1',
+        '_attempt_count': 1, '_before_count': before_count}
+    orch._max_task_attempts = 2
+    orch._verification_frame_timeout_sec = 1.0
+    orch._verification_reference_stamp_ns = 100
+    orch._latest_verification_rgb = np.zeros((4, 4, 3), dtype='uint8')
+    orch._latest_verification_rgb_stamp_ns = 200  # fresh
+    orch._gemini = MagicMock()
+    if after_count is None:
+        orch._gemini.count_objects.side_effect = RuntimeError('boom')
+    else:
+        orch._gemini.count_objects.return_value = {
+            'count': after_count, 'reason': 'r'}
+    orch._publish_verification_result = MagicMock()
+    orch._save_verification_artifacts = MagicMock()
+    orch._reset_pipeline_state = MagicMock()
+    orch._restart_active_task = MagicMock()
+    return orch
+
+
+def test_post_task_success_when_count_decreased():
+    orch = _verification_orch(before_count=2, after_count=1)
+    orch._run_post_task_verification()
+    orch._reset_pipeline_state.assert_called_once()
+    assert orch._reset_pipeline_state.call_args.kwargs['success'] is True
+    orch._restart_active_task.assert_not_called()
+
+
+def test_post_task_retries_when_count_not_decreased():
+    orch = _verification_orch(before_count=2, after_count=2)  # attempt 1 of 2
+    orch._run_post_task_verification()
+    orch._restart_active_task.assert_called_once()
+    orch._reset_pipeline_state.assert_not_called()
+
+
+def test_post_task_skips_when_count_not_decreased_at_max_attempts():
+    orch = _verification_orch(before_count=2, after_count=2)
+    orch._active_task_data['_attempt_count'] = 2  # == _max_task_attempts
+    orch._run_post_task_verification()
+    orch._reset_pipeline_state.assert_called_once()
+    assert orch._reset_pipeline_state.call_args.kwargs['success'] is False
+    orch._restart_active_task.assert_not_called()
+
+
+def test_post_task_success_no_retry_when_after_count_unavailable():
+    orch = _verification_orch(before_count=2, after_count=None)
+    orch._run_post_task_verification()
+    orch._reset_pipeline_state.assert_called_once()
+    assert orch._reset_pipeline_state.call_args.kwargs['success'] is True
+    orch._restart_active_task.assert_not_called()
+
+
+def test_post_task_success_no_retry_when_before_count_unavailable():
+    orch = _verification_orch(before_count=None, after_count=1)
+    orch._run_post_task_verification()
+    orch._reset_pipeline_state.assert_called_once()
+    assert orch._reset_pipeline_state.call_args.kwargs['success'] is True
+    orch._restart_active_task.assert_not_called()
+
+
+def test_post_task_retries_when_count_increased():
+    orch = _verification_orch(before_count=2, after_count=3)  # attempt 1 of 2
+    orch._run_post_task_verification()
+    orch._restart_active_task.assert_called_once()
+    orch._reset_pipeline_state.assert_not_called()
