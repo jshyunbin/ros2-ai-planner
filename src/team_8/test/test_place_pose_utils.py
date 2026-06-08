@@ -3,6 +3,7 @@ import textwrap
 import pytest
 
 from team_8.place_pose_utils import (
+    get_home_joint_config,
     load_place_poses,
     pose_from_xyzquat,
     resolve_target_pose,
@@ -10,7 +11,7 @@ from team_8.place_pose_utils import (
 
 _YAML = textwrap.dedent("""
     transit_z: 0.80
-    home:      {xyz: [0.55, 0.07, 0.90], quat_xyzw: [1.0, 0.0, 0.0, 0.0]}
+    home_joint_config: [0.0, -2.2, 1.9, -1.383, -1.57, 0.0]
     storage_1: {xyz: [0.0,  0.55, 0.85], quat_xyzw: [1.0, 0.0, 0.0, 0.0]}
     storage_2: {xyz: [0.0, -0.55, 0.85], quat_xyzw: [1.0, 0.0, 0.0, 0.0]}
     bookshelf_floor1:
@@ -51,7 +52,21 @@ def test_load_rejects_missing_transit_z(tmp_path):
 
 
 def test_load_rejects_bad_xyz_length(tmp_path):
-    bad = _YAML.replace("xyz: [0.55, 0.07, 0.90]", "xyz: [0.55, 0.07]")
+    bad = _YAML.replace("xyz: [0.0,  0.55, 0.85]", "xyz: [0.0, 0.55]")
+    with pytest.raises(ValueError):
+        load_place_poses(_write(tmp_path, bad))
+
+
+def test_load_parses_home_joint_config(tmp_path):
+    data = load_place_poses(_write(tmp_path, _YAML))
+    assert get_home_joint_config(data) == pytest.approx(
+        [0.0, -2.2, 1.9, -1.383, -1.57, 0.0])
+
+
+def test_load_rejects_bad_home_joint_config_length(tmp_path):
+    bad = _YAML.replace(
+        "home_joint_config: [0.0, -2.2, 1.9, -1.383, -1.57, 0.0]",
+        "home_joint_config: [0.0, -2.2, 1.9]")
     with pytest.raises(ValueError):
         load_place_poses(_write(tmp_path, bad))
 
@@ -81,3 +96,89 @@ def test_resolve_unknown_target_raises_keyerror(tmp_path):
     data = load_place_poses(_write(tmp_path, _YAML))
     with pytest.raises(KeyError):
         resolve_target_pose(data, "nonexistent")
+
+
+from team_8.place_pose_utils import (
+    build_transit_waypoints,
+    is_bookshelf_target,
+    translate_pose_x,
+)
+
+_YAML_SINGLE = textwrap.dedent("""
+    transit_z: 0.80
+    home_joint_config: [0.0, -2.2, 1.9, -1.383, -1.57, 0.0]
+    storage_1: {xyz: [0.0,  0.55, 0.70], quat_xyzw: [1.0, 0.0, 0.0, 0.0]}
+    storage_2: {xyz: [0.0, -0.55, 0.70], quat_xyzw: [1.0, 0.0, 0.0, 0.0]}
+    bookshelf:
+      pre_insert:      {xyz: [0.60, -0.30, 0.76], quat_xyzw: [0.5, 0.5, 0.5, 0.5]}
+      insert_depth_m:  0.22
+      retract_depth_m: 0.22
+""")
+
+
+def test_load_accepts_single_bookshelf_key(tmp_path):
+    data = load_place_poses(_write(tmp_path, _YAML_SINGLE))
+    assert data["bookshelf"]["insert_depth_m"] == pytest.approx(0.22)
+
+
+def test_load_rejects_missing_home_joint_config(tmp_path):
+    bad = _YAML_SINGLE.replace(
+        "home_joint_config: [0.0, -2.2, 1.9, -1.383, -1.57, 0.0]\n", "")
+    with pytest.raises(ValueError):
+        load_place_poses(_write(tmp_path, bad))
+
+
+def test_load_rejects_bookshelf_missing_insert_depth(tmp_path):
+    bad = _YAML_SINGLE.replace("  insert_depth_m:  0.22\n", "")
+    with pytest.raises(ValueError):
+        load_place_poses(_write(tmp_path, bad))
+
+
+def test_is_bookshelf_target_true_for_bookshelf(tmp_path):
+    data = load_place_poses(_write(tmp_path, _YAML_SINGLE))
+    assert is_bookshelf_target(data, "bookshelf") is True
+
+
+def test_is_bookshelf_target_false_for_storage_and_home(tmp_path):
+    data = load_place_poses(_write(tmp_path, _YAML_SINGLE))
+    assert is_bookshelf_target(data, "storage_1") is False
+    assert is_bookshelf_target(data, "home_joint_config") is False
+
+
+def test_resolve_single_bookshelf_returns_pre_insert(tmp_path):
+    data = load_place_poses(_write(tmp_path, _YAML_SINGLE))
+    pose = resolve_target_pose(data, "bookshelf")
+    assert pose.position.z == pytest.approx(0.76)
+
+
+def test_build_transit_waypoints_three_legs():
+    wps = build_transit_waypoints(
+        current_xyz=[0.30, 0.10, 0.50], current_quat_xyzw=[0.0, 1.0, 0.0, 0.0],
+        place_xyz=[0.00, 0.55, 0.70], place_quat_xyzw=[1.0, 0.0, 0.0, 0.0],
+        transit_z=0.80)
+    assert len(wps) == 3
+    assert wps[0][0] == [0.30, 0.10, 0.80]
+    assert wps[0][1] == [0.0, 1.0, 0.0, 0.0]
+    assert wps[1][0] == [0.00, 0.55, 0.80]
+    assert wps[1][1] == [1.0, 0.0, 0.0, 0.0]
+    assert wps[2][0] == [0.00, 0.55, 0.70]
+    assert wps[2][1] == [1.0, 0.0, 0.0, 0.0]
+
+
+def test_translate_pose_x_offsets_only_x():
+    assert translate_pose_x([0.60, -0.30, 0.76], 0.22) == pytest.approx(
+        [0.82, -0.30, 0.76])
+    assert translate_pose_x([0.82, -0.30, 0.76], -0.22) == pytest.approx(
+        [0.60, -0.30, 0.76])
+
+
+def test_build_transit_waypoints_does_not_lower_when_above_transit_z():
+    # Post-pick pose already above transit_z: lift/traverse must stay high,
+    # never drive the carried object back down to transit_z.
+    wps = build_transit_waypoints(
+        current_xyz=[0.30, 0.10, 0.95], current_quat_xyzw=[1.0, 0.0, 0.0, 0.0],
+        place_xyz=[0.00, 0.55, 0.70], place_quat_xyzw=[1.0, 0.0, 0.0, 0.0],
+        transit_z=0.80)
+    assert wps[0][0] == [0.30, 0.10, 0.95]   # lift stays at current (higher) z
+    assert wps[1][0] == [0.00, 0.55, 0.95]   # traverse at the same safe height
+    assert wps[2][0] == [0.00, 0.55, 0.70]   # descend to the drop pose

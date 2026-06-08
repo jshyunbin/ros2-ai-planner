@@ -48,8 +48,9 @@ from team_8.place_pose_utils import (
     get_home_joint_config,
     is_bookshelf_target,
     load_place_poses,
+    pose_from_xyzquat,
     resolve_target_pose,
-    translate_pose_along_x,
+    translate_pose_x,
 )
 from riro_srvs.srv import PlanTrajectory
 
@@ -92,7 +93,10 @@ class CuRoboService(Node):
 
         # Load place pose config once at startup; used by _handle_named_goal.
         try:
-            self._place_poses_cfg = load_place_poses()
+            _poses_yml = os.path.join(
+                os.path.dirname(os.path.dirname(__file__)),
+                'config', 'place_poses.yml')
+            self._place_poses_cfg = load_place_poses(_poses_yml)
         except Exception as exc:
             self.get_logger().warning(
                 f'place_poses.yml not loaded: {exc}; '
@@ -476,8 +480,16 @@ class CuRoboService(Node):
             insert_depth = float(entry.get('insert_depth_m', 0.08))
             retract_depth = float(entry.get('retract_depth_m', 0.06))
 
-            insert_pose = translate_pose_along_x(target_pose, -insert_depth)
-            retract_pose = translate_pose_along_x(target_pose, retract_depth)
+            # translate_pose_x works on plain xyz lists; convert from/to Pose.
+            pre_xyz = [target_pose.position.x,
+                       target_pose.position.y,
+                       target_pose.position.z]
+            pre_quat = [target_pose.orientation.x, target_pose.orientation.y,
+                        target_pose.orientation.z, target_pose.orientation.w]
+            insert_xyz  = translate_pose_x(pre_xyz, -insert_depth)
+            retract_xyz = translate_pose_x(pre_xyz,  retract_depth)
+            insert_pose  = pose_from_xyzquat(insert_xyz,  pre_quat)
+            retract_pose = pose_from_xyzquat(retract_xyz, pre_quat)
 
             insert_js = _trajectory_final_joint_state(trajectory, joint_state)
             insert_traj = curobo.plan_trajectory(insert_pose, insert_js)

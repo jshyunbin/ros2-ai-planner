@@ -1,109 +1,103 @@
-"""Place and home pose management for the pipeline orchestrator.
+"""Loader, validator, and Pose builder for the hardcoded place/home poses.
 
-Loads target poses from place_poses.yml and provides helpers for building
-safe-Z transit waypoints used by plan_place().
-
-YAML schema (config/place_poses.yml):
-  transit_z: 0.35               # safe transit height in metres (base_link Z)
-  home_joint_config: [pan, lift, elbow, w1, w2, w3]  # 6 joint angles (rad)
-  storage_1:                    # simple place target
-    xyz: [x, y, z]
-    quat_xyzw: [qx, qy, qz, qw]
-  bookshelf:                    # bookshelf-style target with insert/retract
-    pre_insert:
-      xyz: [x, y, z]
-      quat_xyzw: [qx, qy, qz, qw]
-    insert_depth_m: 0.22
-    retract_depth_m: 0.22
-
-Note: home is reached by a c-space (joint-space) plan, not IK, so the arm
-always settles in the same posture rather than a random IK branch.
-Tune home_joint_config with: ros2 run team_8 home_config_tuner
+Reads config/place_poses.yml. Kept dependency-light (yaml + a guarded
+geometry_msgs import) so it can be unit-tested without a live ROS graph,
+mirroring pipeline_utils.py.
 """
 
-import os
+from os import PathLike
 from pathlib import Path
 
-import numpy as np
 import yaml
 
-try:
-    from ament_index_python.packages import get_package_share_directory
-    _PKG = 'team_8'
-except ImportError:
-    get_package_share_directory = None
-    _PKG = None
-
-try:
+try:  # pragma: no cover - geometry_msgs only present in the ROS runtime
     from geometry_msgs.msg import Pose
-except ImportError:
+except ImportError:  # pragma: no cover - import-only test fallback
     Pose = None
 
 
-def _default_yaml_path() -> Path:
-    if get_package_share_directory is not None and _PKG is not None:
-        try:
-            share = get_package_share_directory(_PKG)
-            return Path(share) / 'config' / 'place_poses.yml'
-        except Exception:
-            pass
-    # Fallback for testing without ROS install
-    return Path(__file__).parent.parent / 'config' / 'place_poses.yml'
+def load_place_poses(path: "str | PathLike") -> dict:
+    """Parse place_poses.yml into a plain dict, validating its structure.
 
-
-def load_place_poses(path: str | None = None) -> dict:
-    """Parse place_poses.yml and validate required fields.
-
-    Returns the raw dict so callers can inspect transit_z and target entries.
+    Data-driven: requires a numeric ``transit_z`` and a ``home_joint_config``
+    (six joint angles; home is reached by a c-space plan, not an IK pose). Every
+    other top-level entry is validated as either a simple xyz/quat target or a
+    bookshelf-style entry (``pre_insert`` + numeric insert/retract depths).
+    Raises ValueError on any malformed entry.
     """
-    yaml_path = Path(path) if path else _default_yaml_path()
-    if not yaml_path.exists():
-        raise FileNotFoundError(
-            f'place_poses.yml not found at {yaml_path}. '
-            'Copy config/place_poses.yml.example and fill in your robot poses.')
-
-    with open(yaml_path, 'r') as f:
-        data = yaml.safe_load(f)
-
+    data = yaml.safe_load(Path(path).read_text())
     if not isinstance(data, dict):
-        raise ValueError('place_poses.yml must be a YAML mapping.')
-    if 'transit_z' not in data or not isinstance(data['transit_z'], (int, float)):
-        raise ValueError('place_poses.yml must have a numeric transit_z field.')
-    _validate_home_joint_config(data.get('home_joint_config'))
-
+        raise ValueError(f"place_poses file is not a mapping: {path}")
+    if not isinstance(data.get("transit_z"), (int, float)):
+        raise ValueError("place_poses: 'transit_z' must be a number")
+    if "transit_floor_z" in data and not isinstance(
+            data["transit_floor_z"], (int, float)):
+        raise ValueError("place_poses: 'transit_floor_z' must be a number")
+    _validate_home_joint_config(data.get("home_joint_config"))
+    # Optional scalar (non-pose) config keys skipped by the per-target validation.
+    scalar_keys = {"transit_z", "transit_floor_z", "home_joint_config"}
+    for name, entry in data.items():
+        if name in scalar_keys:
+            continue
+        if _looks_like_bookshelf(entry):
+            _validate_xyzquat(entry.get("pre_insert"), f"{name}.pre_insert")
+            for key in ("insert_depth_m", "retract_depth_m"):
+                if not isinstance(entry.get(key), (int, float)):
+                    raise ValueError(
+                        f"place_poses: '{name}.{key}' must be a number")
+        else:
+            _validate_xyzquat(entry, name)
     return data
 
 
+def _looks_like_bookshelf(entry) -> bool:
+    return isinstance(entry, dict) and "pre_insert" in entry
+
+
+def is_bookshelf_target(data, key) -> bool:
+    """True when *key* resolves to a bookshelf-style entry (insert/retract)."""
+    entry = data.get(key)
+    return _looks_like_bookshelf(entry) and "insert_depth_m" in entry
+
+
 def _validate_home_joint_config(entry) -> None:
-    """Raise ValueError unless entry is a list of six numeric joint angles."""
+    """Raise ValueError unless *entry* is a list of six numeric joint angles."""
     if entry is None:
-        raise ValueError("place_poses.yml: missing 'home_joint_config'")
+        raise ValueError("place_poses: missing 'home_joint_config'")
     if not (isinstance(entry, list) and len(entry) == 6):
         raise ValueError(
-            "place_poses.yml: 'home_joint_config' must be a 6-element list of "
-            "joint angles [pan, lift, elbow, wrist_1, wrist_2, wrist_3]")
+            "place_poses: 'home_joint_config' must be a 6-list of joint angles")
     if not all(isinstance(v, (int, float)) for v in entry):
         raise ValueError(
-            "place_poses.yml: 'home_joint_config' values must all be numbers")
+            "place_poses: 'home_joint_config' values must all be numbers")
 
 
-def get_home_joint_config(data: dict) -> list[float]:
+def get_home_joint_config(data) -> list:
     """Return the six home joint angles as a list of floats.
 
-    Order matches the cuRobo cspace joint_names:
-    [pan, lift, elbow, wrist_1, wrist_2, wrist_3].
+    Order matches the cuRobo cspace joint_names
+    (pan, lift, elbow, wrist_1, wrist_2, wrist_3).
     """
-    return [float(v) for v in data['home_joint_config']]
+    return [float(v) for v in data["home_joint_config"]]
 
 
-def is_bookshelf_target(cfg: dict, goal_name: str) -> bool:
-    """Return True if goal_name is a bookshelf-style entry (has pre_insert)."""
-    entry = cfg.get(goal_name, {})
-    return isinstance(entry, dict) and 'pre_insert' in entry
+def _validate_xyzquat(entry, label) -> None:
+    """Raise ValueError if *entry* lacks a valid xyz (3) / quat_xyzw (4) pair."""
+    if not isinstance(entry, dict):
+        raise ValueError(f"place_poses: '{label}' must be a mapping")
+    xyz = entry.get("xyz")
+    quat = entry.get("quat_xyzw")
+    if not (isinstance(xyz, list) and len(xyz) == 3):
+        raise ValueError(f"place_poses: '{label}.xyz' must be a 3-list")
+    if not (isinstance(quat, list) and len(quat) == 4):
+        raise ValueError(f"place_poses: '{label}.quat_xyzw' must be a 4-list")
 
 
-def pose_from_xyzquat(xyz, quat_xyzw) -> 'Pose | None':
-    """Build a geometry_msgs/Pose from xyz + quaternion (x,y,z,w)."""
+def pose_from_xyzquat(xyz, quat_xyzw):
+    """Build a geometry_msgs/Pose from xyz + (x, y, z, w) quaternion.
+
+    Returns None when geometry_msgs is unavailable (import-only test fallback).
+    """
     if Pose is None:
         return None
     pose = Pose()
@@ -117,71 +111,43 @@ def pose_from_xyzquat(xyz, quat_xyzw) -> 'Pose | None':
     return pose
 
 
-def resolve_target_pose(cfg: dict, goal_name: str) -> 'Pose | None':
-    """Return the geometry_msgs/Pose for goal_name.
+def resolve_target_pose(data, target):
+    """Return the geometry_msgs/Pose for a target name.
 
-    For bookshelf targets, returns the pre_insert pose (arm approaches here,
-    then insert_trajectory pushes to final depth).
+    Bookshelf targets resolve to their ``pre_insert`` pose; simple targets to
+    their ``xyz``/``quat_xyzw``. Raises KeyError for an unknown target name.
     """
-    entry = cfg.get(goal_name)
-    if entry is None:
-        raise KeyError(f'goal_name {goal_name!r} not found in place_poses.yml')
-
-    if is_bookshelf_target(cfg, goal_name):
-        sub = entry['pre_insert']
-        return pose_from_xyzquat(sub['xyz'], sub['quat_xyzw'])
-
-    return pose_from_xyzquat(entry['xyz'], entry['quat_xyzw'])
+    if target not in data:
+        raise KeyError(f"unknown target '{target}'")
+    entry = data[target]
+    if _looks_like_bookshelf(entry):
+        entry = entry["pre_insert"]
+    return pose_from_xyzquat(entry["xyz"], entry["quat_xyzw"])
 
 
-def build_transit_waypoints(
-    current_xyz: list | tuple,
-    target_pose: 'Pose',
-    transit_z: float,
-) -> list:
-    """Build three waypoint Poses for a safe-Z transit.
+def build_transit_waypoints(current_xyz, current_quat_xyzw,
+                            place_xyz, place_quat_xyzw, transit_z):
+    """Three tool0 targets for the rule-based safe-z transit.
 
-    Sequence:
-      1. Lift   — same XY as current, Z = max(current_z, transit_z)
-      2. Transit — target XY at transit_z height, target orientation
-      3. Descend — target pose
+    1. lift straight up to ``transit_z`` (keep current xy + orientation)
+    2. traverse to above the place xy at ``transit_z`` (place orientation)
+    3. descend to the full place pose
 
-    The lift step uses target orientation to avoid reorienting while carrying
-    the object.  All waypoints are geometry_msgs/Pose.
+    The lift height is ``max(current_z, transit_z)`` so the carried object is
+    never driven *down* when the post-pick pose already sits above ``transit_z``.
+
+    Returns a list of ``(xyz, quat_xyzw)`` tuples (plain Python lists).
     """
-    if Pose is None:
-        raise ImportError('geometry_msgs is required for build_transit_waypoints')
-
-    cur_x, cur_y, cur_z = float(current_xyz[0]), float(current_xyz[1]), float(current_xyz[2])
-    tgt_x = target_pose.position.x
-    tgt_y = target_pose.position.y
-    tgt_z = target_pose.position.z
-    lift_z = max(cur_z, float(transit_z))
-
-    orient = target_pose.orientation  # keep target orientation throughout transit
-
-    def _pose(x, y, z):
-        p = Pose()
-        p.position.x = float(x)
-        p.position.y = float(y)
-        p.position.z = float(z)
-        p.orientation = orient
-        return p
-
-    return [
-        _pose(cur_x, cur_y, lift_z),   # 1. lift to safe height
-        _pose(tgt_x, tgt_y, transit_z),  # 2. traverse horizontally
-        _pose(tgt_x, tgt_y, tgt_z),    # 3. descend to target
-    ]
+    lift_z = max(float(current_xyz[2]), float(transit_z))
+    lift = ([float(current_xyz[0]), float(current_xyz[1]), lift_z],
+            [float(q) for q in current_quat_xyzw])
+    traverse = ([float(place_xyz[0]), float(place_xyz[1]), lift_z],
+                [float(q) for q in place_quat_xyzw])
+    descend = ([float(v) for v in place_xyz],
+               [float(q) for q in place_quat_xyzw])
+    return [lift, traverse, descend]
 
 
-def translate_pose_along_x(pose: 'Pose', delta_x: float) -> 'Pose':
-    """Return a copy of pose shifted delta_x metres along the base_link X-axis."""
-    if Pose is None:
-        raise ImportError('geometry_msgs is required')
-    p = Pose()
-    p.position.x = pose.position.x + float(delta_x)
-    p.position.y = pose.position.y
-    p.position.z = pose.position.z
-    p.orientation = pose.orientation
-    return p
+def translate_pose_x(xyz, dx):
+    """Return *xyz* translated by *dx* along base_link +x (y, z unchanged)."""
+    return [float(xyz[0]) + float(dx), float(xyz[1]), float(xyz[2])]
