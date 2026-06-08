@@ -17,14 +17,9 @@ services:
       #   pose 3: [-0.714, -1.338,  0.707, -0.768, -1.327, -0.699]
       - PIPELINE_SCAN_POSES=-1.332,-2.402,1.538,-0.863,-1.114,-1.292
 
-      # ── Gemini detection quality gate ────────────────────────────────────
-      # Reject Gemini detections below this confidence (0.0–1.0).
-      # 0.8 requires the model to be fairly certain the object is present;
-      # detections on absent objects typically score <0.5.
-      - PIPELINE_GEMINI_MIN_CONFIDENCE=0.8
-      # Maximum number of Gemini API calls per segmentation request.
-      # If attempt 1 returns low confidence, attempt 2 adds a re-check note.
-      - PIPELINE_GEMINI_MAX_ATTEMPTS=2
+      # ── Gemini detection ─────────────────────────────────────────────────
+      # Gemini returns a JSON list of detections; the first entry is used.
+      # No confidence-gate retry: single-shot detection matches upstream main.
 
       # Table surface measured with depth camera: histogram peak = -0.089 m (base_link).
       - PIPELINE_FLOOR_Z=-0.089
