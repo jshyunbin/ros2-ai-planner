@@ -460,9 +460,43 @@ class CuRobo:
                 self._logger.warn('CuRobo.plan_pick: no grasp candidates given.')
                 return None
 
+            # ── Floor z-clamp: prevent descent below table ───────────────────
+            # GraspGen may output grasp heights slightly below the kinematic
+            # filter threshold.  Apply the same two-component clamp as the old
+            # direct-to-grasp path so the gripper never collides with the table
+            # during Phase-2 (cleared-world) descent.
+            # Note: the standoff goalset (Phase-1) is automatically safe because
+            # standoff positions are `standoff` metres higher than the clamped
+            # grasp pose, well above any floor collision risk.
+            floor_z = _env_float('PIPELINE_FLOOR_Z', -0.07)
+            descent_margin = _env_float('PIPELINE_CUROBO_DESCENT_MARGIN', 0.030)
+            gripper_body_clearance = _env_float(
+                'PIPELINE_CUROBO_GRIPPER_BODY_CLEARANCE', 0.06)
+            min_tool_z_abs = floor_z + gripper_body_clearance
+            clamped_candidates = []
+            for c in candidates:
+                mat = _tool_pose_from_grasp_tcp(_candidate_pose_4x4(c))
+                approach_z = abs(float(mat[2, 2]))
+                min_tool_z_tilt = (floor_z
+                                   + approach_z * _FINGERTIP_LEN
+                                   + descent_margin * approach_z)
+                min_tool_z = max(min_tool_z_tilt, min_tool_z_abs)
+                original_z = float(mat[2, 3])
+                clamped_z = max(original_z, min_tool_z)
+                if clamped_z > original_z + 1e-4:
+                    mat = mat.copy()
+                    mat[2, 3] = clamped_z
+                    self._logger.info(
+                        f'CuRobo.plan_pick: candidate z clamped '
+                        f'{original_z:.3f} → {clamped_z:.3f}m '
+                        f'(floor={floor_z:.3f} approach_z={approach_z:.2f})')
+                # Store as (original_candidate, clamped_tool0_mat) pair
+                clamped_candidates.append((c, mat))
+
             # Phase 1: approach to pre-grasp standoff goalset (TSDF world)
             standoff = _pick_pregrasp_standoff()
-            pregrasp = self._grasps_to_goalset(candidates, tool_z_offset=-standoff)
+            pregrasp = self._grasps_to_goalset(
+                [c for c, _ in clamped_candidates], tool_z_offset=-standoff)
             collision_links = _pick_disable_collision_links(self._planner)
             _reset_planner_seed(self._planner)
             self._planner.disable_link_collision(collision_links)
@@ -485,14 +519,14 @@ class CuRobo:
             idx = _goalset_index(approach)
             if idx is None:
                 idx = 0
-            chosen = candidates[idx]
+            _chosen_candidate, grasp_tool = clamped_candidates[idx]
             approach_jt = interp_traj_to_ros(
                 approach.get_interpolated_plan(),
                 last_tstep=getattr(approach, 'interpolated_last_tstep', None),
             )
 
             # Phase 2: descent to grasp + lift on cleared world
-            grasp_tool = _tool_pose_from_grasp_tcp(_candidate_pose_4x4(chosen))
+            # Use the clamped tool0 matrix directly (floor-safe height)
             lift_offset = _pick_lift_offset()
             lift_tool = grasp_tool.copy()
             lift_tool[:3, 3] += np.array([0.0, 0.0, lift_offset], dtype=np.float32)
