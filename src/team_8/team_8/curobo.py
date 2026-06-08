@@ -1087,16 +1087,22 @@ class CuRobo:
             # Default is 2 which is too small; 'primitive' is the cuRobo key for cuboids.
             'primitive': 10,
         }
+        # CUDA graph: pre-compiles GPU kernels → ~2-3× faster planning per call
+        # after warmup.  Enabled by default; disable if cuRobo aborts with CUDA
+        # graph capture errors (set PIPELINE_CUROBO_USE_CUDA_GRAPH=false).
+        use_graph = _env_bool('PIPELINE_CUROBO_USE_CUDA_GRAPH', True)
         config = MotionPlannerCfg.create(
             robot=UR5_CONFIG,
             scene_model='collision_test.yml',
             collision_cache=collision_cache,
             max_goalset=TOPK_GRASPS,
-            use_cuda_graph=_env_bool('PIPELINE_CUROBO_USE_CUDA_GRAPH', False),
+            use_cuda_graph=use_graph,
         )
         planner = MotionPlanner(config)
-        use_graph = _env_bool('PIPELINE_CUROBO_USE_CUDA_GRAPH', False)
-        planner.warmup(enable_graph=use_graph, num_warmup_iterations=3)
+        # More warmup iterations → more CUDA kernel paths pre-compiled.
+        # 5 covers pick (multi-goal), lift, and place trajectories.
+        warmup_iters = _env_int('PIPELINE_CUROBO_WARMUP_ITERS', 5)
+        planner.warmup(enable_graph=use_graph, num_warmup_iterations=warmup_iters)
         return planner
 
     def _configure_mapper_cuda_graphs(self) -> None:

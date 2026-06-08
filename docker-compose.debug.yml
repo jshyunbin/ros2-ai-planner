@@ -44,12 +44,13 @@ services:
       - PIPELINE_BASKET_WALL_TOP=0.20
 
       # ── Gripper close position ───────────────────────────────────────────
-      # Robotiq 2F-85: 0.0 = fully open, 0.8 = fully closed.
-      # Fully closed (0.8) embeds thin objects into the finger mesh in Gazebo
-      # (position-controlled, no force feedback).  0.6 grips firmly enough
-      # while leaving ~1 cm clearance so objects aren't squeezed into the mesh.
-      # Tune up/down by 0.05 if grip is too loose or still embedding.
-      - PIPELINE_GRIPPER_CLOSE_POSITION=0.6
+      # Robotiq 2F-85: 0.0 = fully open (~85mm gap), 0.804 = fully closed (0mm).
+      # Fingertip gap ≈ 85mm × (1 − θ/0.804).
+      #   0.6 rad ≈ 21mm gap → embeds objects wider than 21mm (coke can=66mm NG)
+      #   0.5 rad ≈ 32mm gap → grips banana/hammer, friction holds coke/meat can
+      #   0.4 rad ≈ 43mm gap → very light grip, safe for wide objects
+      # Tune up if objects drop, tune down if fingers embed into object mesh.
+      - PIPELINE_GRIPPER_CLOSE_POSITION=0.5
 
       # ── Preclose nudge ───────────────────────────────────────────────────
       # The nudge continues joint motion in the descent direction past the
@@ -104,6 +105,16 @@ services:
       # value are tried first.  0.85 ≈ grasps within 32° of straight-down.
       # If tier-0 produces no plan, cuRobo falls back to all candidates.
       - PIPELINE_CUROBO_TIER0_MIN_APPROACH_Z=0.85
+
+      # ── cuRobo GPU / CUDA graph ───────────────────────────────────────────────
+      # CUDA graphs pre-compile GPU kernels → ~2-3× faster planning per call.
+      # Default true.  Set false only if cuRobo aborts with graph capture errors.
+      - PIPELINE_CUROBO_USE_CUDA_GRAPH=true
+      # Warmup iterations at startup: more = more kernel paths pre-compiled.
+      - PIPELINE_CUROBO_WARMUP_ITERS=5
+      # Home joint config for "already at home?" check in orchestrator.
+      # Must match home_joint_config in place_poses.yml.
+      - PIPELINE_HOME_JOINT_CONFIG=0.0,-1.8,1.0,-1.0,-1.65,0.0
 
       # ── Destination mapping (Gemini → place_poses.yml goal names) ────────────
       # storage_1 = left basket, storage_2 = right basket (override if needed).

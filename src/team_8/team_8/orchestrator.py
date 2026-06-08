@@ -88,10 +88,13 @@ except ImportError:
 # Robotiq 2F-85 gripper constants (from challenge_constants.py / yeina).
 _GRIPPER_JOINT = 'robotiq_85_left_knuckle_joint'
 _GRIPPER_OPEN = 0.0
-# Do NOT set to 0.8 (fully closed): position-controlled gripper ignores contact
-# force and embeds thin objects into the finger mesh.  0.6 rad grips firmly
-# without interpenetration.  Override with PIPELINE_GRIPPER_CLOSE_POSITION.
-_GRIPPER_CLOSED = _env_float('PIPELINE_GRIPPER_CLOSE_POSITION', 0.6)
+# Robotiq 2F-85 max joint = 0.804 rad → fingertip gap ≈ 85mm × (1 - θ/0.804).
+# 0.8 = fully closed (0mm gap, always embeds).
+# 0.6 ≈ 21mm gap — too small; embeds objects wider than ~21mm (coke can=66mm).
+# 0.5 ≈ 32mm gap — grips objects up to ~32mm (banana, hammer handle) firmly;
+#        for wider objects (coke can) friction alone holds at lighter contact.
+# Override with PIPELINE_GRIPPER_CLOSE_POSITION.
+_GRIPPER_CLOSED = _env_float('PIPELINE_GRIPPER_CLOSE_POSITION', 0.5)
 
 # Destination → place_poses.yml goal_name mapping.
 # Set PIPELINE_PLACE_GOAL_STORAGE_1 / _STORAGE_2 to override defaults.
@@ -1028,19 +1031,57 @@ class PipelineOrchestrator(Node):
             'Published /curobo/reset_map — TSDF cleared after arm movement.')
 
     def _home_before_capture(self) -> None:
-        """Move the arm to the home pose so the wrist camera faces straight down."""
+        """Move the arm to the home pose so the wrist camera faces straight down.
+
+        Skips the move (and the associated TSDF reset) if the arm is already
+        within HOME_JOINT_TOLERANCE rad of every home joint angle — avoids the
+        5-10 s planning + execution overhead on the very first task.
+        """
+        if self._is_at_home():
+            self.get_logger().info(
+                'Arm already at home pose — skipping home move.')
+            return
         self.get_logger().info('Moving to home pose before capture...')
         response = self._call_curobo_goal_name('home')
         if response is None:
-            self.get_logger().warn(
+            self.get_logger().warning(
                 'Home-before-capture planning failed; continuing without home move.')
             return
         try:
             self._send_and_wait(self._arm_client, response.trajectory, 'home')
             self._reset_tsdf_after_move()
         except Exception as exc:
-            self.get_logger().warn(
+            self.get_logger().warning(
                 f'Home-before-capture execution failed (non-fatal): {exc}')
+
+    # Tolerance (rad) for considering each joint "at home".
+    _HOME_JOINT_TOL = 0.05  # ~3°
+
+    def _is_at_home(self) -> bool:
+        """Return True if all arm joints are within tolerance of home_joint_config."""
+        if self._latest_joints is None:
+            return False
+        # Fetch home config from curobo_service's place_poses.yml via the
+        # orchestrator's own knowledge of PIPELINE_HOME_JOINT_CONFIG env, or
+        # fall back to the Gazebo startup pose used throughout this package.
+        home_cfg = _home_joint_config_from_env()
+        if home_cfg is None:
+            return False
+        try:
+            names = list(self._latest_joints.name)
+            arm_joints = [
+                'shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint',
+                'wrist_1_joint', 'wrist_2_joint', 'wrist_3_joint',
+            ]
+            for joint, target in zip(arm_joints, home_cfg):
+                if joint not in names:
+                    return False
+                actual = float(self._latest_joints.position[names.index(joint)])
+                if abs(actual - target) > self._HOME_JOINT_TOL:
+                    return False
+            return True
+        except Exception:
+            return False
 
     def _plan_and_execute_place(self, goal_name: str) -> None:
         """Transit to place destination, release gripper, handle bookshelf moves."""
@@ -1203,6 +1244,25 @@ def _load_default_scan_poses() -> list[_ScanPose]:
             )
         poses.append(_ScanPose(angles))
     return poses
+
+
+def _home_joint_config_from_env() -> list[float] | None:
+    """Return home joint config from env var or package default.
+
+    Reads PIPELINE_HOME_JOINT_CONFIG (comma-separated 6 floats) if set,
+    otherwise falls back to the Gazebo startup pose baked into place_poses.yml.
+    Returns None if the value cannot be parsed.
+    """
+    raw = os.environ.get('PIPELINE_HOME_JOINT_CONFIG', '').strip()
+    if raw:
+        try:
+            vals = [float(v) for v in raw.split(',')]
+            if len(vals) == 6:
+                return vals
+        except ValueError:
+            pass
+    # Fall back to the compile-time default used in place_poses.yml.
+    return [0.0, -1.8, 1.0, -1.0, -1.65, 0.0]
 
 
 def main(args=None) -> None:
