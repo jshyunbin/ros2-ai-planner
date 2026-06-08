@@ -137,7 +137,7 @@ class PipelineOrchestrator(Node):
         self.declare_parameter('enable_post_task_verification', True)
         self.declare_parameter('verification_settle_sec', 1.0)
         self.declare_parameter('verification_frame_timeout_sec', 3.0)
-        self.declare_parameter('max_task_attempts', 2)
+        self.declare_parameter('max_task_attempts', 3)
         self.declare_parameter(
             'verification_result_topic', self.TASK_VERIFICATION_TOPIC)
         self.declare_parameter(

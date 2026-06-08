@@ -129,7 +129,7 @@ def generate_launch_description() -> LaunchDescription:
                         "enable_post_task_verification": True,
                         "verification_settle_sec": 1.0,
                         "verification_frame_timeout_sec": 3.0,
-                        "max_task_attempts": 2,
+                        "max_task_attempts": 3,
                         "verification_result_topic": "/gemini/task_verification",
                         "verification_debug_dir": "/artifacts/task_verification",
                     }
