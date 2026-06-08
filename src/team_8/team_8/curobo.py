@@ -431,220 +431,98 @@ class CuRobo:
                 grasp_candidates, joint_states, object_cloud=object_cloud)
 
     def _plan_pick_locked(self, grasp_candidates, joint_states, object_cloud=None):
-        """Plan directly to each GraspGenX grasp pose (no pre-grasp + descent).
+        """Two-phase pick planning (pre-grasp standoff + single-goal descent).
 
-        Strategy
-        --------
-        1. Convert all candidates to tool0 poses and apply a floor z-clamp.
-        2. Carve the TSDF around the object bbox **and** around every grasp
-           tool0 position (sphere of radius PIPELINE_CUROBO_GRASP_SPHERE_CARVE_RADIUS,
-           default 0.15 m).  This removes TSDF noise right at the grasp site so
-           that cuRobo's collision checker does not reject start/end states that
-           are actually valid.
-        3. Plan to the full goalset (all candidates simultaneously) with fingertip
-           collision links disabled.  cuRobo picks the kinematically easiest
-           candidate automatically.
-        4. If the carved-TSDF plan fails, retry with a fully cleared world
-           (neighbor collision risk, but a complete pick failure is worse).
-        5. Lift with a cleared world (arm at grasp pose is adjacent to TSDF
-           voxels; keeping them causes "start-state-in-collision").
+        Phase 1 — Approach to pre-grasp standoff (live TSDF world)
+        -----------------------------------------------------------
+        Plan a goalset of all candidates backed off ``standoff`` metres along
+        each candidate's tool +z.  cuRobo selects the easiest-to-reach candidate
+        automatically.  Using standoff poses instead of final grasp poses keeps
+        the goalset goals collision-free (the gripper isn't yet touching the
+        object), which dramatically reduces the plan_pose batch time compared to
+        planning directly to grasp poses (138 s → ~10 s).
+
+        Phase 2 — Descent to grasp + lift (cleared world)
+        --------------------------------------------------
+        The winning standoff candidate's descent and lift are single-goal plans
+        on a cleared world.  Single-goal plans are ~3 s each.  The cleared world
+        is necessary because the gripper is intentionally making contact and
+        would otherwise be flagged as start/end-state-in-collision.
         """
         try:
             t0 = time.perf_counter()
             self.update_joint_state(joint_states)
+            self._update_world_from_tsdf()
+            t_world = time.perf_counter()
 
             candidates = list(grasp_candidates)[:TOPK_GRASPS]
             if not candidates:
                 self._logger.warn('CuRobo.plan_pick: no grasp candidates given.')
                 return None
 
-            # ── Build tool0 poses for all candidates, apply floor z-clamp ──────
-            # Two-component clamp:
-            #
-            # 1. Tilt-scaled component: fingertip only descends approach_z × _FINGERTIP_LEN
-            #    in world-Z for a tilted approach, so the minimum is lower than vertical.
-            #    approach_z = |mat[2,2]| = cos(tilt from vertical)
-            #      vertical  → 1.0 → full _FINGERTIP_LEN applied
-            #      45° tilt  → 0.71 → ~71 % applied
-            #      60° tilt  → 0.50 → 50 % applied
-            #
-            # 2. Absolute minimum: gripper BODY parts (not just fingertip) can protrude
-            #    below tool0 for tilted grasps. A hard lower bound on tool0-z prevents
-            #    the palm / link geometry from colliding with the table regardless of tilt.
-            #
-            # The effective clamp is the maximum of both components.
-            floor_z = _env_float('PIPELINE_FLOOR_Z', -0.07)
-            descent_margin = _env_float('PIPELINE_CUROBO_DESCENT_MARGIN', 0.030)
-            # Absolute clearance: tool0 always at least this far above floor_z.
-            # 0.06 m ensures gripper body clears the table for any tilt angle.
-            gripper_body_clearance = _env_float(
-                'PIPELINE_CUROBO_GRIPPER_BODY_CLEARANCE', 0.06)
-            min_tool_z_abs = floor_z + gripper_body_clearance
-
-            grasp_tool_mats = []   # (4,4) tool0 pose in base_link for each candidate
-            for c in candidates:
-                mat = _tool_pose_from_grasp_tcp(_candidate_pose_4x4(c))
-                # |mat[2,2]| = world-Z component of tool local-Z axis
-                approach_z = abs(float(mat[2, 2]))
-                effective_fingertip_drop = approach_z * _FINGERTIP_LEN
-                # Scale margin by approach_z too: for a horizontal grasp the
-                # fingers barely move in world-Z during closure, so the safety
-                # margin is also proportionally smaller.
-                effective_margin = descent_margin * approach_z
-                min_tool_z_tilt = floor_z + effective_fingertip_drop + effective_margin
-                # Take the stricter of the two bounds.
-                min_tool_z = max(min_tool_z_tilt, min_tool_z_abs)
-                original_z = float(mat[2, 3])
-                clamped_z = max(original_z, min_tool_z)
-                if clamped_z > original_z + 1e-4:
-                    mat = mat.copy()
-                    mat[2, 3] = clamped_z
-                    self._logger.info(
-                        f'CuRobo.plan_pick: candidate z clamped '
-                        f'{original_z:.3f} → {clamped_z:.3f}m '
-                        f'(floor={floor_z:.3f} approach_z={approach_z:.2f} '
-                        f'tilt_min={min_tool_z_tilt:.3f} '
-                        f'abs_min={min_tool_z_abs:.3f})')
-                grasp_tool_mats.append(mat)
-
-            # Positions used for TSDF sphere carving (one per candidate)
-            grasp_positions = [m[:3, 3] for m in grasp_tool_mats]
-
-            # ── Update TSDF world with aggressive carving around grasp sites ────
-            self._update_world_from_tsdf(
-                object_cloud=object_cloud, grasp_positions=grasp_positions)
-            t_world = time.perf_counter()
-
-            current = self._ros_js_to_curobo(joint_states)
+            # Phase 1: approach to pre-grasp standoff goalset (TSDF world)
+            standoff = _pick_pregrasp_standoff()
+            pregrasp = self._grasps_to_goalset(candidates, tool_z_offset=-standoff)
             collision_links = _pick_disable_collision_links(self._planner)
+            _reset_planner_seed(self._planner)
+            self._planner.disable_link_collision(collision_links)
+            current = self._ros_js_to_curobo(joint_states)
+            try:
+                approach = self._planner.plan_pose(pregrasp, current)
+            finally:
+                self._planner.enable_link_collision(collision_links)
+            torch.cuda.synchronize()
 
-            # ── Tiered planning: most-vertical candidates first ──────────────────
-            # cuRobo minimises joint-space travel cost over the entire goalset; it
-            # can therefore pick a tilted grasp simply because it requires fewer
-            # wrist rotations.  We solve this by trying a top-down-only tier first
-            # and only falling back to all candidates when that fails.
-            #
-            # Tier 0: approach_z >= TIER0_MIN_APPROACH_Z (default 0.85, ≈32° tilt)
-            # Tier 1: all candidates (fallback)
-            tier0_min_az = _env_float('PIPELINE_CUROBO_TIER0_MIN_APPROACH_Z', 0.85)
-            tier0_mats = [m for m in grasp_tool_mats
-                          if abs(float(m[2, 2])) >= tier0_min_az]
-            # Cap tier0 to a maximum batch size.  plan_pose optimises all goals
-            # simultaneously on GPU; a large batch increases memory pressure and
-            # planning time roughly linearly.  Take the most-vertical ones first
-            # (already sorted by approach_z descending from GraspGen ranking).
-            tier0_max = _env_int('PIPELINE_CUROBO_TIER0_MAX_CANDIDATES', 8)
-            if len(tier0_mats) > tier0_max:
-                tier0_mats = tier0_mats[:tier0_max]
-
-            # Build (mat_list, label) pairs in priority order.
-            plan_tiers: list[tuple[list, str]] = []
-            if tier0_mats and len(tier0_mats) < len(grasp_tool_mats):
-                plan_tiers.append((
-                    tier0_mats,
-                    f'tier0({len(tier0_mats)} top-down, '
-                    f'approach_z≥{tier0_min_az:.2f})',
-                ))
-            plan_tiers.append((
-                grasp_tool_mats,
-                f'all-candidates({len(grasp_tool_mats)})',
-            ))
-
-            grasp_result = None
-            winning_mats = grasp_tool_mats  # mats for the successful tier (idx lookup)
-            for tier_mats, tier_label in plan_tiers:
-                _reset_planner_seed(self._planner)
-                self._planner.disable_link_collision(collision_links)
-                try:
-                    r = self._planner.plan_pose(
-                        self._mats_to_goalset(tier_mats), current)
-                finally:
-                    self._planner.enable_link_collision(collision_links)
-                torch.cuda.synchronize()
-                if _result_success(r):
-                    grasp_result = r
-                    winning_mats = tier_mats
-                    self._logger.info(
-                        f'CuRobo.plan_pick: succeeded with {tier_label}')
-                    break
-                self._logger.info(
-                    f'CuRobo.plan_pick: {tier_label} failed, trying next tier.')
-
-            if not _result_success(grasp_result):
-                # Final fallback: clear only the object region (keep neighbour
-                # objects in the collision world so the arm doesn't sweep through
-                # them).  Full world clear is used only when object_cloud is None.
+            if not _result_success(approach):
+                status = getattr(approach, 'status', 'unknown')
                 self._logger.warn(
-                    'CuRobo.plan_pick: all TSDF tiers failed; '
-                    'retrying with object-region clear (neighbours preserved).')
-                self._clear_object_region(object_cloud)
-                _reset_planner_seed(self._planner)
-                self._planner.disable_link_collision(collision_links)
-                try:
-                    grasp_result = self._planner.plan_pose(
-                        self._mats_to_goalset(grasp_tool_mats), current)
-                finally:
-                    self._planner.enable_link_collision(collision_links)
-                torch.cuda.synchronize()
-                winning_mats = grasp_tool_mats
-
-            if not _result_success(grasp_result):
-                status = getattr(grasp_result, 'status', 'unknown')
-                self._logger.warn(
-                    'CuRobo.plan_pick: all planning attempts failed '
-                    f'(status={status}).')
+                    'CuRobo.plan_pick: pre-grasp goalset planning failed '
+                    f'(candidates={len(candidates)} standoff={standoff:.3f}m '
+                    f'status={status}).')
                 return None
 
-            t_grasp = time.perf_counter()
-            idx = _goalset_index(grasp_result)
+            t_pre = time.perf_counter()
+            idx = _goalset_index(approach)
             if idx is None:
                 idx = 0
-
-            grasp_jt = interp_traj_to_ros(
-                grasp_result.get_interpolated_plan(),
-                last_tstep=getattr(grasp_result, 'interpolated_last_tstep', None),
+            chosen = candidates[idx]
+            approach_jt = interp_traj_to_ros(
+                approach.get_interpolated_plan(),
+                last_tstep=getattr(approach, 'interpolated_last_tstep', None),
             )
 
-            # ── Lift: clear object region, then plan straight up ─────────────────
-            # Use object-region clear so neighbouring objects stay in the world.
-            # If that fails (rare: arm is squeezed between objects), fall back to
-            # full clear which guarantees a straight-up path.
+            # Phase 2: descent to grasp + lift on cleared world
+            grasp_tool = _tool_pose_from_grasp_tcp(_candidate_pose_4x4(chosen))
             lift_offset = _pick_lift_offset()
-            chosen_mat = winning_mats[idx]  # pose from the tier that succeeded
-            lift_tool = chosen_mat.copy()
+            lift_tool = grasp_tool.copy()
             lift_tool[:3, 3] += np.array([0.0, 0.0, lift_offset], dtype=np.float32)
 
-            self._clear_object_region(object_cloud)
+            self._clear_collision_world()
+            t_clear = time.perf_counter()
+            grasp_jt = self._plan_pose_segment(
+                grasp_tool, self._final_joint_state(approach_jt), 'grasp descent')
+            if grasp_jt is None:
+                return None
+            t_grasp = time.perf_counter()
             lift_jt = self._plan_pose_segment(
                 lift_tool, self._final_joint_state(grasp_jt), 'lift')
-            if lift_jt is None:
-                self._logger.warn(
-                    'CuRobo.plan_pick: lift with object-region clear failed; '
-                    'retrying with full world clear.')
-                self._clear_collision_world()
-                lift_jt = self._plan_pose_segment(
-                    lift_tool, self._final_joint_state(grasp_jt), 'lift')
             if lift_jt is None:
                 return None
             t_lift = time.perf_counter()
 
-            chosen_approach_z = abs(float(chosen_mat[2, 2]))
             self._logger.info(
-                'CuRobo.plan_pick succeeded (direct-to-grasp): '
-                f'total_candidates={len(candidates)} '
-                f'winning_tier_size={len(winning_mats)} '
-                f'chosen_idx={idx} '
-                f'chosen_approach_z={chosen_approach_z:.2f} '
-                f'chosen_tool0_z={float(chosen_mat[2, 3]):.3f}m '
-                f'lift={lift_offset:.3f}m '
-                f'(grasp={len(grasp_jt.points)}pts lift={len(lift_jt.points)}pts) '
+                'CuRobo.plan_pick succeeded: '
+                f'candidates={len(candidates)} chosen_idx={idx} '
+                f'standoff={standoff:.3f}m lift={lift_offset:.3f}m '
+                f'(approach={len(approach_jt.points)}pts '
+                f'grasp={len(grasp_jt.points)}pts lift={len(lift_jt.points)}pts) '
                 f'timing[s]: world={t_world - t0:.2f} '
-                f'grasp={t_grasp - t_world:.2f} '
+                f'pregrasp={t_pre - t_world:.2f} '
+                f'clear={t_clear - t_pre:.2f} '
+                f'descent={t_grasp - t_clear:.2f} '
                 f'lift={t_lift - t_grasp:.2f} total={t_lift - t0:.2f}')
-            # grasp=None signals to curobo_service that approach already ends at
-            # the grasp pose (no separate descent phase to concatenate).
             return PickPlan(
-                approach=grasp_jt, grasp=None, lift=lift_jt,
+                approach=approach_jt, grasp=grasp_jt, lift=lift_jt,
                 goalset_index=idx)
         except Exception as exc:
             self._logger.error(f'CuRobo.plan_pick error: {exc}')
@@ -664,8 +542,16 @@ class CuRobo:
         _reset_planner_seed(self._planner)
         if in_branch:
             return self._plan_inbranch_cspace(goal_mat, current_state, name)
+        # Disable PRM graph-seeding: against a dense TSDF world the graph search
+        # is slow and silent (no per-iteration log), and was responsible for the
+        # "startup home hang" (25 s+). Setting enable_graph_attempt to a large
+        # value means a failed trajopt falls through immediately to the next
+        # world mode ('relaxed') instead of spending minutes in the graph search.
+        graph_attempt = 1 if _env_bool(
+            'PIPELINE_CUROBO_TRAJ_ENABLE_GRAPH', False) else 1_000_000
         result = self._planner.plan_pose(
-            self._tool_goal_from_matrix(goal_mat), current_state)
+            self._tool_goal_from_matrix(goal_mat), current_state,
+            enable_graph_attempt=graph_attempt)
         torch.cuda.synchronize()
         if not _result_success(result):
             status = getattr(result, 'status', 'unknown')
@@ -993,9 +879,13 @@ class CuRobo:
                 f'CuRobo: FK failed: {type(exc).__name__}: {exc}')
             return None
 
-    def _update_world_from_tsdf(
-        self, object_cloud=None, grasp_positions=None
-    ) -> bool:
+    def _update_world_from_tsdf(self) -> bool:
+        """Push the current TSDF ESDF into the cuRobo collision world.
+
+        No voxel carving — the pre-grasp standoff goalset approach makes
+        carving unnecessary (standoff positions are away from the object).
+        Single-goal descent/lift use _clear_collision_world() instead.
+        """
         with self._lock:
             frame_count = self._frame_count
             last_update = self._last_world_update_frame
@@ -1006,26 +896,16 @@ class CuRobo:
                 f'CuRobo: map not ready ({frame_count}/{required_frames} '
                 'dual-camera frames); planning in current/free collision model.')
             return False
-        if last_update == frame_count and object_cloud is None and grasp_positions is None:
+        if last_update == frame_count:
             return True
 
         torch.cuda.synchronize()
         voxel_grid = self._mapper.compute_esdf()
-
-        if object_cloud is not None:
-            voxel_grid = self._carve_object_from_voxel_grid(
-                voxel_grid, object_cloud, grasp_positions=grasp_positions)
-        elif grasp_positions is not None:
-            voxel_grid = self._carve_object_from_voxel_grid(
-                voxel_grid, None, grasp_positions=grasp_positions)
-
         try:
             self._planner.clear_scene_cache()
         except Exception:
             pass
-        self._planner.update_world(
-            SceneCfg(voxel=[voxel_grid],
-                     cuboid=self._build_static_cuboids()))
+        self._planner.update_world(SceneCfg(voxel=[voxel_grid]))
         torch.cuda.synchronize()
         with self._lock:
             self._last_world_update_frame = frame_count
@@ -1290,9 +1170,11 @@ class CuRobo:
                 'dims': [3.0, 3.0, 3.0],
                 'voxel_size': 0.015,
             },
-            # Pre-allocate cuboid slots for floor + basket_a + basket_b + margin.
-            # Default is 2 which is too small; 'primitive' is the cuRobo key for cuboids.
-            'primitive': 10,
+            # 'cuboid' is the correct cuRobo API key for cuboid cache slots.
+            # ('primitive' was incorrect and caused silent GPU realloc stalls.)
+            # 4 slots: the initial scene_model (2 cuboids) + transit floor (1)
+            # + one margin slot. Sized generously; cuboids are cheap.
+            'cuboid': 4,
         }
         # CUDA graph pre-compiles GPU kernels but requires a static collision
         # world — cuRobo must reset the graph every time the TSDF updates, and
@@ -1309,10 +1191,9 @@ class CuRobo:
             use_cuda_graph=use_graph,
         )
         planner = MotionPlanner(config)
-        # More warmup iterations → more CUDA kernel paths pre-compiled.
-        # 5 covers pick (multi-goal), lift, and place trajectories.
-        warmup_iters = _env_int('PIPELINE_CUROBO_WARMUP_ITERS', 5)
-        planner.warmup(enable_graph=use_graph, num_warmup_iterations=warmup_iters)
+        # 3 warmup iterations cover the standoff goalset, single-goal descent,
+        # and lift kernel paths. Reduced from 5 (saves ~2 warmup plan calls).
+        planner.warmup(enable_graph=use_graph, num_warmup_iterations=3)
         return planner
 
     def _configure_mapper_cuda_graphs(self) -> None:

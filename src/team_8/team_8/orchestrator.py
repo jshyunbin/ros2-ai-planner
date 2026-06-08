@@ -449,7 +449,9 @@ class PipelineOrchestrator(TimedLoggerMixin, Node):
         self._current_task = object_name
         self._scan_attempt_idx = 0
 
-        # Wait for TSDF to accumulate enough frames before doing anything.
+        # Wait for TSDF to accumulate enough frames — only on the first cycle.
+        # _curobo_ready_event is set once and never cleared (no reset_map),
+        # so subsequent cycles pass through immediately.
         if self._enable_motion_execution:
             if not self._wait_for_curobo_ready():
                 self.get_logger().error(
@@ -489,7 +491,6 @@ class PipelineOrchestrator(TimedLoggerMixin, Node):
                 self.get_logger().info(
                     f'Moved to scan pose #{scan_idx + 1}/{len(self._scan_poses)} '
                     f'positions={[round(float(p), 3) for p in pose.position]}.')
-                self._reset_tsdf_after_move()
             except Exception as exc:
                 self.get_logger().warn(f'move_to_scan_pose failed (non-fatal): {exc}')
 
@@ -1050,7 +1051,6 @@ class PipelineOrchestrator(TimedLoggerMixin, Node):
             return
         try:
             self._send_and_wait(self._arm_client, response.trajectory, 'home')
-            self._reset_tsdf_after_move()
         except Exception as exc:
             self.get_logger().warning(
                 f'Home-before-capture execution failed (non-fatal): {exc}')
@@ -1105,7 +1105,6 @@ class PipelineOrchestrator(TimedLoggerMixin, Node):
             self._send_and_wait(self._arm_client, retract_traj, 'bookshelf_retract')
 
         self.get_logger().info(f'Place to {goal_name!r} complete.')
-        self._reset_tsdf_after_move()
 
     def _plan_and_execute_home(self) -> None:
         """Move the arm back to home pose after place."""
@@ -1115,7 +1114,6 @@ class PipelineOrchestrator(TimedLoggerMixin, Node):
             raise RuntimeError('Return-home planning failed.')
         self._send_and_wait(self._arm_client, response.trajectory, 'return_home')
         self.get_logger().info('Returned to home pose.')
-        self._reset_tsdf_after_move()
 
 
 # ── Module-level helpers ──────────────────────────────────────────────────────
