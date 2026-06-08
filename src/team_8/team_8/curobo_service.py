@@ -20,6 +20,7 @@ CuRobo warmup runs in a background thread so the service is immediately
 advertised while the planner initialises.
 """
 
+import os
 import threading
 import time
 import traceback
