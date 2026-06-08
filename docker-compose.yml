@@ -18,7 +18,7 @@ services:
       ROS_LOCALHOST_ONLY: ${ROS_LOCALHOST_ONLY:-0}
       RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
       FASTDDS_BUILTIN_TRANSPORTS: ${FASTDDS_BUILTIN_TRANSPORTS:-UDPv4}
-      FASTRTPS_DEFAULT_PROFILES_FILE: /ros2_ws/config/fastdds_no_shm.xml
+      FASTRTPS_DEFAULT_PROFILES_FILE: /ros2_ws/config/${FASTDDS_PROFILE:-fastdds_no_shm.xml}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       GRASPGENX_REPO_DIR: /opt/GraspGenX
     volumes:
@@ -28,3 +28,24 @@ services:
     stdin_open: true
     tty: true
     command: ["ros2", "launch", "team_8", "deploy.launch.py"]
+
+  # Zenoh bridge — carries ROS2 traffic to the local (Gazebo) machine over a
+  # single TCP tunnel, since the campus network blocks DDS UDP / server->local
+  # is not directly reachable. This side LISTENS on tcp/0.0.0.0:7447; the local
+  # bridge connects to 143.248.116.101:7447. The bridge speaks plain localhost
+  # DDS on ROS_DOMAIN_ID 42 to discover the ai_planner nodes (network_mode:
+  # host shares the same loopback), then relays over zenoh.
+  zenoh_bridge:
+    image: eclipse/zenoh-bridge-ros2dds:latest
+    network_mode: host
+    environment:
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-42}
+      # The bridge must know the ROS distro of the nodes it bridges: Humble uses
+      # 24-byte GIDs, but the bridge defaults to 'iron' (16-byte) and then fails
+      # to parse ros_discovery_info. Must match the team_8 nodes (Humble).
+      ROS_DISTRO: humble
+    # -l: zenoh listen endpoint (this side is the TCP server)
+    # --no-multicast-scouting: rely on the explicit TCP endpoint, not UDP
+    #   multicast (which does not cross machines anyway).
+    command: ["-l", "tcp/0.0.0.0:7447", "--no-multicast-scouting", "--rest-http-port", "8000", "peer"]
+    restart: unless-stopped
