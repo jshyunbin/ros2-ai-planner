@@ -27,7 +27,7 @@ import yaml
 
 try:
     from ament_index_python.packages import get_package_share_directory
-    _PKG = 'pipeline_orchestrator'
+    _PKG = 'team_8'
 except ImportError:
     get_package_share_directory = None
     _PKG = None

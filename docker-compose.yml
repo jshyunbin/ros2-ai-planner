@@ -21,6 +21,7 @@ services:
       - ./config:/ros2_ws/config:ro
       - torch_cache:/root/.cache/torch
       - triton_cache:/root/.triton
+      - graspgen_ext:/opt/GraspGenX/ext
     ipc: host
     stdin_open: true
     tty: true
@@ -29,3 +30,4 @@ services:
 volumes:
   torch_cache:
   triton_cache:
+  graspgen_ext:

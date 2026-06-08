@@ -46,23 +46,38 @@ except ImportError:  # pragma: no cover - runtime dependency
 
 
 PROMPT_SCHEMA = {
-    "type": "ARRAY",
-    "items": {
-        "type": "OBJECT",
-        "properties": {
-            "box_2d": {
-                "type": "ARRAY",
-                "items": {"type": "INTEGER"},
-                "description": "Bounding box [ymin, xmin, ymax, xmax] scaled strictly from 0 to 1000.",
-            },
-            "label": {
-                "type": "STRING",
-                "description": "Descriptive text label of the detected item.",
-            },
+    "type": "OBJECT",
+    "properties": {
+        "found": {
+            "type": "BOOLEAN",
+            "description": "True if the target object is clearly visible in the image.",
         },
-        "required": ["box_2d", "label"],
+        "confidence": {
+            "type": "NUMBER",
+            "description": (
+                "Detection confidence 0.0–1.0. "
+                "Use 0.0 when found=false. "
+                "Only use >0.8 when the object is unambiguously identifiable."
+            ),
+        },
+        "box_2d": {
+            "type": "ARRAY",
+            "items": {"type": "INTEGER"},
+            "description": (
+                "Bounding box [ymin, xmin, ymax, xmax] each in 0–1000 range. "
+                "Omit or set to [] when found=false."
+            ),
+        },
+        "label": {
+            "type": "STRING",
+            "description": "Short label for the detected object. Empty string when found=false.",
+        },
     },
+    "required": ["found", "confidence"],
 }
+
+# Minimum Gemini confidence to accept a detection (below this → treated as not found).
+_GEMINI_MIN_CONFIDENCE = float(os.environ.get("PIPELINE_GEMINI_MIN_CONFIDENCE", "0.8"))
 
 
 def transform_to_matrix(msg) -> np.ndarray:
@@ -312,7 +327,7 @@ class SegmentationService(Node):
             api_width = int(api_image_bgr.shape[1])
             api_height = int(api_image_bgr.shape[0])
 
-            prompt_result = self._localize_prompt(api_image_bgr, prompt)
+            prompt_result = self._localize_prompt_with_retry(api_image_bgr, prompt)
             prompt_bbox_api = self._sanitize_detection_box(
                 prompt_result["box_2d"], api_width, api_height
             )
@@ -448,7 +463,31 @@ class SegmentationService(Node):
             response.data = json.dumps(failure_payload)
             return response
 
-    def _localize_prompt(self, image_bgr: np.ndarray, prompt: str) -> dict:
+    def _localize_prompt_with_retry(self, image_bgr: np.ndarray, prompt: str) -> dict:
+        """Call _localize_prompt up to 2 times.
+
+        If the first call returns low confidence (object may exist but Gemini
+        is uncertain), retry once with an explicit re-check instruction.
+        If both attempts fail, raise the last error.
+        """
+        max_gemini_attempts = int(os.environ.get("PIPELINE_GEMINI_MAX_ATTEMPTS", "2"))
+        last_exc: Exception | None = None
+        for attempt in range(1, max_gemini_attempts + 1):
+            try:
+                return self._localize_prompt(image_bgr, prompt, attempt=attempt)
+            except RuntimeError as exc:
+                last_exc = exc
+                self.get_logger().warn(
+                    f"Gemini attempt {attempt}/{max_gemini_attempts} failed: {exc}"
+                )
+        raise RuntimeError(str(last_exc))
+
+    def _localize_prompt(self, image_bgr: np.ndarray, prompt: str, *, attempt: int = 1) -> dict:
+        """Call Gemini to detect the target object in the image.
+
+        Returns a dict with keys label, box_2d, image_size on success.
+        Raises RuntimeError if the object is not found or confidence is too low.
+        """
         rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         pil_image = PILImage.fromarray(rgb)
         width = int(image_bgr.shape[1])
@@ -461,10 +500,20 @@ class SegmentationService(Node):
             temperature=0.1,
         )
 
+        retry_note = (
+            "\nIMPORTANT: A previous attempt returned low confidence. "
+            "Look very carefully — if the object is genuinely absent, return found=false."
+            if attempt > 1
+            else ""
+        )
         full_prompt = (
-            f"{prompt}\n"
-            "Return a JSON list. For each object, return the label and the 'box_2d' "
-            "as an array of exactly 4 integers: [ymin, xmin, ymax, xmax]."
+            f"Task: {prompt}\n"
+            "Look at the image carefully.\n"
+            "If the target object is NOT visible or you are not sure, set found=false and confidence=0.0.\n"
+            "Only set found=true and confidence>0.8 when the object is clearly and unambiguously present.\n"
+            "When found=true, provide box_2d as [ymin, xmin, ymax, xmax] in 0–1000 range.\n"
+            "Do NOT guess or hallucinate a bounding box if the object is absent."
+            + retry_note
         )
         response = self._gemini.models.generate_content(
             model=self._gemini_model,
@@ -472,12 +521,26 @@ class SegmentationService(Node):
             config=config,
         )
         payload = json.loads(response.text)
-        if not isinstance(payload, list) or not payload:
-            raise RuntimeError("Gemini returned no detections.")
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"Gemini returned unexpected format: {type(payload)}")
 
-        detection = payload[0]
-        label = str(detection.get("label", "")).strip() or "target"
-        box_2d = detection.get("box_2d", [])
+        found = bool(payload.get("found", False))
+        confidence = float(payload.get("confidence", 0.0))
+        label = str(payload.get("label", "")).strip() or "target"
+        box_2d = payload.get("box_2d") or []
+
+        self.get_logger().info(
+            f'Gemini detection: found={found} confidence={confidence:.2f} label="{label}"'
+        )
+
+        if not found or confidence < _GEMINI_MIN_CONFIDENCE:
+            reason = (
+                "object not found in image"
+                if not found
+                else f"confidence too low ({confidence:.2f} < {_GEMINI_MIN_CONFIDENCE})"
+            )
+            raise RuntimeError(f"Gemini: {reason}.")
+
         return {"label": label, "box_2d": box_2d, "image_size": [width, height]}
 
     def _scale_bbox(

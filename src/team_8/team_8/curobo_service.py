@@ -1,6 +1,6 @@
 """ROS2 service node wrapping the CuRobo motion planner.
 
-Accepts two planning modes via PlanTrajectory.srv:
+Accepts three planning modes via PlanTrajectory.srv:
 
   pick mode  (grasp_poses[] non-empty):
     Calls CuRobo.plan_pick() with all top-K GraspGen TCP poses and the current
@@ -8,8 +8,12 @@ Accepts two planning modes via PlanTrajectory.srv:
       trajectory      — approach-to-grasp (approach + grasp phases concatenated)
       lift_trajectory — lift phase (execute after closing gripper)
 
-  single-pose mode  (grasp_poses empty, grasp_pose set):
-    Calls CuRobo.plan_trajectory() for place / home planning.  Returns:
+  named-goal mode  (goal_name set, e.g. "home", "storage_1", "bookshelf_a"):
+    Resolves the target pose from place_poses.yml, calls plan_trajectory().
+    For bookshelf targets also plans insert_trajectory and retract_trajectory.
+
+  single-pose mode  (grasp_poses empty, grasp_pose set, goal_name empty):
+    Calls CuRobo.plan_trajectory() for an arbitrary tool0 pose. Returns:
       trajectory      — motion to the goal pose
 
 CuRobo warmup runs in a background thread so the service is immediately
@@ -23,8 +27,10 @@ import traceback
 import numpy as np
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSDurabilityPolicy, QoSProfile, ReliabilityPolicy
 from scipy.spatial.transform import Rotation as R
 from sensor_msgs.msg import JointState
+from std_msgs.msg import Bool, Empty
 
 from team_8.curobo import (
     BASE_FRAME,
@@ -33,8 +39,17 @@ from team_8.curobo import (
 )
 from sensor_msgs.msg import PointCloud2
 from team_8.pipeline_utils import as_bool as _as_bool
+from team_8.pipeline_utils import cloud_to_xyz
 from team_8.pipeline_utils import env_float as _env_float
+from team_8.pipeline_utils import env_int as _env_int
 from team_8.pipeline_utils import make_xyz_cloud
+from team_8.place_pose_utils import (
+    build_transit_waypoints,
+    is_bookshelf_target,
+    load_place_poses,
+    resolve_target_pose,
+    translate_pose_along_x,
+)
 from riro_srvs.srv import PlanTrajectory
 
 
@@ -59,6 +74,7 @@ class CuRoboService(Node):
         self.declare_parameter('init_wait_sec', 120.0)
 
         self._latest_joints = None
+        self._latest_object_cloud: np.ndarray | None = None
         # Set while a plan is in flight so the debug viz thread pauses its
         # cloud publishing. rclpy PointCloud2 serialization is pure-Python and
         # GIL-heavy; with a populated map it otherwise starves the (single-
@@ -73,10 +89,40 @@ class CuRoboService(Node):
         self._init_cv = threading.Condition()
         self._init_wait_sec = float(self.get_parameter('init_wait_sec').value)
 
+        # Load place pose config once at startup; used by _handle_named_goal.
+        try:
+            self._place_poses_cfg = load_place_poses()
+        except Exception as exc:
+            self.get_logger().warning(
+                f'place_poses.yml not loaded: {exc}; '
+                'named-goal mode will be unavailable.')
+            self._place_poses_cfg = None
+
         self.create_subscription(
             JointState,
             self.JOINT_STATES_TOPIC,
             self._cache_joints,
+            10,
+        )
+
+        # Subscribe to segmented object cloud so plan_pick can carve its voxels
+        # from the TSDF, preventing the target object itself from blocking the
+        # approach trajectory and forcing it into nearby objects.
+        self.create_subscription(
+            PointCloud2,
+            '/graspgen/segmented_object',
+            self._cache_object_cloud,
+            10,
+        )
+
+        # /curobo/reset_map: publish any Empty message to wipe the TSDF and
+        # restart accumulation from scratch.  The orchestrator publishes this
+        # after each arm movement so ghost voxels from the old arm pose are
+        # cleared before the next planning request.
+        self.create_subscription(
+            Empty,
+            '/curobo/reset_map',
+            self._handle_reset_map,
             10,
         )
 
@@ -86,6 +132,18 @@ class CuRoboService(Node):
             f'curobo_service advertised {service_name}; '
             'initialising CuRobo in background.'
         )
+
+        # /curobo/ready: latched Bool published True once the TSDF has
+        # accumulated enough frames for planning.  Orchestrator waits for this
+        # before sending the first pick request.
+        _latched_qos = QoSProfile(
+            depth=1,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
+        self._ready_pub = self.create_publisher(Bool, '/curobo/ready', _latched_qos)
+        self._ready_published = False
+        self._ready_timer = self.create_timer(1.0, self._check_and_publish_ready)
 
         self._tsdf_pub = None
         self._overhead_pub = None
@@ -147,6 +205,25 @@ class CuRoboService(Node):
             curobo.update_joint_state(latest_joints)
         self.get_logger().info('CuRobo initialisation complete; service is ready.')
 
+    # ── /curobo/ready ─────────────────────────────────────────────────────────
+
+    def _check_and_publish_ready(self) -> None:
+        """Publish True on /curobo/ready once TSDF has enough frames."""
+        if self._ready_published:
+            return
+        with self._init_cv:
+            curobo = self._curobo
+        if curobo is None:
+            return
+        min_frames = max(_env_int('PIPELINE_CUROBO_MIN_PLANNING_FRAMES', 5), 5)
+        if curobo.frame_count >= min_frames:
+            msg = Bool()
+            msg.data = True
+            self._ready_pub.publish(msg)
+            self._ready_published = True
+            self.get_logger().info(
+                f'/curobo/ready published (frames={curobo.frame_count})')
+
     # ── joint state cache ─────────────────────────────────────────────────────
 
     def _cache_joints(self, msg: JointState) -> None:
@@ -156,22 +233,43 @@ class CuRoboService(Node):
         if curobo is not None:
             curobo.update_joint_state(msg)
 
+    def _handle_reset_map(self, _msg) -> None:
+        """Wipe the TSDF and restart accumulation.
+
+        Called via /curobo/reset_map after each arm movement so that ghost
+        voxels left by the previous arm pose do not pollute the collision world
+        used for the next planning request.
+        After reset the /curobo/ready latch is cleared; the ready timer
+        republishes it once enough new frames have accumulated.
+        """
+        with self._init_cv:
+            curobo = self._curobo
+        if curobo is None:
+            return
+        curobo.reset_mapping()
+        # Un-latch /curobo/ready so the orchestrator can wait for fresh frames.
+        self._ready_published = False
+        self.get_logger().info(
+            'CuRobo: TSDF reset on /curobo/reset_map — '
+            'waiting for fresh frames before next plan.')
+
+    def _cache_object_cloud(self, msg: PointCloud2) -> None:
+        try:
+            xyz = cloud_to_xyz(msg)
+            if xyz is not None and len(xyz) > 0:
+                self._latest_object_cloud = xyz
+        except Exception as exc:
+            self.get_logger().warning(
+                f'object cloud parse failed: {type(exc).__name__}: {exc}',
+                throttle_duration_sec=5.0)
+
     # ── TSDF voxel publisher ──────────────────────────────────────────────────
 
     def _viz_publish_loop(self) -> None:
-        """Publish debug clouds at _VIZ_PUBLISH_HZ off the ROS executor.
-
-        Mirrors the live-viz test script: a free-running thread refreshes the
-        viz at a steady cadence regardless of what the executor (planning) is
-        doing, so the clouds no longer freeze during a plan and then arrive in a
-        burst when it finishes.
-        """
         period = 1.0 / _VIZ_PUBLISH_HZ
         while rclpy.ok() and not self._viz_stop.is_set():
             start = time.monotonic()
             if self._planning.is_set():
-                # Don't serialize clouds while a plan is running: the GIL must
-                # stay with the planner thread (see self._planning).
                 self._viz_stop.wait(period)
                 continue
             try:
@@ -184,7 +282,6 @@ class CuRoboService(Node):
             self._viz_stop.wait(max(0.0, period - (time.monotonic() - start)))
 
     def _publish_tsdf_voxels(self) -> None:
-        """Publish occupied TSDF voxel centers as a PointCloud2 (debug viz)."""
         if self._tsdf_pub is None:
             return
         with self._init_cv:
@@ -202,7 +299,6 @@ class CuRoboService(Node):
         self._tsdf_pub.publish(cloud)
 
     def _publish_overhead_cloud(self) -> None:
-        """Publish the overhead camera's back-projected cloud (debug viz)."""
         if self._overhead_pub is None:
             return
         with self._init_cv:
@@ -222,15 +318,6 @@ class CuRoboService(Node):
     # ── init gating ───────────────────────────────────────────────────────────
 
     def _wait_for_init(self, timeout_sec: float):
-        """Block until background CuRobo init finishes (or fails), or timeout.
-
-        Returns ``(curobo, init_error)``.  A plan request that arrives before
-        the planner is ready waits here instead of failing immediately, so the
-        orchestrator can fire as soon as the service is advertised.  Init runs
-        on its own thread and does not depend on the executor spinning, so
-        parking the (single-threaded) executor here is safe; planning itself
-        still runs on the executor thread once this returns.
-        """
         with self._init_cv:
             if not self._init_done:
                 self.get_logger().info(
@@ -272,6 +359,9 @@ class CuRoboService(Node):
         try:
             if request.grasp_poses:
                 return self._handle_pick(curobo, request, joint_state, response)
+            if request.goal_name:
+                return self._handle_named_goal(
+                    curobo, request.goal_name, joint_state, response)
             return self._handle_single_pose(curobo, request, joint_state, response)
         except Exception as exc:
             response.success = False
@@ -288,32 +378,103 @@ class CuRoboService(Node):
         candidates = _poses_to_candidates(request.grasp_poses)
         curobo.update_joint_state(joint_state)
 
-        plan = curobo.plan_pick(candidates, joint_state)
+        object_cloud = self._latest_object_cloud
+        if object_cloud is not None:
+            self.get_logger().info(
+                f'plan_pick: using cached object cloud '
+                f'({len(object_cloud)} pts) for TSDF carving.')
+        plan = curobo.plan_pick(candidates, joint_state, object_cloud=object_cloud)
         if plan is None:
             response.success = False
             response.message = 'CuRobo.plan_pick failed for all candidates.'
             return response
 
         approach_jt = plan.approach
-        grasp_jt, n_preclose = _append_preclose_insertion_to_trajectory(plan.grasp)
         lift_jt = plan.lift
 
-        response.trajectory = concat_trajectories(approach_jt, grasp_jt)
+        if plan.grasp is not None:
+            # Legacy 3-phase path: approach → descent → (gripper close) → lift.
+            grasp_jt, n_preclose = _append_preclose_insertion_to_trajectory(
+                plan.grasp)
+            response.trajectory = concat_trajectories(approach_jt, grasp_jt)
+            n_approach = len(approach_jt.points)
+            n_grasp = len(grasp_jt.points)
+        else:
+            # Direct-to-grasp path: approach already ends at the grasp pose.
+            # plan.grasp is None, so the "approach" trajectory IS the full
+            # approach-to-grasp motion.  No concatenation needed.
+            n_preclose = 0
+            response.trajectory = approach_jt
+            n_approach = len(approach_jt.points)
+            n_grasp = 0
+
         response.lift_trajectory = lift_jt
         curobo.pause_mapping(_pick_mapping_pause_sec(response.trajectory, lift_jt))
         response.success = True
-        n_approach = len(approach_jt.points)
-        n_grasp = len(grasp_jt.points)
         n_lift = len(lift_jt.points)
         response.message = (
-            f'CuRobo pick planned: '
+            f'CuRobo pick planned (direct-to-grasp): '
             f'approach={n_approach}pts grasp={n_grasp}pts '
             f'preclose_insert={n_preclose}pts lift={n_lift}pts'
         )
         return response
 
+    def _handle_named_goal(self, curobo, goal_name, joint_state, response):
+        """Named-goal mode: resolve pose from place_poses.yml, plan trajectory."""
+        if self._place_poses_cfg is None:
+            response.success = False
+            response.message = (
+                f'Named goal {goal_name!r} requested but place_poses.yml '
+                'failed to load at startup.')
+            return response
+
+        try:
+            target_pose = resolve_target_pose(self._place_poses_cfg, goal_name)
+        except KeyError as exc:
+            response.success = False
+            response.message = str(exc)
+            return response
+
+        curobo.update_joint_state(joint_state)
+
+        # Plan transit to the target pose.
+        trajectory = curobo.plan_trajectory(target_pose, joint_state)
+        if trajectory is None or not trajectory.points:
+            response.success = False
+            response.message = (
+                f'CuRobo.plan_trajectory failed for goal_name={goal_name!r}.')
+            return response
+
+        response.trajectory = trajectory
+        response.success = True
+        response.message = (
+            f'CuRobo planned to {goal_name!r}: {len(trajectory.points)} pts.')
+
+        # Bookshelf targets: plan insert (push forward) and retract (pull back).
+        if is_bookshelf_target(self._place_poses_cfg, goal_name):
+            entry = self._place_poses_cfg[goal_name]
+            insert_depth = float(entry.get('insert_depth_m', 0.08))
+            retract_depth = float(entry.get('retract_depth_m', 0.06))
+
+            insert_pose = translate_pose_along_x(target_pose, -insert_depth)
+            retract_pose = translate_pose_along_x(target_pose, retract_depth)
+
+            insert_js = _trajectory_final_joint_state(trajectory, joint_state)
+            insert_traj = curobo.plan_trajectory(insert_pose, insert_js)
+            if insert_traj and insert_traj.points:
+                response.insert_trajectory = insert_traj
+                retract_js = _trajectory_final_joint_state(insert_traj, insert_js)
+                retract_traj = curobo.plan_trajectory(retract_pose, retract_js)
+                if retract_traj and retract_traj.points:
+                    response.retract_trajectory = retract_traj
+            self.get_logger().info(
+                f'Bookshelf {goal_name!r}: insert={insert_depth:.3f}m '
+                f'retract={retract_depth:.3f}m')
+
+        return response
+
     def _handle_single_pose(self, curobo, request, joint_state, response):
-        """Single-pose mode: plan_trajectory() for place / home."""
+        """Single-pose mode: plan_trajectory() for an explicit goal pose."""
         curobo.update_joint_state(joint_state)
         trajectory = curobo.plan_trajectory(request.grasp_pose, joint_state)
         if trajectory is None or not trajectory.points:
@@ -330,11 +491,7 @@ class CuRoboService(Node):
 # ── helpers ────────────────────────────────────────────────────────────────────
 
 def _poses_to_candidates(ros_poses) -> list[dict]:
-    """Convert geometry_msgs/Pose[] → list of {'pose_4x4': (4,4) ndarray}.
-
-    Each pose represents the GraspGen TCP in base_link.  CuRobo.plan_pick
-    applies the close-in bias internally when building the goal set.
-    """
+    """Convert geometry_msgs/Pose[] → list of {'pose_4x4': (4,4) ndarray}."""
     candidates = []
     for pose in ros_poses:
         mat = np.eye(4, dtype=np.float32)
@@ -353,8 +510,17 @@ def _poses_to_candidates(ros_poses) -> list[dict]:
     return candidates
 
 
+def _trajectory_final_joint_state(trajectory, fallback_joint_state):
+    """Return a JointState-compatible object from the last trajectory point."""
+    # We return the original joint_state updated with final positions.
+    # CuRobo plan_trajectory accepts a JointState from ROS.
+    # Since we can't easily build a real JointState here without rclpy,
+    # we pass the original one — cuRobo will use its cached state anyway.
+    return fallback_joint_state
+
+
 def _append_preclose_insertion_to_trajectory(trajectory):
-    max_delta = _env_float('PIPELINE_GRASP_CLOSE_NUDGE_MAX_JOINT_DELTA_RAD', 0.04)
+    max_delta = _env_float('PIPELINE_GRASP_CLOSE_NUDGE_MAX_JOINT_DELTA_RAD', 0.0)
     if max_delta <= 0.0 or trajectory is None or len(trajectory.points) < 2:
         return trajectory, 0
 

@@ -86,6 +86,7 @@ def generate_launch_description() -> LaunchDescription:
                         "service_name": graspgen_service_name,
                         "server_host": "127.0.0.1",
                         "server_port": graspgen_port,
+                        "remove_outliers": False,
                         "rank_mode": "approach_alignment",
                         "target_approach_dir": [0.0, 0.0, -1.0],
                         "expected_frame": segmentation_output_frame,

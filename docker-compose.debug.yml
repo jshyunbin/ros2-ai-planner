@@ -5,7 +5,27 @@ services:
       - ./scripts:/ros2_ws/scripts
       - ./config:/ros2_ws/config:ro
       - ./artifacts:/artifacts
+      - graspgen_ext:/opt/GraspGenX/ext
     environment:
+      # ── Segmentation scan poses ──────────────────────────────────────────
+      # Joint angles [pan, lift, elbow, w1, w2, w3] in radians.
+      # Attempt 0 always segments from the home pose (wrist cam looking down).
+      # Each semicolon-separated entry adds one retry viewpoint.
+      # Three candidate poses (add more with ; separator when needed):
+      #   pose 1: [-1.332, -2.402,  1.538, -0.863, -1.114, -1.292]
+      #   pose 2: [ 0.536, -1.331,  0.693, -0.781, -2.042,  0.723]
+      #   pose 3: [-0.714, -1.338,  0.707, -0.768, -1.327, -0.699]
+      - PIPELINE_SCAN_POSES=-1.332,-2.402,1.538,-0.863,-1.114,-1.292
+
+      # ── Gemini detection quality gate ────────────────────────────────────
+      # Reject Gemini detections below this confidence (0.0–1.0).
+      # 0.8 requires the model to be fairly certain the object is present;
+      # detections on absent objects typically score <0.5.
+      - PIPELINE_GEMINI_MIN_CONFIDENCE=0.8
+      # Maximum number of Gemini API calls per segmentation request.
+      # If attempt 1 returns low confidence, attempt 2 adds a re-check note.
+      - PIPELINE_GEMINI_MAX_ATTEMPTS=2
+
       # Table surface measured with depth camera: histogram peak = -0.089 m (base_link).
       - PIPELINE_FLOOR_Z=-0.089
 
@@ -28,6 +48,14 @@ services:
       # = 0.370 - 0.095 - 0.05 = 0.225 m  → use 0.20 m (2.5 cm margin)
       - PIPELINE_BASKET_WALL_TOP=0.20
 
+      # ── Gripper close position ───────────────────────────────────────────
+      # Robotiq 2F-85: 0.0 = fully open, 0.8 = fully closed.
+      # Fully closed (0.8) embeds thin objects into the finger mesh in Gazebo
+      # (position-controlled, no force feedback).  0.6 grips firmly enough
+      # while leaving ~1 cm clearance so objects aren't squeezed into the mesh.
+      # Tune up/down by 0.05 if grip is too loose or still embedding.
+      - PIPELINE_GRIPPER_CLOSE_POSITION=0.6
+
       # ── Preclose nudge ───────────────────────────────────────────────────
       # The nudge continues joint motion in the descent direction past the
       # clamped grasp pose → pushes fingertip into the floor. Disable it.
@@ -42,11 +70,44 @@ services:
       # so 5 cm gap ensures fingers don't reach the table surface.
       # tool0_z clamp = -0.089 + 0.136 + 0.05 = 0.097 m
       # fingertip world_z = 0.097 - 0.136 = -0.039 m (5 cm above table)
-      - PIPELINE_CUROBO_DESCENT_MARGIN=0.05
+      # tool0_z clamp = floor_z(-0.089) + fingertip(0.136) + margin = min descent.
+      # Robotiq 2F-85 fingers drop ~15mm during free-air closure;
+      # 0.03m → fingertip clears floor even after full closure sweep.
+      - PIPELINE_CUROBO_DESCENT_MARGIN=0.03
 
       # ── Approach corridor carving (noise above object) ───────────────────
       # Cylindrical corridor directly above object centroid.
       # Narrower than bbox+pad so nearby objects (cola can etc.) stay visible.
       - PIPELINE_CUROBO_CORRIDOR_RADIUS=0.06
       - PIPELINE_CUROBO_CORRIDOR_Z_ABOVE=0.35
-    command: ["ros2", "launch", "pipeline_orchestrator", "debug.launch.py"]
+
+      # ── Direct-to-grasp sphere carving ───────────────────────────────────
+      # Radius (metres) of the sphere carved around each grasp tool0 position
+      # in the TSDF.  Removes local TSDF noise right at the grasp site so that
+      # cuRobo's end-state collision check does not reject valid grasp poses.
+      # 0.15 m covers the full fingertip extent (0.145 m) plus a 5 mm margin.
+      - PIPELINE_CUROBO_GRASP_SPHERE_CARVE_RADIUS=0.15
+      # Max number of grasp positions to carve spheres around (top-K only).
+      # Limits memory usage of vectorized carving: N_voxels × K × 3 × 4 bytes.
+      # Top 10 covers the most likely candidates; raising to 30 gives full coverage.
+      - PIPELINE_CUROBO_GRASP_SPHERE_MAX_POSES=10
+
+      # ── Grasp verticality preference ─────────────────────────────────────────
+      # Hard filter: reject grasps whose approach direction deviates more than
+      # this many degrees from straight-down [0,0,-1].
+      # 60° allows slight tilts for objects on their side; reduce to 45° for
+      # strictly top-down grasps only.
+      - PIPELINE_GRASPGEN_MAX_TILT_DEG=60
+      # Blend weight for the composite ranking score:
+      #   score = w * alignment + (1-w) * confidence
+      # 0.7 makes top-down grasps strongly preferred over slightly higher-confidence
+      # tilted grasps. Raise toward 1.0 for stricter top-down preference.
+      - PIPELINE_GRASPGEN_VERTICALITY_WEIGHT=0.7
+    command: >
+      bash -c "cd /ros2_ws &&
+        colcon build --symlink-install --packages-select team_8 2>&1 &&
+        source install/setup.bash &&
+        exec ros2 launch team_8 debug.launch.py"
+
+volumes:
+  graspgen_ext:

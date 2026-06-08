@@ -33,7 +33,10 @@ except ImportError:  # pragma: no cover - import is environment-dependent
 # GraspGen TCP is GRIPPER_TCP_Z_OFFSET ahead of tool0 along the grasp Z-axis.
 _GRIPPER_TCP_Z_OFFSET = 0.1034   # m — robotiq_2f_140 checkpoint gripper_depth
 _MAX_REACH = 0.82                 # m — UR5 kinematic reach limit
-_MIN_TOOL_Z = 0.08                # m — minimum tool0 height above table
+# Floor protection is handled by cuRobo's descent z-clamp (floor_z + fingertip + margin).
+# This threshold only rejects physically impossible grasps (below floor surface).
+# Override via PIPELINE_GRASPGEN_MIN_TOOL_Z; default deliberately very low.
+_MIN_TOOL_Z = 0.01                # m — near-floor grasps allowed; cuRobo clamps descent
 
 
 class GraspGenService(Node):
@@ -57,7 +60,7 @@ class GraspGenService(Node):
         self.declare_parameter("remove_outliers", False)
         self.declare_parameter("rank_mode", "approach_alignment")
         self.declare_parameter("target_approach_dir", [0.0, 0.0, -1.0])
-        self.declare_parameter("max_returned_grasps", 5)
+        self.declare_parameter("max_returned_grasps", 30)
         self.declare_parameter("expected_frame", "base_link")
         self.declare_parameter("enable_collision_check", False)
         self.declare_parameter("collision_threshold", 0.002)
@@ -400,10 +403,7 @@ class GraspGenService(Node):
             [g[:3, 3] - g[:3, 2] * _GRIPPER_TCP_Z_OFFSET for g in grasps]
         )
         radii = np.linalg.norm(tool_pos, axis=1)
-        min_tool_z = max(
-            float(os.environ.get('PIPELINE_GRASPGEN_MIN_TOOL_Z', _MIN_TOOL_Z)),
-            _MIN_TOOL_Z,
-        )
+        min_tool_z = float(os.environ.get('PIPELINE_GRASPGEN_MIN_TOOL_Z', _MIN_TOOL_Z))
         keep = (radii < _MAX_REACH) & (tool_pos[:, 2] > min_tool_z)
         self.get_logger().info(
             f'GraspGen kinematic filter: kept {int(keep.sum())}/{len(grasps)} grasps '
@@ -426,10 +426,28 @@ class GraspGenService(Node):
             rows = [row for row, keep in zip(rows, collision_free_mask) if keep]
 
         if rank_mode == "approach_alignment":
-            rows.sort(
-                key=lambda row: (row["alignment"], row["confidence"]),
-                reverse=True,
-            )
+            # Hard tilt filter: reject grasps beyond max_tilt_deg from the
+            # target approach direction (default 60°, i.e. alignment < cos(60°)=0.5).
+            # This removes heavily-tilted grasps that tend to miss the object.
+            max_tilt_deg = float(
+                os.environ.get('PIPELINE_GRASPGEN_MAX_TILT_DEG', '60'))
+            min_alignment = float(np.cos(np.deg2rad(max_tilt_deg)))
+            before = len(rows)
+            rows = [r for r in rows if r["alignment"] >= min_alignment]
+            n_filtered = before - len(rows)
+            if n_filtered > 0:
+                self.get_logger().info(
+                    f'GraspGen tilt filter: removed {n_filtered}/{before} grasps '
+                    f'(tilt>{max_tilt_deg:.0f}° from target, alignment<{min_alignment:.3f})')
+
+            # Composite score: blend verticality (alignment) and GraspGenX confidence.
+            # Weight 0.7 makes top-down grasps strongly preferred over tilted ones
+            # even when the tilted grasp has a slightly higher GraspGenX confidence.
+            w = float(os.environ.get('PIPELINE_GRASPGEN_VERTICALITY_WEIGHT', '0.7'))
+            for r in rows:
+                r["score"] = round(
+                    w * r["alignment"] + (1.0 - w) * r["confidence"], 4)
+            rows.sort(key=lambda r: r["score"], reverse=True)
         else:
             rows.sort(
                 key=lambda row: (
@@ -461,6 +479,7 @@ class GraspGenService(Node):
         }
 
         if rank_mode == "approach_alignment":
+            # alignment=1.0: perfectly top-down, alignment=0.0: horizontal
             row["alignment"] = round(float(np.dot(approach, target_dir)), 4)
             return row
 
