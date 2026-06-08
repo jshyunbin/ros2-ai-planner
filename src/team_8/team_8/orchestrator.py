@@ -741,8 +741,14 @@ class PipelineOrchestrator(Node):
                 timer.cancel()
             self._run_post_task_verification()
 
+        # Must share the reentrant pipeline group: this callback runs the full
+        # retry pipeline, whose _send_and_wait calls block on action
+        # goal-response futures. In the default mutually-exclusive group (same
+        # as the arm ActionClient) those callbacks can never be delivered while
+        # this one blocks, deadlocking the home move (see _pipeline_cbg).
         self._verification_timer = self.create_timer(
-            max(0.05, float(delay_sec)), callback)
+            max(0.05, float(delay_sec)), callback,
+            callback_group=self._pipeline_cbg)
 
     def _cancel_verification_timer(self) -> None:
         timer = self._verification_timer

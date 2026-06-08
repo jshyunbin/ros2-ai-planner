@@ -1099,6 +1099,26 @@ def test_orchestrator_pick_done_runs_place_then_home():
     orch._reset_pipeline_state.assert_called_once()
 
 
+def test_orchestrator_verification_timer_uses_pipeline_callback_group():
+    # The verification timer callback runs the full retry pipeline, whose
+    # _send_and_wait calls block on action goal-response futures. If the timer
+    # lives in the default mutually-exclusive group (same as the arm
+    # ActionClient), the goal-response callback can never be delivered and the
+    # home move deadlocks (60s "Timed out waiting for home action goal
+    # response"). It must share the reentrant pipeline group, like the task
+    # subscription and service clients.
+    orch = _orchestrator_skeleton()
+    sentinel_group = object()
+    orch._pipeline_cbg = sentinel_group
+    orch._verification_timer = None
+    orch.create_timer = MagicMock(return_value='timer-handle')
+
+    orch._schedule_verification_timer(1.0)
+
+    _, kwargs = orch.create_timer.call_args
+    assert kwargs.get('callback_group') is sentinel_group
+
+
 def test_orchestrator_pick_done_schedules_verification_when_enabled():
     from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
     orch = _orchestrator_skeleton()
