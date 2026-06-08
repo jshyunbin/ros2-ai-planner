@@ -20,7 +20,7 @@
 # and this raised/extended posture lets the wrist camera see the whole storage
 # (the more-tucked cuRobo default didn't cover it). Tune with
 # `ros2 run team_8 home_config_tuner` against the live sim.
-home_joint_config: [0.0, -1.5708, 1.0, -1.0472, -1.5708, 0.0]
+home_joint_config: [ 0.0, -1.8, 1.0, -1.0, -1.65, 0.0]
 
 # Lateral carry height. Capped by UR5 reach: at storage_1's xy radius (~0.65 m)
 # cuRobo IK reaches up to z~0.60; 0.80 was unreachable and broke the lift leg.
@@ -44,6 +44,6 @@ storage_2: {xyz: [0.000000, -0.550000, 0.370327], quat_xyzw: [1.0, 0.0, 0.0, 0.0
 # tool0 +z points +x (into the shelf) so the insert leg drives +x by
 # insert_depth_m, then retract_depth_m pulls back along -x after release.
 bookshelf:
-  pre_insert:      {xyz: [0.75, -0.3, 0.78], quat_xyzw: [-0.5, 0.5, -0.5, 0.5]}
+  pre_insert:      {xyz: [0.5, -0.3, 0.22], quat_xyzw: [-0.5, 0.5, -0.5, 0.5]}
   insert_depth_m:  0.22
   retract_depth_m: 0.22
