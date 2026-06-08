@@ -39,6 +39,7 @@ from team_8.pipeline_utils import (
     env_float as _env_float,
     env_int as _env_int,
 )
+from team_8.place_pose_utils import build_transit_waypoints, translate_pose_x
 
 OVERHEAD_DEPTH_TOPIC = '/camera/camera/depth/color/image_raw'
 OVERHEAD_INFO_TOPIC = '/camera/camera/depth/color/camera_info'
@@ -67,6 +68,20 @@ GRIPPER_TCP_Z_OFFSET = 0.1034
 # mesh extends ~0.155 m.  Using the larger value ensures the z-clamp prevents
 # any part of the physical mesh from reaching the floor.
 _FINGERTIP_LEN = 0.155
+
+
+class PlacePlan:
+    """Trajectories for a place: ``move`` is the collision-off safe-z transit to
+    the drop / pre-insert pose; ``insert`` and ``retract`` are the collision-off
+    bookshelf push/pull segments (both None for storage drops).
+    """
+
+    __slots__ = ('move', 'insert', 'retract')
+
+    def __init__(self, move, insert=None, retract=None):
+        self.move = move
+        self.insert = insert
+        self.retract = retract
 
 
 class PickPlan:
@@ -618,13 +633,20 @@ class CuRobo:
             self._logger.error(f'CuRobo.plan_pick error: {exc}')
             return None
 
-    def _plan_pose_segment(self, goal_mat, current_state, name):
+    def _plan_pose_segment(self, goal_mat, current_state, name, in_branch=False):
         """``plan_pose`` to a single tool0 pose (4x4 in base_link).
 
         The caller controls the collision world state before invoking this.
         Returns a ROS ``JointTrajectory`` or ``None`` on failure.
+
+        With ``in_branch=True`` the pose is reached via the IK solution closest
+        to ``current_state`` (same kinematic branch) and a c-space plan — prevents
+        the arm flipping to a contorted elbow/wrist branch mid-transit when
+        carrying an object.  Used by place transit legs.
         """
         _reset_planner_seed(self._planner)
+        if in_branch:
+            return self._plan_inbranch_cspace(goal_mat, current_state, name)
         result = self._planner.plan_pose(
             self._tool_goal_from_matrix(goal_mat), current_state)
         torch.cuda.synchronize()
@@ -637,6 +659,47 @@ class CuRobo:
             result.get_interpolated_plan(),
             last_tstep=getattr(result, 'interpolated_last_tstep', None),
         )
+
+    def _plan_inbranch_cspace(self, goal_mat, current_state, name):
+        """Plan to a tool0 pose via the IK branch nearest ``current_state``."""
+        goal_state = self._nearest_branch_ik(goal_mat, current_state, name)
+        if goal_state is None:
+            return None
+        result = self._planner.plan_cspace(goal_state, current_state)
+        torch.cuda.synchronize()
+        if not _result_success(result):
+            status = getattr(result, 'status', 'unknown')
+            self._logger.warn(
+                f'CuRobo: {name} in-branch c-space plan failed '
+                f'(status={status}).')
+            return None
+        return interp_traj_to_ros(
+            result.get_interpolated_plan(),
+            last_tstep=getattr(result, 'interpolated_last_tstep', None),
+        )
+
+    def _nearest_branch_ik(self, goal_mat, current_state, name):
+        """IK solution closest (in joint space) to ``current_state``."""
+        goal = self._tool_goal_from_matrix(goal_mat)
+        num_seeds = self._planner.ik_solver.config.num_seeds
+        ik = self._planner.ik_solver.solve_pose(
+            goal, current_state=current_state, return_seeds=num_seeds)
+        success = ik.success.view(-1)
+        if not bool(torch.any(success)):
+            self._logger.warn(f'CuRobo: {name} IK found no feasible solution.')
+            return None
+        dof = current_state.position.shape[-1]
+        sols = ik.solution.view(-1, dof)[success]
+        cur = current_state.position.view(1, dof)
+        dist = torch.linalg.norm(sols - cur, dim=1)
+        best = int(torch.argmin(dist))
+        self._logger.info(
+            f'CuRobo: {name} in-branch IK selected solution '
+            f'{best + 1}/{int(success.sum())} '
+            f'(joint move {float(dist[best]):.2f} rad).')
+        best_pos = sols[best:best + 1, :].clone()
+        return CuRoboJointState.from_position(
+            best_pos, joint_names=list(JOINT_NAMES))
 
     def _tool_goal_from_matrix(self, mat) -> GoalToolPose:
         """Single-goal GoalToolPose from a 4x4 tool0 pose in base_link."""
@@ -727,6 +790,133 @@ class CuRobo:
         self._logger.warn(
             f'CuRobo.plan_home_config: all attempts exhausted ({last_status})')
         return None
+
+    def plan_place(self, place_pose, transit_z, bookshelf=False,
+                   insert_depth=0.0, retract_depth=0.0, joint_states=None,
+                   floor_z=0.0):
+        """Plan a safe-z transit to a place destination over a ground plane.
+
+        Returns a ``PlacePlan`` (move + optional bookshelf insert/retract) or
+        ``None`` on failure.  The collision world is replaced by a single
+        ground-plane cuboid at ``floor_z`` so the arm can't drop through the
+        table, while the held object (unmodelled by cuRobo) never false-blocks
+        the intentional place motion.
+        """
+        with self._cuda_lock:
+            return self._plan_place_locked(
+                place_pose, transit_z, bool(bookshelf),
+                float(insert_depth), float(retract_depth), joint_states,
+                float(floor_z))
+
+    def _plan_place_locked(self, place_pose, transit_z, bookshelf,
+                           insert_depth, retract_depth, joint_states,
+                           floor_z=0.0):
+        try:
+            self.update_joint_state(joint_states)
+            current_tool = self.tool_pose(joint_states)
+            if current_tool is None:
+                self._logger.warn('CuRobo.plan_place: FK for current pose failed.')
+                return None
+            cur_xyz, cur_quat_wxyz = current_tool
+            cur_quat_xyzw = [
+                cur_quat_wxyz[1], cur_quat_wxyz[2], cur_quat_wxyz[3],
+                cur_quat_wxyz[0],
+            ]
+            place_xyz, place_quat_xyzw = _pose_to_xyz_quat_xyzw(place_pose)
+            waypoints = build_transit_waypoints(
+                cur_xyz, cur_quat_xyzw, place_xyz, place_quat_xyzw, transit_z)
+
+            # Replace collision world with single ground-plane cuboid.
+            self._set_transit_floor_world(floor_z)
+            current_state = self._ros_js_to_curobo(joint_states)
+            legs = []
+            for i, (xyz, quat) in enumerate(waypoints):
+                if i == 0:
+                    jt = self._plan_lift_leg(current_state, xyz, quat, cur_xyz)
+                else:
+                    mat = _mat_from_xyz_quat_xyzw(xyz, quat)
+                    jt = self._plan_pose_segment(
+                        mat, current_state, f'transit_{i}', in_branch=True)
+                if jt is None:
+                    return None
+                legs.append(jt)
+                current_state = self._final_joint_state(jt)
+
+            move = legs[0]
+            for jt in legs[1:]:
+                move = concat_trajectories(move, jt)
+
+            insert_jt = None
+            retract_jt = None
+            if bookshelf:
+                inserted_xyz = translate_pose_x(place_xyz, insert_depth)
+                insert_mat = _mat_from_xyz_quat_xyzw(inserted_xyz, place_quat_xyzw)
+                insert_jt = self._plan_pose_segment(
+                    insert_mat, current_state, 'insert', in_branch=True)
+                if insert_jt is None:
+                    return None
+                inserted_state = self._final_joint_state(insert_jt)
+                retract_xyz = translate_pose_x(inserted_xyz, -retract_depth)
+                retract_mat = _mat_from_xyz_quat_xyzw(retract_xyz, place_quat_xyzw)
+                retract_jt = self._plan_pose_segment(
+                    retract_mat, inserted_state, 'retract', in_branch=True)
+                if retract_jt is None:
+                    return None
+
+            self._logger.info(
+                'CuRobo.plan_place succeeded: '
+                f'move={len(move.points)}pts bookshelf={bookshelf}')
+            return PlacePlan(move=move, insert=insert_jt, retract=retract_jt)
+        except Exception as exc:
+            self._logger.error(f'CuRobo.plan_place error: {exc}')
+            return None
+
+    def _plan_lift_leg(self, current_state, lift_xyz, lift_quat, cur_xyz):
+        """Plan the lift leg, lowering the target height until IK is reachable."""
+        x, y = float(lift_xyz[0]), float(lift_xyz[1])
+        target_z = float(lift_xyz[2])
+        floor_z = float(cur_xyz[2])
+        step = max(_place_lift_height_step(), 1e-3)
+        tried = []
+        z = target_z
+        while z > floor_z:
+            mat = _mat_from_xyz_quat_xyzw([x, y, z], lift_quat)
+            jt = self._plan_pose_segment(
+                mat, current_state, f'lift@{z:.2f}m', in_branch=True)
+            if jt is not None:
+                if z < target_z - 1e-6:
+                    self._logger.info(
+                        f'CuRobo.plan_place: lift capped at z={z:.2f}m '
+                        f'(requested {target_z:.2f}m unreachable at radius '
+                        f'{float(np.hypot(x, y)):.2f}m).')
+                return jt
+            tried.append(round(z, 3))
+            z -= step
+        mat = _mat_from_xyz_quat_xyzw([x, y, floor_z], lift_quat)
+        jt = self._plan_pose_segment(
+            mat, current_state, 'lift@current', in_branch=True)
+        if jt is None:
+            self._logger.warn(
+                f'CuRobo.plan_place: lift leg unreachable (tried heights '
+                f'{tried} and current height {floor_z:.2f}m).')
+        return jt
+
+    def _set_transit_floor_world(self, floor_z: float) -> None:
+        """Replace collision world with a single ground-plane cuboid at floor_z."""
+        try:
+            self._planner.clear_scene_cache()
+        except Exception:
+            pass
+        thickness = _transit_floor_thickness()
+        floor = Cuboid(
+            name='transit_floor',
+            pose=[0.0, 0.0, float(floor_z) - thickness / 2.0, 1.0, 0.0, 0.0, 0.0],
+            dims=[_TRANSIT_FLOOR_XY, _TRANSIT_FLOOR_XY, thickness],
+        )
+        self._planner.update_world(SceneCfg(cuboid=[floor]))
+        torch.cuda.synchronize()
+        with self._lock:
+            self._last_world_update_frame = -1
 
     def plan_trajectory(self, goal_pose, joint_states):
         """Plan a single tool0 trajectory for place/home style targets."""
@@ -1216,6 +1406,34 @@ def _last_tstep_to_int(last_tstep):
         raise ValueError(
             f'Invalid cuRobo interpolated last_tstep: {last_tstep!r}'
         ) from exc
+
+
+def _mat_from_xyz_quat_xyzw(xyz, quat_xyzw) -> np.ndarray:
+    """4×4 homogeneous pose from xyz + (x, y, z, w) quaternion."""
+    mat = np.eye(4, dtype=np.float32)
+    mat[:3, :3] = R.from_quat(
+        [float(q) for q in quat_xyzw]).as_matrix().astype(np.float32)
+    mat[:3, 3] = np.asarray(xyz, dtype=np.float32)
+    return mat
+
+
+def _pose_to_xyz_quat_xyzw(pose):
+    """(xyz list, quat_xyzw list) from a geometry_msgs/Pose."""
+    p, o = pose.position, pose.orientation
+    return [p.x, p.y, p.z], [o.x, o.y, o.z, o.w]
+
+
+def _place_lift_height_step() -> float:
+    """Step (m) by which the place lift height is lowered when IK is unreachable."""
+    return max(_env_float('PIPELINE_PLACE_LIFT_HEIGHT_STEP_M', 0.05), 1e-3)
+
+
+# Lateral extent (m) of the transit ground-plane cuboid.
+_TRANSIT_FLOOR_XY = 3.0
+
+
+def _transit_floor_thickness() -> float:
+    return max(_env_float('PIPELINE_PLACE_TRANSIT_FLOOR_THICKNESS_M', 1.0), 1e-3)
 
 
 def _candidate_pose_4x4(candidate) -> np.ndarray:

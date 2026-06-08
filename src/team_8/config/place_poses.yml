@@ -10,7 +10,8 @@
 # Tune with: ros2 run team_8 home_config_tuner
 home_joint_config: [0.0, -1.8, 1.0, -1.0, -1.65, 0.0]
 
-transit_z: 0.50          # safe height (base_link Z) for lateral carry moves
+transit_z: 0.45          # safe height (base_link Z) for lateral carry moves
+transit_floor_z: 0.0    # floor plane height for transit collision world
 
 # Storage A (right side of workspace, +Y)
 storageA_1:

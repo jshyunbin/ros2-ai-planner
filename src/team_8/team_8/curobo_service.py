@@ -457,7 +457,7 @@ class CuRoboService(Node):
                 f'CuRobo home planned: {len(trajectory.points)} points.')
             return response
 
-        # ── All other named goals: IK-based pose plan ────────────────────────
+        # ── All other named goals: plan_place (collision-off transit + bookshelf) ─
         try:
             target_pose = resolve_target_pose(self._place_poses_cfg, goal_name)
         except KeyError as exc:
@@ -465,47 +465,35 @@ class CuRoboService(Node):
             response.message = str(exc)
             return response
 
-        trajectory = curobo.plan_trajectory(target_pose, joint_state)
-        if trajectory is None or not trajectory.points:
+        bookshelf = is_bookshelf_target(self._place_poses_cfg, goal_name)
+        insert_depth = retract_depth = 0.0
+        if bookshelf:
+            entry = self._place_poses_cfg[goal_name]
+            insert_depth = float(entry['insert_depth_m'])
+            retract_depth = float(entry['retract_depth_m'])
+
+        transit_z = float(self._place_poses_cfg.get('transit_z', 0.5))
+        floor_z = float(self._place_poses_cfg.get('transit_floor_z', 0.0))
+
+        plan = curobo.plan_place(
+            target_pose, transit_z, bookshelf=bookshelf,
+            insert_depth=insert_depth, retract_depth=retract_depth,
+            joint_states=joint_state, floor_z=floor_z)
+
+        if plan is None or plan.move is None or not plan.move.points:
             response.success = False
-            response.message = (
-                f'CuRobo.plan_trajectory failed for goal_name={goal_name!r}.')
+            response.message = f'CuRobo.plan_place failed for {goal_name!r}.'
             return response
 
-        response.trajectory = trajectory
+        response.trajectory = plan.move
         response.success = True
+        if plan.insert is not None:
+            response.insert_trajectory = plan.insert
+        if plan.retract is not None:
+            response.retract_trajectory = plan.retract
         response.message = (
-            f'CuRobo planned to {goal_name!r}: {len(trajectory.points)} pts.')
-
-        # Bookshelf targets: plan insert (push forward) and retract (pull back).
-        if is_bookshelf_target(self._place_poses_cfg, goal_name):
-            entry = self._place_poses_cfg[goal_name]
-            insert_depth = float(entry.get('insert_depth_m', 0.08))
-            retract_depth = float(entry.get('retract_depth_m', 0.06))
-
-            # translate_pose_x works on plain xyz lists; convert from/to Pose.
-            pre_xyz = [target_pose.position.x,
-                       target_pose.position.y,
-                       target_pose.position.z]
-            pre_quat = [target_pose.orientation.x, target_pose.orientation.y,
-                        target_pose.orientation.z, target_pose.orientation.w]
-            insert_xyz  = translate_pose_x(pre_xyz, -insert_depth)
-            retract_xyz = translate_pose_x(pre_xyz,  retract_depth)
-            insert_pose  = pose_from_xyzquat(insert_xyz,  pre_quat)
-            retract_pose = pose_from_xyzquat(retract_xyz, pre_quat)
-
-            insert_js = _trajectory_final_joint_state(trajectory, joint_state)
-            insert_traj = curobo.plan_trajectory(insert_pose, insert_js)
-            if insert_traj and insert_traj.points:
-                response.insert_trajectory = insert_traj
-                retract_js = _trajectory_final_joint_state(insert_traj, insert_js)
-                retract_traj = curobo.plan_trajectory(retract_pose, retract_js)
-                if retract_traj and retract_traj.points:
-                    response.retract_trajectory = retract_traj
-            self.get_logger().info(
-                f'Bookshelf {goal_name!r}: insert={insert_depth:.3f}m '
-                f'retract={retract_depth:.3f}m')
-
+            f'CuRobo place planned for {goal_name!r}: '
+            f'move={len(plan.move.points)}pts bookshelf={bookshelf}')
         return response
 
     def _handle_single_pose(self, curobo, request, joint_state, response):
