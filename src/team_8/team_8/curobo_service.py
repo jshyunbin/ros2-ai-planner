@@ -24,6 +24,8 @@ import threading
 import time
 import traceback
 
+from ament_index_python.packages import get_package_share_directory
+
 import numpy as np
 import rclpy
 from rclpy.node import Node
@@ -94,7 +96,7 @@ class CuRoboService(Node):
         # Load place pose config once at startup; used by _handle_named_goal.
         try:
             _poses_yml = os.path.join(
-                os.path.dirname(os.path.dirname(__file__)),
+                get_package_share_directory('team_8'),
                 'config', 'place_poses.yml')
             self._place_poses_cfg = load_place_poses(_poses_yml)
         except Exception as exc:

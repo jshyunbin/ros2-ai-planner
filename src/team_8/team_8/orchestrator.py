@@ -397,9 +397,11 @@ class PipelineOrchestrator(Node):
         (e.g. place failed), the remaining queue is cleared for safety.
         """
         if reason:
-            level = 'info' if success else 'warn'
-            getattr(self.get_logger(), level)(
-                f'Task {"succeeded" if success else "failed"}: {reason}')
+            msg = f'Task {"succeeded" if success else "failed"}: {reason}'
+            if success:
+                self.get_logger().info(msg)
+            else:
+                self.get_logger().warning(msg)
 
         self._pipeline_busy = False
         self._active_task_data = None
