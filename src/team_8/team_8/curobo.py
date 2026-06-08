@@ -279,6 +279,11 @@ class CuRobo:
             self._tsdf_centers = tsdf_np
 
     def _on_info(self, msg, cam_id: str):
+        # Cache the intrinsic matrix: camera params rarely (never) change after
+        # startup, so avoid a new CUDA tensor allocation on every CameraInfo msg.
+        key = (cam_id, msg.k[0], msg.k[2], msg.k[4], msg.k[5])
+        if self._cam_intrinsics.get(f'__key_{cam_id}') == key:
+            return
         with self._cuda_lock:
             K = torch.tensor([
                 [msg.k[0], 0.0, msg.k[2]],
@@ -287,6 +292,7 @@ class CuRobo:
             ], dtype=torch.float32, device='cuda')
         with self._lock:
             self._cam_intrinsics[cam_id] = K
+            self._cam_intrinsics[f'__key_{cam_id}'] = key
 
     def _on_depth(self, msg, cam_id: str, frame: str):
         with self._lock:

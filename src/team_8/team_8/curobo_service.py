@@ -491,9 +491,18 @@ class CuRoboService(Node):
             response.insert_trajectory = plan.insert
         if plan.retract is not None:
             response.retract_trajectory = plan.retract
+
+        # Pause TSDF mapping for the entire place motion so depth frames of the
+        # arm-in-transit don't accumulate ghost voxels in the collision world.
+        # This dramatically reduces the next plan_pick's world-rebuild time
+        # (otherwise TSDF rebuild can take 20+ seconds on a dense voxel world).
+        pause_sec = _place_mapping_pause_sec(plan.move, plan.insert, plan.retract)
+        curobo.pause_mapping(pause_sec)
+
         response.message = (
             f'CuRobo place planned for {goal_name!r}: '
-            f'move={len(plan.move.points)}pts bookshelf={bookshelf}')
+            f'move={len(plan.move.points)}pts bookshelf={bookshelf} '
+            f'mapping_pause={pause_sec:.1f}s')
         return response
 
     def _handle_single_pose(self, curobo, request, joint_state, response):
@@ -580,6 +589,19 @@ def _append_preclose_insertion_to_trajectory(trajectory):
         )
         trajectory.points.append(pt)
     return trajectory, steps
+
+
+def _place_mapping_pause_sec(move, insert, retract) -> float:
+    """Compute how long to pause TSDF mapping during a place motion.
+
+    Covers the full move + insert + retract duration plus a small buffer so
+    the arm has time to settle before mapping resumes.
+    """
+    duration = _trajectory_duration_sec(move)
+    duration += _trajectory_duration_sec(insert)
+    duration += _trajectory_duration_sec(retract)
+    duration += _env_float('PIPELINE_GRASP_MAPPING_PAUSE_EXTRA_SEC', 2.0)
+    return max(duration, 0.0)
 
 
 def _pick_mapping_pause_sec(approach_and_grasp, lift) -> float:
