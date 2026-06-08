@@ -85,7 +85,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install "numpy<2" uv && \
     git clone --branch v0.8.0 --depth 1 https://github.com/NVlabs/curobo.git /tmp/curobo && \
     cd /tmp/curobo && \
-    TORCH_CUDA_ARCH_LIST="12.0+PTX" \
+    TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9;12.0+PTX" \
     uv pip install --system ".[cu12]" && \
     cd / && rm -rf /tmp/curobo && \
     python3 -m pip install --force-reinstall "numpy<2"
