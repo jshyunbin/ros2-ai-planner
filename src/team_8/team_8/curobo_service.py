@@ -45,6 +45,7 @@ from team_8.pipeline_utils import env_int as _env_int
 from team_8.pipeline_utils import make_xyz_cloud
 from team_8.place_pose_utils import (
     build_transit_waypoints,
+    get_home_joint_config,
     is_bookshelf_target,
     load_place_poses,
     resolve_target_pose,
@@ -420,7 +421,12 @@ class CuRoboService(Node):
         return response
 
     def _handle_named_goal(self, curobo, goal_name, joint_state, response):
-        """Named-goal mode: resolve pose from place_poses.yml, plan trajectory."""
+        """Named-goal mode: resolve goal from place_poses.yml and plan.
+
+        'home' uses a c-space plan to the fixed home_joint_config so the arm
+        always returns to the same posture (no IK branch ambiguity).
+        All other keys use plan_trajectory (IK → pose).
+        """
         if self._place_poses_cfg is None:
             response.success = False
             response.message = (
@@ -428,6 +434,23 @@ class CuRoboService(Node):
                 'failed to load at startup.')
             return response
 
+        curobo.update_joint_state(joint_state)
+
+        # ── Home: fixed joint-config c-space plan ────────────────────────────
+        if goal_name == 'home':
+            trajectory = curobo.plan_home_config(
+                get_home_joint_config(self._place_poses_cfg), joint_state)
+            if trajectory is None or not trajectory.points:
+                response.success = False
+                response.message = 'CuRobo home c-space planning failed.'
+                return response
+            response.success = True
+            response.trajectory = trajectory
+            response.message = (
+                f'CuRobo home planned: {len(trajectory.points)} points.')
+            return response
+
+        # ── All other named goals: IK-based pose plan ────────────────────────
         try:
             target_pose = resolve_target_pose(self._place_poses_cfg, goal_name)
         except KeyError as exc:
@@ -435,9 +458,6 @@ class CuRoboService(Node):
             response.message = str(exc)
             return response
 
-        curobo.update_joint_state(joint_state)
-
-        # Plan transit to the target pose.
         trajectory = curobo.plan_trajectory(target_pose, joint_state)
         if trajectory is None or not trajectory.points:
             response.success = False

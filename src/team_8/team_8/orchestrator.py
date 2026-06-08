@@ -96,11 +96,10 @@ _GRIPPER_CLOSED = _env_float('PIPELINE_GRIPPER_CLOSE_POSITION', 0.6)
 # Destination → place_poses.yml goal_name mapping.
 # Set PIPELINE_PLACE_GOAL_STORAGE_1 / _STORAGE_2 to override defaults.
 _DESTINATION_TO_GOAL: dict[str, str] = {
-    'storage_1':      os.environ.get('PIPELINE_PLACE_GOAL_STORAGE_1', 'storageB_1'),
-    'storage_2':      os.environ.get('PIPELINE_PLACE_GOAL_STORAGE_2', 'storageA_1'),
-    'bookshelf_floor1': os.environ.get('PIPELINE_PLACE_GOAL_BOOKSHELF1', 'bookshelf_floor1'),
-    'bookshelf_floor2': os.environ.get('PIPELINE_PLACE_GOAL_BOOKSHELF2', 'bookshelf_floor2'),
-    'unspecified':    '',  # falls back to self._place_goal parameter
+    'storage_1':  os.environ.get('PIPELINE_PLACE_GOAL_STORAGE_1', 'storageB_1'),
+    'storage_2':  os.environ.get('PIPELINE_PLACE_GOAL_STORAGE_2', 'storageA_1'),
+    'bookshelf':  os.environ.get('PIPELINE_PLACE_GOAL_BOOKSHELF', 'bookshelf'),
+    'unspecified': '',  # falls back to self._place_goal parameter
 }
 
 

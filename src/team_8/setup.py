@@ -27,6 +27,7 @@ setup(
     entry_points={
         'console_scripts': [
             'orchestrator = team_8.orchestrator:main',
+            'home_config_tuner = team_8.home_config_tuner:main',
             'pose_probe = team_8.pose_probe:main',
             'curobo_service = team_8.curobo_service:main',
             'debug_viz = team_8.debug_viz:main',

@@ -109,6 +109,7 @@ services:
       # storage_1 = left basket, storage_2 = right basket (override if needed).
       - PIPELINE_PLACE_GOAL_STORAGE_1=storageB_1
       - PIPELINE_PLACE_GOAL_STORAGE_2=storageA_1
+      - PIPELINE_PLACE_GOAL_BOOKSHELF=bookshelf
 
       # ── Post-pick verification ────────────────────────────────────────────────
       # Number of times the pipeline retries picking if Gemini verification sees

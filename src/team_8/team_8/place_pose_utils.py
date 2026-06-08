@@ -4,19 +4,21 @@ Loads target poses from place_poses.yml and provides helpers for building
 safe-Z transit waypoints used by plan_place().
 
 YAML schema (config/place_poses.yml):
-  transit_z: 0.35          # safe transit height in metres (base_link Z)
-  home:
+  transit_z: 0.35               # safe transit height in metres (base_link Z)
+  home_joint_config: [pan, lift, elbow, w1, w2, w3]  # 6 joint angles (rad)
+  storage_1:                    # simple place target
     xyz: [x, y, z]
     quat_xyzw: [qx, qy, qz, qw]
-  storage_1:               # simple place target
-    xyz: [x, y, z]
-    quat_xyzw: [qx, qy, qz, qw]
-  bookshelf_a:             # bookshelf-style target with insert/retract
+  bookshelf:                    # bookshelf-style target with insert/retract
     pre_insert:
       xyz: [x, y, z]
       quat_xyzw: [qx, qy, qz, qw]
-    insert_depth_m: 0.08
-    retract_depth_m: 0.06
+    insert_depth_m: 0.22
+    retract_depth_m: 0.22
+
+Note: home is reached by a c-space (joint-space) plan, not IK, so the arm
+always settles in the same posture rather than a random IK branch.
+Tune home_joint_config with: ros2 run team_8 home_config_tuner
 """
 
 import os
@@ -67,10 +69,31 @@ def load_place_poses(path: str | None = None) -> dict:
         raise ValueError('place_poses.yml must be a YAML mapping.')
     if 'transit_z' not in data or not isinstance(data['transit_z'], (int, float)):
         raise ValueError('place_poses.yml must have a numeric transit_z field.')
-    if 'home' not in data:
-        raise ValueError('place_poses.yml must have a home target.')
+    _validate_home_joint_config(data.get('home_joint_config'))
 
     return data
+
+
+def _validate_home_joint_config(entry) -> None:
+    """Raise ValueError unless entry is a list of six numeric joint angles."""
+    if entry is None:
+        raise ValueError("place_poses.yml: missing 'home_joint_config'")
+    if not (isinstance(entry, list) and len(entry) == 6):
+        raise ValueError(
+            "place_poses.yml: 'home_joint_config' must be a 6-element list of "
+            "joint angles [pan, lift, elbow, wrist_1, wrist_2, wrist_3]")
+    if not all(isinstance(v, (int, float)) for v in entry):
+        raise ValueError(
+            "place_poses.yml: 'home_joint_config' values must all be numbers")
+
+
+def get_home_joint_config(data: dict) -> list[float]:
+    """Return the six home joint angles as a list of floats.
+
+    Order matches the cuRobo cspace joint_names:
+    [pan, lift, elbow, wrist_1, wrist_2, wrist_3].
+    """
+    return [float(v) for v in data['home_joint_config']]
 
 
 def is_bookshelf_target(cfg: dict, goal_name: str) -> bool:
