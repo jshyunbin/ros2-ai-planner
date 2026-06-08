@@ -434,21 +434,27 @@ class CuRobo:
                 return None
 
             # ── Build tool0 poses for all candidates, apply floor z-clamp ──────
-            # The clamp protects the floor from fingertip contact.
-            # Key insight: for a tilted approach, the fingertip descends in world-Z
-            # only by cos(tilt) × _FINGERTIP_LEN, so the minimum tool0-z is lower
-            # for tilted grasps than for vertical ones.
+            # Two-component clamp:
             #
-            # approach_z_component = |mat[2,2]| = cosine of angle from vertical.
-            #   vertical approach  → 1.0 → full _FINGERTIP_LEN applied
-            #   60° from vertical  → 0.5 → half _FINGERTIP_LEN applied
-            #   horizontal         → 0.0 → zero fingertip descent in world-Z
+            # 1. Tilt-scaled component: fingertip only descends approach_z × _FINGERTIP_LEN
+            #    in world-Z for a tilted approach, so the minimum is lower than vertical.
+            #    approach_z = |mat[2,2]| = cos(tilt from vertical)
+            #      vertical  → 1.0 → full _FINGERTIP_LEN applied
+            #      45° tilt  → 0.71 → ~71 % applied
+            #      60° tilt  → 0.50 → 50 % applied
             #
-            # This prevents the clamp from forcing tilted grasps (e.g. hammer side
-            # grasps) 8–10 cm above the object, which causes the gripper to close
-            # in mid-air.
+            # 2. Absolute minimum: gripper BODY parts (not just fingertip) can protrude
+            #    below tool0 for tilted grasps. A hard lower bound on tool0-z prevents
+            #    the palm / link geometry from colliding with the table regardless of tilt.
+            #
+            # The effective clamp is the maximum of both components.
             floor_z = _env_float('PIPELINE_FLOOR_Z', -0.07)
             descent_margin = _env_float('PIPELINE_CUROBO_DESCENT_MARGIN', 0.030)
+            # Absolute clearance: tool0 always at least this far above floor_z.
+            # 0.06 m ensures gripper body clears the table for any tilt angle.
+            gripper_body_clearance = _env_float(
+                'PIPELINE_CUROBO_GRIPPER_BODY_CLEARANCE', 0.06)
+            min_tool_z_abs = floor_z + gripper_body_clearance
 
             grasp_tool_mats = []   # (4,4) tool0 pose in base_link for each candidate
             for c in candidates:
@@ -460,7 +466,9 @@ class CuRobo:
                 # fingers barely move in world-Z during closure, so the safety
                 # margin is also proportionally smaller.
                 effective_margin = descent_margin * approach_z
-                min_tool_z = floor_z + effective_fingertip_drop + effective_margin
+                min_tool_z_tilt = floor_z + effective_fingertip_drop + effective_margin
+                # Take the stricter of the two bounds.
+                min_tool_z = max(min_tool_z_tilt, min_tool_z_abs)
                 original_z = float(mat[2, 3])
                 clamped_z = max(original_z, min_tool_z)
                 if clamped_z > original_z + 1e-4:
@@ -470,8 +478,8 @@ class CuRobo:
                         f'CuRobo.plan_pick: candidate z clamped '
                         f'{original_z:.3f} → {clamped_z:.3f}m '
                         f'(floor={floor_z:.3f} approach_z={approach_z:.2f} '
-                        f'fingertip_drop={effective_fingertip_drop:.3f} '
-                        f'margin={effective_margin:.3f})')
+                        f'tilt_min={min_tool_z_tilt:.3f} '
+                        f'abs_min={min_tool_z_abs:.3f})')
                 grasp_tool_mats.append(mat)
 
             # Positions used for TSDF sphere carving (one per candidate)
@@ -485,38 +493,72 @@ class CuRobo:
             current = self._ros_js_to_curobo(joint_states)
             collision_links = _pick_disable_collision_links(self._planner)
 
-            # ── Plan directly to grasp goalset (no intermediate pre-grasp) ──────
-            # Build goalset from clamped tool0 poses.
-            grasp_goalset = self._mats_to_goalset(grasp_tool_mats)
+            # ── Tiered planning: most-vertical candidates first ──────────────────
+            # cuRobo minimises joint-space travel cost over the entire goalset; it
+            # can therefore pick a tilted grasp simply because it requires fewer
+            # wrist rotations.  We solve this by trying a top-down-only tier first
+            # and only falling back to all candidates when that fails.
+            #
+            # Tier 0: approach_z >= TIER0_MIN_APPROACH_Z (default 0.85, ≈32° tilt)
+            # Tier 1: all candidates (fallback)
+            tier0_min_az = _env_float('PIPELINE_CUROBO_TIER0_MIN_APPROACH_Z', 0.85)
+            tier0_mats = [m for m in grasp_tool_mats
+                          if abs(float(m[2, 2])) >= tier0_min_az]
 
-            _reset_planner_seed(self._planner)
-            self._planner.disable_link_collision(collision_links)
-            try:
-                grasp_result = self._planner.plan_pose(grasp_goalset, current)
-            finally:
-                self._planner.enable_link_collision(collision_links)
-            torch.cuda.synchronize()
+            # Build (mat_list, label) pairs in priority order.
+            plan_tiers: list[tuple[list, str]] = []
+            if tier0_mats and len(tier0_mats) < len(grasp_tool_mats):
+                plan_tiers.append((
+                    tier0_mats,
+                    f'tier0({len(tier0_mats)} top-down, '
+                    f'approach_z≥{tier0_min_az:.2f})',
+                ))
+            plan_tiers.append((
+                grasp_tool_mats,
+                f'all-candidates({len(grasp_tool_mats)})',
+            ))
+
+            grasp_result = None
+            winning_mats = grasp_tool_mats  # mats for the successful tier (idx lookup)
+            for tier_mats, tier_label in plan_tiers:
+                _reset_planner_seed(self._planner)
+                self._planner.disable_link_collision(collision_links)
+                try:
+                    r = self._planner.plan_pose(
+                        self._mats_to_goalset(tier_mats), current)
+                finally:
+                    self._planner.enable_link_collision(collision_links)
+                torch.cuda.synchronize()
+                if _result_success(r):
+                    grasp_result = r
+                    winning_mats = tier_mats
+                    self._logger.info(
+                        f'CuRobo.plan_pick: succeeded with {tier_label}')
+                    break
+                self._logger.info(
+                    f'CuRobo.plan_pick: {tier_label} failed, trying next tier.')
 
             if not _result_success(grasp_result):
-                # Retry with completely cleared world (all TSDF removed)
-                status = getattr(grasp_result, 'status', 'unknown')
+                # Final fallback: wipe TSDF world entirely, try all candidates.
                 self._logger.warn(
-                    'CuRobo.plan_pick: direct grasp planning failed with carved '
-                    f'TSDF (status={status}); retrying with cleared world.')
+                    'CuRobo.plan_pick: all TSDF tiers failed; '
+                    'retrying with cleared world.')
                 self._clear_collision_world()
                 _reset_planner_seed(self._planner)
                 self._planner.disable_link_collision(collision_links)
                 try:
-                    grasp_result = self._planner.plan_pose(grasp_goalset, current)
+                    grasp_result = self._planner.plan_pose(
+                        self._mats_to_goalset(grasp_tool_mats), current)
                 finally:
                     self._planner.enable_link_collision(collision_links)
                 torch.cuda.synchronize()
+                winning_mats = grasp_tool_mats
 
             if not _result_success(grasp_result):
                 status = getattr(grasp_result, 'status', 'unknown')
                 self._logger.warn(
-                    'CuRobo.plan_pick: direct grasp planning failed for all '
-                    f'candidates (status={status}).')
+                    'CuRobo.plan_pick: all planning attempts failed '
+                    f'(status={status}).')
                 return None
 
             t_grasp = time.perf_counter()
@@ -531,7 +573,7 @@ class CuRobo:
 
             # ── Lift: clear world then plan straight up ──────────────────────────
             lift_offset = _pick_lift_offset()
-            chosen_mat = grasp_tool_mats[idx]
+            chosen_mat = winning_mats[idx]  # pose from the tier that succeeded
             lift_tool = chosen_mat.copy()
             lift_tool[:3, 3] += np.array([0.0, 0.0, lift_offset], dtype=np.float32)
 
@@ -542,9 +584,14 @@ class CuRobo:
                 return None
             t_lift = time.perf_counter()
 
+            chosen_approach_z = abs(float(chosen_mat[2, 2]))
             self._logger.info(
                 'CuRobo.plan_pick succeeded (direct-to-grasp): '
-                f'candidates={len(candidates)} chosen_goalset_index={idx} '
+                f'total_candidates={len(candidates)} '
+                f'winning_tier_size={len(winning_mats)} '
+                f'chosen_idx={idx} '
+                f'chosen_approach_z={chosen_approach_z:.2f} '
+                f'chosen_tool0_z={float(chosen_mat[2, 3]):.3f}m '
                 f'lift={lift_offset:.3f}m '
                 f'(grasp={len(grasp_jt.points)}pts lift={len(lift_jt.points)}pts) '
                 f'timing[s]: world={t_world - t0:.2f} '
@@ -1060,13 +1107,22 @@ def _candidate_pose_4x4(candidate) -> np.ndarray:
 
 
 def _effective_gripper_tcp_z_offset() -> float:
-    close_extra = _env_float('PIPELINE_CUROBO_GRASP_CLOSE_EXTRA_M', 0.110)
+    # close_extra: how far tool0 travels past its standard offset toward the object.
+    # Standard: GRIPPER_TCP_Z_OFFSET = 0.1034 m (robotiq_2f_140 model depth).
+    # Actual 2F-85 fingertip contact is ~0.082–0.090 m from tool0.
+    #
+    # Setting close_extra < GRIPPER_TCP_Z_OFFSET keeps tool0 back from TCP
+    # (safe, fingers won't over-extend into the floor).
+    # Setting close_extra > GRIPPER_TCP_Z_OFFSET drives tool0 past TCP
+    # (deeper into the object — risks floor penetration for low grasps).
+    #
+    # Default 0.100 m → offset = 0.1034 - 0.100 = +0.0034 m: tool0 stops
+    # 3.4 mm before TCP (very slightly conservative, no floor penetration risk).
+    close_extra = _env_float('PIPELINE_CUROBO_GRASP_CLOSE_EXTRA_M', 0.100)
     if close_extra < 0.0:
         raise ValueError('PIPELINE_CUROBO_GRASP_CLOSE_EXTRA_M must be non-negative')
     offset = GRIPPER_TCP_Z_OFFSET - close_extra
-    # A small negative offset is allowed: tool0 then sits just past the GraspGen
-    # grasp point (driven deeper onto the object). Floor it to catch gross
-    # misconfig that would ram the wrist well past the target.
+    # Catch gross mis-configuration that would ram the wrist far past the target.
     if offset < -0.05:
         raise ValueError(
             'PIPELINE_CUROBO_GRASP_CLOSE_EXTRA_M too large: tool0 would be '
