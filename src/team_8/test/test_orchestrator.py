@@ -1228,9 +1228,11 @@ def test_orchestrator_home_before_capture_skips_without_joints():
 
 def test_orchestrator_run_pipeline_homes_before_segmenting():
     import json
+    import team_8.orchestrator as _orch_mod
     orch = _orchestrator_skeleton()
     orch._pipeline_busy = False
     orch._active_task = ''
+    orch._active_task_data = None
     orch._segmentation_service_name = '/segmentation/segment_prompt'
     orch._segmentation_service_wait_sec = 0.1
     calls = []
@@ -1241,8 +1243,11 @@ def test_orchestrator_run_pipeline_homes_before_segmenting():
     orch._home_before_capture = MagicMock(
         side_effect=lambda: calls.append(('home', None)) or 555)
     orch._on_segmentation_done = MagicMock()
+    mock_stringstring = MagicMock()
+    mock_stringstring.Request.return_value = MagicMock(data='')
 
-    orch._run_pipeline('pick the mug')
+    with patch.object(_orch_mod, 'StringString', mock_stringstring):
+        orch._run_pipeline('pick the mug')
 
     # Home move happens before segmentation is requested.
     assert [c[0] for c in calls] == ['home', 'segment']
@@ -1426,3 +1431,30 @@ def test_count_target_in_workspace_returns_none_on_gemini_error():
 
     # min_stamp_ns == 0 uses the latest frame regardless of stamp.
     assert orch._count_target_in_workspace('banana', min_stamp_ns=0) is None
+
+
+def test_run_pipeline_captures_before_count_after_home():
+    import json
+    import team_8.orchestrator as _orch_mod
+    orch = _orchestrator_skeleton()
+    orch._pipeline_busy = False
+    orch._active_task = ''
+    orch._active_task_data = {'object': 'coke_can', 'destination': 'storage_1'}
+    orch._segmentation_service_name = '/segmentation/segment_prompt'
+    orch._segmentation_service_wait_sec = 0.1
+    orch._segmentation_client = MagicMock()
+    orch._segmentation_client.wait_for_service.return_value = True
+    orch._segmentation_client.call_async.return_value = MagicMock()
+    orch._home_before_capture = MagicMock(return_value=777)
+    orch._count_target_in_workspace = MagicMock(return_value=2)
+    orch._on_segmentation_done = MagicMock()
+    mock_stringstring = MagicMock()
+    mock_stringstring.Request.return_value = MagicMock(data='')
+
+    with patch.object(_orch_mod, 'StringString', mock_stringstring):
+        orch._run_pipeline('pick the coke can')
+
+    # The before-count uses the target name and the home-arrival stamp, and is
+    # stored on the active task for the post-task comparison.
+    orch._count_target_in_workspace.assert_called_once_with('coke_can', 777)
+    assert orch._active_task_data['_before_count'] == 2

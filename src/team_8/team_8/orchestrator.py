@@ -439,6 +439,15 @@ class PipelineOrchestrator(Node):
             self._retry_or_skip(f'initial home move failed: {exc}')
             return
 
+        # Count target-type instances in the source workspace now (arm at home,
+        # camera over the table) so post-task verification can confirm the count
+        # dropped. Re-captured every attempt so retries compare against the
+        # current scene. None (count unavailable) is stored as-is.
+        if self._active_task_data is not None:
+            object_name = str(self._active_task_data.get('object', ''))
+            self._active_task_data['_before_count'] = (
+                self._count_target_in_workspace(object_name, min_stamp_ns))
+
         request = StringString.Request()
         # min_stamp_ns == 0 (motion disabled / no joints yet) tells the
         # segmentation service to skip the freshness gate and use the latest frame.
