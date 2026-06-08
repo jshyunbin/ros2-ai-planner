@@ -66,6 +66,24 @@ DESTINATIONS = (
 
 # ── JSON schemas ──────────────────────────────────────────────────────────────
 
+WORKSPACE_COUNT_SCHEMA: dict[str, Any] = {
+    "type": "OBJECT",
+    "properties": {
+        "object_count": {
+            "type": "INTEGER",
+            "description": (
+                "Number of distinct graspable objects currently visible "
+                "on the main work table."
+            ),
+        },
+        "reason": {
+            "type": "STRING",
+            "description": "Brief description of what was counted.",
+        },
+    },
+    "required": ["object_count", "reason"],
+}
+
 TASK_PLAN_SCHEMA: dict[str, Any] = {
     "type": "OBJECT",
     "properties": {
@@ -219,7 +237,64 @@ Instruction:
         )
         return self._validate_task_plan(payload)
 
-    # ── Post-pick verification ────────────────────────────────────────────────
+    # ── Workspace object counting ─────────────────────────────────────────────
+
+    def count_workspace_objects(self, pil_image: Any) -> dict[str, Any]:
+        """Count all distinct graspable objects visible on the workspace table.
+
+        Used for count-based pick verification: compare count before and after
+        the pick to determine whether the object was successfully removed,
+        without relying on object-specific identification (which can misidentify
+        similar-looking objects such as a hammer being called a banana).
+
+        Returns:
+            {"object_count": int, "reason": str}
+        """
+        if not hasattr(pil_image, "size"):
+            raise TypeError(
+                "count_workspace_objects expects a PIL image with a size attribute."
+            )
+
+        prompt = """
+You are auditing a robot workspace to count graspable objects.
+
+Count the number of distinct objects currently visible on the main work table
+(the flat surface where the robot picks objects from).
+
+Counting rules:
+1. Count ONLY objects that a robot gripper could pick up: cans, bottles, boxes,
+   fruits, tools, toys, etc.
+2. Do NOT count: the robot arm, the gripper, storage baskets, shelves, or the
+   table/floor surface itself.
+3. Count an object only if more than half of it is visible (not just an edge).
+4. Count each physical object exactly once, even if it overlaps another.
+5. Objects that have already been placed into a basket or on a shelf do NOT
+   count — only objects still on the flat pickup table count.
+
+Return:
+- object_count: integer >= 0
+- reason: one short sentence listing what you counted (e.g. "1 banana and 1 hammer")
+""".strip()
+
+        payload = self._generate_json(
+            contents=[prompt, pil_image],
+            schema=WORKSPACE_COUNT_SCHEMA,
+            temperature=0.0,
+        )
+
+        if not isinstance(payload, dict):
+            raise GeminiAPIError("Object count response must be a JSON object.")
+
+        count = payload.get("object_count")
+        if not isinstance(count, int) or count < 0:
+            raise GeminiAPIError(f"Invalid object_count value: {count!r}")
+
+        return {
+            "object_count": int(count),
+            "reason": str(payload.get("reason", "")).strip(),
+        }
+
+    # ── Post-pick verification (legacy — use count-based instead) ─────────────
 
     def verify_object_removed(
         self,

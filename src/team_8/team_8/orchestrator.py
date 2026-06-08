@@ -212,6 +212,8 @@ class PipelineOrchestrator(Node):
         self._latest_segmentation = None
         self._latest_graspgen = None
         self._latest_joints = None
+        # Object count captured before pick (for count-based verification).
+        self._pre_pick_object_count: int | None = None
 
         # Task queue: deque of dicts with 'object' and 'destination'.
         self._task_queue: collections.deque = collections.deque()
@@ -459,6 +461,11 @@ class PipelineOrchestrator(Node):
         # Move to home pose so the wrist camera faces straight down for capture.
         if self._enable_motion_execution:
             self._home_before_capture()
+
+        # Count workspace objects before picking — used for count-based
+        # post-pick verification.  Captured here so the arm is at home and
+        # the wrist camera has a clear view of the full workspace.
+        self._pre_pick_object_count = self._count_workspace_objects_now()
 
         self._run_segmentation_attempt(object_name)
 
@@ -735,78 +742,98 @@ class PipelineOrchestrator(Node):
             self.get_logger().warn(
                 f'Return-home after place failed (non-fatal): {exc}')
 
-        # Post-pick verification via Gemini.
-        if self._gemini_api is not None and self._enable_motion_execution:
-            self._run_post_pick_verification()
+        # Post-pick verification via object count comparison.
+        if (self._gemini_api is not None
+                and self._enable_motion_execution
+                and self._pre_pick_object_count is not None):
+            self._run_count_based_verification()
         else:
-            # No verification: succeed immediately and start next task.
             self._reset_pipeline_state(
                 success=True, reason=f'pick-place complete → {dest_goal}')
 
-    # ── Post-pick verification ────────────────────────────────────────────────
+    # ── Count-based post-pick verification ───────────────────────────────────
+    #
+    # Strategy: compare the number of graspable objects on the workspace table
+    # BEFORE and AFTER the pick.  If the count decreased the object was removed
+    # successfully.  This avoids object-name misidentification (e.g. Gemini
+    # calling a hammer a "banana") that plagued the description-based approach.
 
-    def _run_post_pick_verification(self) -> None:
-        """Capture current wrist-camera image and verify object was removed."""
-        if self._active_task_data is None:
-            self._reset_pipeline_state(success=True, reason='pick-place complete')
-            return
+    def _count_workspace_objects_now(self) -> int | None:
+        """Capture wrist-camera image and ask Gemini to count workspace objects.
 
-        object_name = self._active_task_data.get('object', self._current_task)
-        destination = self._active_task_data.get('destination', 'unspecified')
-        dest_goal = self._active_destination()
-
+        Returns the integer count, or None if the count cannot be obtained
+        (no image, GeminiAPI unavailable, or API error).
+        """
+        if self._gemini_api is None:
+            return None
         pil_image = self._capture_rgb_as_pil()
         if pil_image is None:
-            self.get_logger().warn(
-                'Post-pick verification skipped: no RGB image available.')
-            self._reset_pipeline_state(
-                success=True, reason=f'pick-place complete → {dest_goal} (no verify)')
-            return
-
+            return None
         try:
-            result = self._gemini_api.verify_object_removed(
-                pil_image,
-                object_name=object_name,
-                destination=destination,
-            )
+            result = self._gemini_api.count_workspace_objects(pil_image)
+            count = result['object_count']
+            self.get_logger().info(
+                f'Workspace object count: {count} ({result["reason"]})')
+            return count
         except Exception as exc:
             self.get_logger().warn(
-                f'verify_object_removed failed ({exc}); assuming success.')
-            self._reset_pipeline_state(
-                success=True, reason=f'pick-place complete → {dest_goal} (verify error)')
-            return
+                f'count_workspace_objects failed ({exc}); skipping count.')
+            return None
 
-        present = result.get('present_in_source_workspace', False)
-        confidence = result.get('confidence', 0.0)
-        reason_text = result.get('reason', '')
+    def _run_count_based_verification(self) -> None:
+        """Verify pick success by comparing pre- and post-pick object counts.
 
-        self.get_logger().info(
-            f'Post-pick verification: present={present} '
-            f'confidence={confidence:.2f} reason="{reason_text}"')
+        Flow:
+          - pre-count (N) was captured in _run_pipeline before segmentation.
+          - post-count (M) is captured here after returning home.
+          - M < N  → object removed → success.
+          - M >= N → pick failed    → retry (if retries remain) or skip.
+        """
+        dest_goal = self._active_destination()
+        pre = self._pre_pick_object_count  # set before pick
 
-        if not present:
-            # Object is gone → success.
+        post = self._count_workspace_objects_now()
+        if post is None:
+            self.get_logger().warn(
+                'Post-pick count unavailable; assuming success.')
             self._reset_pipeline_state(
                 success=True,
-                reason=f'pick verified removed → {dest_goal}: {reason_text}')
+                reason=f'pick-place complete → {dest_goal} (count unavailable)')
+            return
+
+        self.get_logger().info(
+            f'Pick verification: pre_count={pre} post_count={post}')
+
+        if post < pre:
+            # At least one object disappeared → pick succeeded.
+            self._reset_pipeline_state(
+                success=True,
+                reason=f'pick verified: count {pre}→{post}, object removed → {dest_goal}')
+
         elif self._active_task_retries_left > 0:
-            # Object still visible → retry pick.
+            # Count unchanged → object still on table → retry.
             self._active_task_retries_left -= 1
+            object_name = (
+                self._active_task_data.get('object', self._current_task)
+                if self._active_task_data else self._current_task
+            )
             self.get_logger().warn(
-                f"Object '{object_name}' still in workspace after pick "
-                f'({reason_text}). Retrying '
-                f'({self._active_task_retries_left} left)...')
+                f"Pick verification failed: workspace count unchanged "
+                f"({pre}→{post}) for '{object_name}'. "
+                f"Retrying ({self._active_task_retries_left} left)...")
             self._pipeline_busy = False
             self._scan_attempt_idx = 0
+            self._pre_pick_object_count = None  # will be re-counted on next attempt
             self._restart_active_task()
+
         else:
-            # Out of retries → fail.
+            # Out of retries.
             self.get_logger().warn(
-                f"Object '{object_name}' still present after all retries. "
-                'Skipping task.')
+                f'Pick verification failed after all retries '
+                f'(count {pre}→{post}). Skipping task.')
             self._reset_pipeline_state(
                 success=False,
-                reason=f'pick failed after verification retries: {reason_text}')
+                reason=f'pick failed: workspace count unchanged after all retries')
 
     def _capture_rgb_as_pil(self):
         """Convert the latest RGB sensor_msgs/Image to a PIL Image.
