@@ -107,8 +107,8 @@ services:
 
       # ── Destination mapping (Gemini → place_poses.yml goal names) ────────────
       # storage_1 = left basket, storage_2 = right basket (override if needed).
-      - PIPELINE_PLACE_GOAL_STORAGE_1=storageB_1
-      - PIPELINE_PLACE_GOAL_STORAGE_2=storageA_1
+      - PIPELINE_PLACE_GOAL_STORAGE_1=storageA_1
+      - PIPELINE_PLACE_GOAL_STORAGE_2=storageB_1
       - PIPELINE_PLACE_GOAL_BOOKSHELF=bookshelf
 
       # ── Post-pick verification ────────────────────────────────────────────────
