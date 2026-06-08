@@ -1229,6 +1229,9 @@ def test_orchestrator_run_pipeline_homes_before_segmenting():
 
 
 def test_orchestrator_run_pipeline_aborts_when_home_fails():
+    # A failed initial home move must not request segmentation, and it must take
+    # the retry-or-skip path (a transient home-plan failure should not silently
+    # drop the object), not a bare drop to the next task.
     orch = _orchestrator_skeleton()
     orch._pipeline_busy = False
     orch._active_task = ''
@@ -1237,12 +1240,75 @@ def test_orchestrator_run_pipeline_aborts_when_home_fails():
     orch._segmentation_client = MagicMock()
     orch._segmentation_client.wait_for_service.return_value = True
     orch._home_before_capture = MagicMock(side_effect=RuntimeError('no plan'))
-    orch._reset_pipeline_state = MagicMock()
+    orch._retry_or_skip = MagicMock()
 
     orch._run_pipeline('pick the mug')
 
     orch._segmentation_client.call_async.assert_not_called()
+    orch._retry_or_skip.assert_called_once()
+
+
+def test_orchestrator_segmentation_failure_retries_task_in_place():
+    # A pre-grasp pipeline failure (e.g. Gemini 503 on segmentation) must
+    # consume a retry attempt and re-run the SAME task, not silently drop it
+    # and advance to the next queued object. The retry budget previously only
+    # applied to post-execution verification, so a transient stage failure
+    # skipped the object entirely (the "silent skip" bug).
+    import json
+    orch = _orchestrator_skeleton()
+    orch._max_task_attempts = 2
+    orch._active_task_data = {
+        'object': 'banana', 'destination': 'storage_2', '_attempt_count': 1}
+    orch._restart_active_task = MagicMock()
+    orch._reset_pipeline_state = MagicMock()
+    future = MagicMock()
+    future.result.return_value = MagicMock(
+        data=json.dumps({'success': False, 'error': '503 UNAVAILABLE'}))
+
+    orch._on_segmentation_done(future)
+
+    orch._restart_active_task.assert_called_once()
+    orch._reset_pipeline_state.assert_not_called()
+
+
+def test_orchestrator_segmentation_failure_skips_after_attempts_exhausted():
+    # Once the attempt budget is spent the task is skipped (the queue advances
+    # to the next object) rather than retried forever.
+    import json
+    orch = _orchestrator_skeleton()
+    orch._max_task_attempts = 2
+    orch._active_task_data = {
+        'object': 'banana', 'destination': 'storage_2', '_attempt_count': 2}
+    orch._restart_active_task = MagicMock()
+    orch._reset_pipeline_state = MagicMock()
+    future = MagicMock()
+    future.result.return_value = MagicMock(
+        data=json.dumps({'success': False, 'error': '503 UNAVAILABLE'}))
+
+    orch._on_segmentation_done(future)
+
+    orch._restart_active_task.assert_not_called()
     orch._reset_pipeline_state.assert_called_once()
+    assert orch._reset_pipeline_state.call_args.kwargs.get('success') is False
+
+
+def test_orchestrator_graspgen_failure_retries_task_in_place():
+    # GraspGen failures are also pre-grasp, so they take the same retry path.
+    import json
+    orch = _orchestrator_skeleton()
+    orch._max_task_attempts = 2
+    orch._active_task_data = {
+        'object': 'banana', 'destination': 'storage_2', '_attempt_count': 1}
+    orch._restart_active_task = MagicMock()
+    orch._reset_pipeline_state = MagicMock()
+    future = MagicMock()
+    future.result.return_value = MagicMock(
+        data=json.dumps({'success': False, 'error': 'no grasps'}))
+
+    orch._on_graspgen_done(future)
+
+    orch._restart_active_task.assert_called_once()
+    orch._reset_pipeline_state.assert_not_called()
 
 
 # --- curobo_service /curobo/ready readiness signal ---

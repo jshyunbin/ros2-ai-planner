@@ -421,7 +421,7 @@ class PipelineOrchestrator(Node):
             self.get_logger().warn(
                 f'Segmentation service unavailable: {self._segmentation_service_name} '
                 f'(waited {self._segmentation_service_wait_sec:.1f}s)')
-            self._reset_pipeline_state()
+            self._retry_or_skip('segmentation service unavailable')
             return
 
         self._pipeline_busy = True
@@ -433,9 +433,10 @@ class PipelineOrchestrator(Node):
             min_stamp_ns = self._home_before_capture()
         except Exception as exc:
             # The arm may be left partway home with the gripper open; that's a
-            # safe idle state, so just clear busy/active and wait for the next task.
+            # safe idle state. Retry the task (which re-homes) while the attempt
+            # budget allows, then skip — the home plan failure is often transient.
             self.get_logger().error(f'Initial home move failed: {exc}')
-            self._reset_pipeline_state()
+            self._retry_or_skip(f'initial home move failed: {exc}')
             return
 
         request = StringString.Request()
@@ -455,12 +456,13 @@ class PipelineOrchestrator(Node):
             payload = json.loads(result.data)
         except Exception as exc:
             self.get_logger().error(f'Segmentation service call failed: {exc}')
-            self._reset_pipeline_state()
+            self._retry_or_skip(f'segmentation service error: {exc}')
             return
 
         if not payload.get('success'):
             self.get_logger().warn(f'Segmentation failed: {payload}')
-            self._reset_pipeline_state()
+            self._retry_or_skip(
+                f"segmentation failed: {payload.get('error', payload)}")
             return
 
         self._latest_segmentation = payload
@@ -473,7 +475,7 @@ class PipelineOrchestrator(Node):
             self.get_logger().warn(
                 f'GraspGen service unavailable: {self._graspgen_service_name} '
                 f'(waited {self._graspgen_service_wait_sec:.1f}s)')
-            self._reset_pipeline_state()
+            self._retry_or_skip('graspgen service unavailable')
             return
 
         request = StringString.Request()
@@ -489,13 +491,14 @@ class PipelineOrchestrator(Node):
             payload = json.loads(result.data)
         except Exception as exc:
             self.get_logger().error(f'GraspGen service call failed: {exc}')
-            self._reset_pipeline_state()
+            self._retry_or_skip(f'graspgen service error: {exc}')
             return
 
         if not payload.get('success'):
             self.get_logger().warn(
                 f"GraspGen failed: {payload.get('error', payload)}")
-            self._reset_pipeline_state()
+            self._retry_or_skip(
+                f"graspgen failed: {payload.get('error', payload)}")
             return
 
         self._latest_graspgen = payload
@@ -503,7 +506,7 @@ class PipelineOrchestrator(Node):
         if not top_grasps:
             self.get_logger().warn(
                 'GraspGen returned success but no ranked grasps.')
-            self._reset_pipeline_state()
+            self._retry_or_skip('graspgen returned no ranked grasps')
             return
 
         self.get_logger().info(
@@ -530,7 +533,7 @@ class PipelineOrchestrator(Node):
             self.get_logger().warn(
                 'Could not build any valid Pose from GraspGen rows; '
                 'skipping motion execution.')
-            self._reset_pipeline_state()
+            self._retry_or_skip('no valid grasp poses from GraspGen rows')
             return
 
         self._plan_and_execute_pick(grasp_poses)
@@ -572,13 +575,12 @@ class PipelineOrchestrator(Node):
             result = future.result()
         except Exception as exc:
             self.get_logger().error(f'CuRobo service call failed: {exc}')
-            self._reset_pipeline_state(success=False, reason=str(exc))
+            self._retry_or_skip(f'pick plan service error: {exc}')
             return
 
         if not result.success:
             self.get_logger().warn(f'CuRobo pick planning failed: {result.message}')
-            self._reset_pipeline_state(
-                success=False, reason=f'pick planning failed: {result.message}')
+            self._retry_or_skip(f'pick planning failed: {result.message}')
             return
 
         self.get_logger().info(result.message)
@@ -888,6 +890,40 @@ class PipelineOrchestrator(Node):
         self._holding_object = False
 
         self._start_task_attempt(task)
+
+    def _retry_or_skip(self, reason: str) -> None:
+        """Handle a *pre-grasp* pipeline stage failure (segmentation, GraspGen,
+        or pick planning).
+
+        Re-attempt the same task in place while the attempt budget allows,
+        otherwise log a clear skip and let the queue advance. Without this a
+        transient failure (e.g. a Gemini 503 during segmentation) would drop the
+        object permanently: every failure path used to call
+        ``_reset_pipeline_state``, which pops the *next* task and never re-queues
+        the failed one. The retry budget only ever covered post-execution
+        verification, so a single transient hiccup silently skipped the object.
+
+        Only safe before the gripper has closed on the object: it routes through
+        ``_restart_active_task`` (which clears ``_holding_object``). Failures past
+        the grasp must keep using ``_reset_pipeline_state`` so the held-object
+        queue stop still fires.
+        """
+        task = self._active_task_data
+        if task is not None:
+            attempt_count = int(task.get('_attempt_count', 1))
+            if attempt_count < self._max_task_attempts:
+                self.get_logger().warn(
+                    f"Task object={task.get('object')} "
+                    f"destination={task.get('destination')} failed ({reason}); "
+                    f"retrying ({attempt_count + 1}/{self._max_task_attempts}).")
+                self._restart_active_task()
+                return
+            self.get_logger().error(
+                f"Task object={task.get('object')} "
+                f"destination={task.get('destination')} failed ({reason}) after "
+                f"{attempt_count} attempt(s); skipping it and continuing to the "
+                "next task.")
+        self._reset_pipeline_state(success=False, reason=reason)
 
     def _publish_verification_result(
         self, *, task: dict, result: dict
