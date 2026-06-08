@@ -351,6 +351,17 @@ class PipelineOrchestrator(Node):
         too_few_points = payload.get('success') and point_count < self._min_object_points
 
         if seg_failed or too_few_points:
+            # ── Special case: Gemini confirmed the object is absent ──────────
+            # Gemini returned an empty detection list (not a model error) →
+            # the object is simply not in the workspace.  Skip remaining scan
+            # poses and give up immediately — retrying won't help.
+            if payload.get('object_not_found'):
+                self.get_logger().warn(
+                    f"Object '{self._current_task}' not found in workspace "
+                    f"(Gemini returned no detections). Skipping task.")
+                self._reset_pipeline_state()
+                return
+
             reason = (
                 f'Gemini/SAM2 failed: {payload.get("error", "unknown")}'
                 if seg_failed

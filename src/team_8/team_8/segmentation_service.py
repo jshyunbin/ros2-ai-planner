@@ -503,10 +503,17 @@ class SegmentationService(Node):
             )
             return response
         except Exception as exc:
-            self.get_logger().error(f"Segmentation request failed: {exc}")
+            object_not_found = str(exc) == "object_not_found"
+            if object_not_found:
+                self.get_logger().warn(
+                    f"Gemini: '{prompt}' not detected in image — "
+                    "object absent from workspace.")
+            else:
+                self.get_logger().error(f"Segmentation request failed: {exc}")
             failure_payload = {
                 "success": False,
                 "error": str(exc),
+                "object_not_found": object_not_found,
                 "prompt": prompt,
                 "debug_dir": str(debug_path),
             }
@@ -540,8 +547,12 @@ class SegmentationService(Node):
 
         full_prompt = (
             f"{prompt}\n"
-            "Return a JSON list. For each object, return the label and the 'box_2d' "
-            "as an array of exactly 4 integers: [ymin, xmin, ymax, xmax]."
+            "Return a JSON list of detected objects. "
+            "For each detected object, return the label and the 'box_2d' "
+            "as an array of exactly 4 integers: [ymin, xmin, ymax, xmax].\n"
+            "IMPORTANT: If the target object is NOT visible in the image, "
+            "return an empty JSON list: []. "
+            "Do NOT guess or hallucinate a bounding box for an absent object."
         )
         response = self._gemini.models.generate_content(
             model=self._gemini_model,
@@ -549,8 +560,11 @@ class SegmentationService(Node):
             config=config,
         )
         payload = json.loads(response.text)
-        if not isinstance(payload, list) or not payload:
-            raise RuntimeError("Gemini returned no detections.")
+        if not isinstance(payload, list):
+            raise RuntimeError("Gemini returned unexpected format (not a list).")
+        if not payload:
+            # Gemini explicitly found nothing — treat as "object not in workspace"
+            raise RuntimeError("object_not_found")
 
         detection = payload[0]
         label = str(detection.get("label", "")).strip() or "target"
