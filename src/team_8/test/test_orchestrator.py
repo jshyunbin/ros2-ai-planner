@@ -1384,3 +1384,45 @@ def test_curobo_service_check_ready_is_one_shot():
     svc._ready_published = True  # already fired
     svc._check_ready()
     svc._ready_pub.publish.assert_not_called()
+
+
+def test_count_target_in_workspace_returns_count_when_frame_fresh():
+    import numpy as np
+    orch = _orchestrator_skeleton()
+    orch._verification_frame_timeout_sec = 1.0
+    orch._latest_verification_rgb = np.zeros((4, 4, 3), dtype='uint8')
+    orch._latest_verification_rgb_stamp_ns = 200
+    orch._gemini = MagicMock()
+    orch._gemini.count_objects.return_value = {"count": 2, "reason": "two"}
+
+    count = orch._count_target_in_workspace('coke_can', min_stamp_ns=100)
+
+    assert count == 2
+    assert orch._gemini.count_objects.call_args.kwargs['object_name'] == 'coke_can'
+
+
+def test_count_target_in_workspace_returns_none_on_stale_frame():
+    import numpy as np
+    orch = _orchestrator_skeleton()
+    orch._verification_frame_timeout_sec = 0.1
+    orch._latest_verification_rgb = np.zeros((4, 4, 3), dtype='uint8')
+    orch._latest_verification_rgb_stamp_ns = 50  # not newer than min_stamp_ns
+    orch._gemini = MagicMock()
+
+    count = orch._count_target_in_workspace('coke_can', min_stamp_ns=100)
+
+    assert count is None
+    orch._gemini.count_objects.assert_not_called()
+
+
+def test_count_target_in_workspace_returns_none_on_gemini_error():
+    import numpy as np
+    orch = _orchestrator_skeleton()
+    orch._verification_frame_timeout_sec = 1.0
+    orch._latest_verification_rgb = np.zeros((4, 4, 3), dtype='uint8')
+    orch._latest_verification_rgb_stamp_ns = 999
+    orch._gemini = MagicMock()
+    orch._gemini.count_objects.side_effect = RuntimeError('boom')
+
+    # min_stamp_ns == 0 uses the latest frame regardless of stamp.
+    assert orch._count_target_in_workspace('banana', min_stamp_ns=0) is None

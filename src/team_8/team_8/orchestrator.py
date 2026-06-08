@@ -759,6 +759,54 @@ class PipelineOrchestrator(Node):
             except Exception:
                 pass
 
+    def _count_target_in_workspace(
+        self, object_name: str, min_stamp_ns: int
+    ) -> 'int | None':
+        """Count target-type instances in the source workspace.
+
+        Bounded-wait (``_verification_frame_timeout_sec``) for a verification RGB
+        frame stamped after ``min_stamp_ns`` (``min_stamp_ns <= 0`` uses the
+        latest frame), then ask Gemini to count. Returns the integer count, or
+        ``None`` on timeout / decode / Gemini failure (logged, never raises) so
+        callers can fall back to a no-retry success.
+        """
+        if PILImage is None:
+            self.get_logger().warn(
+                'Pillow unavailable; cannot count workspace objects.')
+            return None
+
+        deadline = time.monotonic() + self._verification_frame_timeout_sec
+        frame = None
+        while True:
+            stamp_ns = self._latest_verification_rgb_stamp_ns
+            candidate = self._latest_verification_rgb
+            fresh = candidate is not None and (
+                min_stamp_ns <= 0 or stamp_ns > min_stamp_ns)
+            if fresh:
+                frame = candidate
+                break
+            if time.monotonic() >= deadline:
+                self.get_logger().warn(
+                    'No fresh verification frame for object count '
+                    f'(object={object_name}, min_stamp_ns={min_stamp_ns}).')
+                return None
+            time.sleep(0.05)
+
+        image_rgb = frame[:, :, ::-1].copy()
+        try:
+            result = self._gemini.count_objects(
+                PILImage.fromarray(image_rgb), object_name=object_name)
+            count = int(result['count'])
+        except Exception as exc:
+            self.get_logger().warn(
+                f'Object count failed (object={object_name}): {exc}')
+            return None
+
+        self.get_logger().info(
+            f'Workspace count object={object_name} count={count} '
+            f"reason={result.get('reason', '')}")
+        return count
+
     def _run_post_task_verification(self) -> None:
         task = self._active_task_data
         if task is None:
