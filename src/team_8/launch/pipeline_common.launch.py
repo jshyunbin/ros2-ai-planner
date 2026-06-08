@@ -4,6 +4,8 @@ deploy.launch.py / debug.launch.py include this file and set the toggles;
 neither requires the user to pass any argument.
 """
 
+import os
+
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, ExecuteProcess
 from launch.conditions import IfCondition
@@ -127,6 +129,8 @@ def generate_launch_description() -> LaunchDescription:
                         "auto_run_on_task_command": True,
                         "place_goal": "storageA_1",
                         "auto_loop": True,
+                        "pick_verify_retries": int(
+                            os.environ.get("PIPELINE_PICK_VERIFY_RETRIES", "1")),
                     }
                 ],
             ),

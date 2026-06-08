@@ -104,6 +104,17 @@ services:
       # value are tried first.  0.85 ≈ grasps within 32° of straight-down.
       # If tier-0 produces no plan, cuRobo falls back to all candidates.
       - PIPELINE_CUROBO_TIER0_MIN_APPROACH_Z=0.85
+
+      # ── Destination mapping (Gemini → place_poses.yml goal names) ────────────
+      # storage_1 = left basket, storage_2 = right basket (override if needed).
+      - PIPELINE_PLACE_GOAL_STORAGE_1=storageB_1
+      - PIPELINE_PLACE_GOAL_STORAGE_2=storageA_1
+
+      # ── Post-pick verification ────────────────────────────────────────────────
+      # Number of times the pipeline retries picking if Gemini verification sees
+      # the object still present in the workspace after a pick attempt.
+      # 0 = no verification retries (skip verification), 1 = one retry, etc.
+      - PIPELINE_PICK_VERIFY_RETRIES=1
     command: >
       bash -c "cd /ros2_ws &&
         colcon build --symlink-install --packages-select team_8 2>&1 &&

@@ -5,10 +5,16 @@ Pick execution follows yeina's 3-phase approach:
   2. Close gripper
   3. Send lift trajectory (arm lifts with object)
 
+Natural-language task commands ("A를 B로 옮겨라") are parsed via GeminiAPI
+into a structured task queue.  Each task specifies an object name and a
+destination.  After a successful pick-and-place the result is verified by
+sending a wrist-camera image back to Gemini.
+
 All execution calls are blocking (_send_and_wait); the node is spun with
 MultiThreadedExecutor so spin_until_future_complete works inside callbacks.
 """
 
+import collections
 import copy
 import json
 import os
@@ -22,7 +28,7 @@ try:  # pragma: no cover - runtime dependency
     from rclpy.node import Node
     from rclpy.executors import MultiThreadedExecutor
     from rclpy.qos import QoSDurabilityPolicy, QoSProfile, ReliabilityPolicy
-    from sensor_msgs.msg import JointState
+    from sensor_msgs.msg import JointState, Image
     from std_msgs.msg import Bool, Empty, String
     from control_msgs.action import FollowJointTrajectory
     from geometry_msgs.msg import Pose
@@ -33,6 +39,7 @@ except ImportError:  # pragma: no cover - import-only test fallback
     ActionClient = None
     GoalStatus = None
     JointState = None
+    Image = None
     FollowJointTrajectory = None
     Pose = None
     JointTrajectory = None
@@ -61,6 +68,22 @@ from team_8.pipeline_utils import as_bool as _as_bool
 from team_8.pipeline_utils import env_float as _env_float
 from team_8.pipeline_utils import pose_from_grasp_row as _pose_from_grasp_row_util
 
+try:
+    from team_8.gemini_api import (
+        GeminiAPI,
+        GeminiAPIError,
+        DESTINATIONS as _GEMINI_DESTINATIONS,
+        build_segmentation_prompt as _build_seg_prompt,
+    )
+    _GEMINI_API_AVAILABLE = True
+except ImportError:
+    GeminiAPI = None  # type: ignore[misc,assignment]
+    GeminiAPIError = RuntimeError  # type: ignore[misc,assignment]
+    _GEMINI_API_AVAILABLE = False
+
+    def _build_seg_prompt(object_name: str) -> str:  # type: ignore[misc]
+        return object_name
+
 
 # Robotiq 2F-85 gripper constants (from challenge_constants.py / yeina).
 _GRIPPER_JOINT = 'robotiq_85_left_knuckle_joint'
@@ -69,6 +92,16 @@ _GRIPPER_OPEN = 0.0
 # force and embeds thin objects into the finger mesh.  0.6 rad grips firmly
 # without interpenetration.  Override with PIPELINE_GRIPPER_CLOSE_POSITION.
 _GRIPPER_CLOSED = _env_float('PIPELINE_GRIPPER_CLOSE_POSITION', 0.6)
+
+# Destination → place_poses.yml goal_name mapping.
+# Set PIPELINE_PLACE_GOAL_STORAGE_1 / _STORAGE_2 to override defaults.
+_DESTINATION_TO_GOAL: dict[str, str] = {
+    'storage_1':      os.environ.get('PIPELINE_PLACE_GOAL_STORAGE_1', 'storageB_1'),
+    'storage_2':      os.environ.get('PIPELINE_PLACE_GOAL_STORAGE_2', 'storageA_1'),
+    'bookshelf_floor1': os.environ.get('PIPELINE_PLACE_GOAL_BOOKSHELF1', 'bookshelf_floor1'),
+    'bookshelf_floor2': os.environ.get('PIPELINE_PLACE_GOAL_BOOKSHELF2', 'bookshelf_floor2'),
+    'unspecified':    '',  # falls back to self._place_goal parameter
+}
 
 
 class PipelineOrchestrator(Node):
@@ -99,8 +132,11 @@ class PipelineOrchestrator(Node):
                                '/ur5_controller/follow_joint_trajectory')
         self.declare_parameter('gripper_action_name',
                                '/gripper_controller/follow_joint_trajectory')
-        self.declare_parameter('place_goal', 'storage_1')
+        self.declare_parameter('rgb_camera_topic', '/camera/color/image_raw')
+        self.declare_parameter('place_goal', 'storageA_1')
         self.declare_parameter('auto_loop', True)
+        self.declare_parameter('gemini_model', 'gemini-2.5-flash')
+        self.declare_parameter('pick_verify_retries', 1)
 
         self._segmentation_service_name = str(
             self.get_parameter('segmentation_service_name').value)
@@ -122,6 +158,9 @@ class PipelineOrchestrator(Node):
             self.get_parameter('enable_motion_execution').value)
         self._place_goal = str(self.get_parameter('place_goal').value)
         self._auto_loop = _as_bool(self.get_parameter('auto_loop').value)
+        self._gemini_model = str(self.get_parameter('gemini_model').value)
+        self._pick_verify_retries = int(
+            self.get_parameter('pick_verify_retries').value)
 
         # Reentrant group: pipeline callbacks invoke spin_until_future_complete
         # (via _wait_for_future) which would deadlock under a mutually exclusive group.
@@ -134,6 +173,14 @@ class PipelineOrchestrator(Node):
         self._joint_sub = self.create_subscription(
             JointState, self.JOINT_STATES_TOPIC, self._cache_joints, 10)
 
+        # Subscribe to wrist camera for post-pick verification.
+        _rgb_topic = str(self.get_parameter('rgb_camera_topic').value)
+        self._latest_rgb_msg = None
+        if Image is not None:
+            self.create_subscription(
+                Image, _rgb_topic, self._cache_rgb, 10)
+            self.get_logger().info(f'Subscribed to RGB camera: {_rgb_topic}')
+
         # Subscribe to /curobo/ready (TRANSIENT_LOCAL) so we catch it even if
         # curobo_service published before we started.
         self._curobo_ready_event = threading.Event()
@@ -144,44 +191,58 @@ class PipelineOrchestrator(Node):
         ) if QoSDurabilityPolicy is not None else 10
         self.create_subscription(
             Bool, '/curobo/ready', self._on_curobo_ready, _latched_qos)
+
         self._segmentation_client = self.create_client(
             StringString, self._segmentation_service_name)
         self._graspgen_client = self.create_client(
             StringString, self._graspgen_service_name)
 
         # Multi-view scan pose list.
-        # /save_scan_pose  — append current joint state to the list
-        # /clear_scan_poses — reset the list
-        # On segmentation failure the orchestrator automatically moves to the
-        # next saved pose and retries, handling both Gemini bbox failure and
-        # insufficient point cloud coverage.
         if BoolNone is not None:
-            self.create_service(BoolNone, '/save_scan_pose', self._save_scan_pose_callback)
-            self.create_service(BoolNone, '/clear_scan_poses', self._clear_scan_poses_callback)
+            self.create_service(
+                BoolNone, '/save_scan_pose', self._save_scan_pose_callback)
+            self.create_service(
+                BoolNone, '/clear_scan_poses', self._clear_scan_poses_callback)
 
-        # Publisher for TSDF reset — sent after each arm movement so ghost
-        # voxels from the previous arm pose are cleared before the next plan.
+        # Publisher for TSDF reset — sent after each arm movement.
         self._reset_map_pub = self.create_publisher(Empty, '/curobo/reset_map', 10)
 
+        # ── Pipeline state ────────────────────────────────────────────────────
         self._pipeline_busy = False
-        self._active_task = ''
         self._latest_segmentation = None
         self._latest_graspgen = None
         self._latest_joints = None
+
+        # Task queue: deque of dicts with 'object' and 'destination'.
+        self._task_queue: collections.deque = collections.deque()
+        # Currently executing task data.
+        self._active_task_data: dict | None = None
+        # How many pick-and-verify retries remain for the active task.
+        self._active_task_retries_left: int = 0
+
         # Scan poses: arm moves to each before segmentation on retry.
-        # Attempt 0 always uses the home/current pose (no scan pose movement).
-        # Attempts 1..N use scan_poses[0..N-1].
-        # Pre-loaded from PIPELINE_SCAN_POSES env var at startup.
         self._scan_poses = _load_default_scan_poses()
-        self._scan_attempt_idx = 0     # 0 = home, 1+ = scan_poses[idx-1]
-        self._current_task = ''        # task string carried across retries
-        # Minimum number of object points to accept segmentation result.
+        self._scan_attempt_idx = 0
+        self._current_task = ''  # object name carried across retries
         self._min_object_points = 500
-        # Max retries when cuRobo pick planning fails (each retry re-segments from
-        # the next scan pose so the arm viewpoint changes and TSDF is refreshed).
         self._max_planning_retries = int(
             os.environ.get('PIPELINE_MAX_PLANNING_RETRIES', '2'))
 
+        # ── GeminiAPI for command parsing + verification ───────────────────
+        self._gemini_api: GeminiAPI | None = None
+        if _GEMINI_API_AVAILABLE and GeminiAPI is not None:
+            try:
+                self._gemini_api = GeminiAPI(
+                    model=self._gemini_model,
+                    logger=self.get_logger(),
+                )
+                self.get_logger().info(
+                    f'GeminiAPI ready (model={self._gemini_model}).')
+            except Exception as exc:
+                self.get_logger().warn(
+                    f'GeminiAPI init failed — task parsing disabled: {exc}')
+
+        # ── Motion clients ────────────────────────────────────────────────
         self._curobo_client = None
         self._arm_client = None
         self._gripper_client = None
@@ -211,7 +272,8 @@ class PipelineOrchestrator(Node):
             f'segmentation={self._segmentation_service_name} '
             f'graspgen={self._graspgen_service_name} '
             f'curobo={self._curobo_service_name} '
-            f'motion_execution={self._enable_motion_execution}'
+            f'motion_execution={self._enable_motion_execution} '
+            f'gemini_api={self._gemini_api is not None}'
         )
 
     # ── ROS2 subscriptions ────────────────────────────────────────────────────
@@ -222,20 +284,52 @@ class PipelineOrchestrator(Node):
             self._curobo_ready_event.set()
 
     def task_command_callback(self, msg: String) -> None:
-        self.get_logger().info(f'Received task command: {msg.data}')
-        if self._auto_run_on_task_command:
-            self._run_pipeline(msg.data)
+        """Handle incoming task command string.
+
+        If GeminiAPI is available, parse natural-language instruction into a
+        structured task queue ("A를 B로 옮겨라").  Otherwise treat the raw
+        string as a single object name with the default place destination.
+        """
+        instruction = str(msg.data).strip()
+        self.get_logger().info(f'Received task command: {instruction!r}')
+
+        if not self._auto_run_on_task_command:
+            return
+
+        tasks: list[dict] = []
+
+        if self._gemini_api is not None:
+            try:
+                plan = self._gemini_api.parse_task_command(instruction)
+                tasks = plan.get('tasks', [])
+                self.get_logger().info(
+                    f'Parsed task plan: {tasks}')
+            except Exception as exc:
+                self.get_logger().warn(
+                    f'parse_task_command failed ({exc}); '
+                    f'treating command as raw object name.')
+
+        if not tasks:
+            # Fallback: treat the whole command as a single object name.
+            tasks = [{'object': instruction, 'destination': 'unspecified'}]
+
+        # Enqueue all tasks and start if idle.
+        for t in tasks:
+            self._task_queue.append(t)
+        self.get_logger().info(
+            f'Task queue: {len(self._task_queue)} task(s) pending.')
+
+        if not self._pipeline_busy:
+            self._start_next_task()
 
     def _cache_joints(self, msg) -> None:
         self._latest_joints = msg
 
-    def _save_scan_pose_callback(self, request, response):
-        """Append current joint state to the scan pose list.
+    def _cache_rgb(self, msg) -> None:
+        self._latest_rgb_msg = msg
 
-        Call from each desired camera viewpoint:
-          ros2 service call /save_scan_pose riro_srvs/srv/BoolNone "{data: true}"
-        Poses are tried in order on segmentation failure.
-        """
+    def _save_scan_pose_callback(self, request, response):
+        """Append current joint state to the scan pose list."""
         if self._latest_joints is None:
             self.get_logger().warn('save_scan_pose: no /joint_states received yet.')
             return response
@@ -246,39 +340,107 @@ class PipelineOrchestrator(Node):
         return response
 
     def _clear_scan_poses_callback(self, request, response):
-        """Clear all saved scan poses.
-
-          ros2 service call /clear_scan_poses riro_srvs/srv/BoolNone "{data: true}"
-        """
+        """Clear all saved scan poses."""
         n = len(self._scan_poses)
         self._scan_poses.clear()
         self._scan_attempt_idx = 0
         self.get_logger().info(f'Cleared {n} scan pose(s).')
         return response
 
-    # ── pipeline entry ────────────────────────────────────────────────────────
+    # ── Task queue management ─────────────────────────────────────────────────
 
-    def _run_pipeline(self, task: str) -> None:
-        task = task.strip()
-        if not task:
-            self.get_logger().warn('Ignoring empty task command.')
+    def _start_next_task(self) -> None:
+        """Pop the next task from the queue and start it, or go idle."""
+        if not self._task_queue:
+            self.get_logger().info('Task queue empty — pipeline idle.')
+            return
+
+        task_data = self._task_queue.popleft()
+        self._active_task_data = task_data
+        self._active_task_retries_left = self._pick_verify_retries
+        object_name = task_data.get('object', '')
+        destination = task_data.get('destination', 'unspecified')
+        self.get_logger().info(
+            f"Starting task: pick '{object_name}' → place '{destination}'.")
+        self._start_task_attempt()
+
+    def _start_task_attempt(self) -> None:
+        """Begin a single pick attempt for the active task."""
+        if self._active_task_data is None:
+            return
+        object_name = self._active_task_data.get('object', '')
+        self._run_pipeline(object_name)
+
+    def _restart_active_task(self) -> None:
+        """Re-run the current task (pick verification failed, retries remain)."""
+        if self._active_task_data is None:
+            return
+        object_name = self._active_task_data.get('object', '')
+        self.get_logger().info(
+            f"Restarting task for '{object_name}' "
+            f'({self._active_task_retries_left} retr(ies) left).')
+        self._start_task_attempt()
+
+    def _active_destination(self) -> str:
+        """Resolve the active task's destination to a place_poses.yml goal name."""
+        if self._active_task_data is None:
+            return self._place_goal
+        dest = self._active_task_data.get('destination', 'unspecified')
+        mapped = _DESTINATION_TO_GOAL.get(dest, '')
+        return mapped if mapped else self._place_goal
+
+    def _reset_pipeline_state(self, *, success: bool = False, reason: str = '') -> None:
+        """Clear active task state and start the next task if any.
+
+        When success=False and the gripper may still be holding an object
+        (e.g. place failed), the remaining queue is cleared for safety.
+        """
+        if reason:
+            level = 'info' if success else 'warn'
+            getattr(self.get_logger(), level)(
+                f'Task {"succeeded" if success else "failed"}: {reason}')
+
+        self._pipeline_busy = False
+        self._active_task_data = None
+        self._scan_attempt_idx = 0
+        self._current_task = ''
+        self._latest_segmentation = None
+        self._latest_graspgen = None
+
+        # Auto-loop: re-queue a new attempt for the same object after success.
+        # Only applies when the queue was empty (single-object continuous loop).
+        if success and self._auto_loop and not self._task_queue:
+            # Nothing else queued — idle; the user can send the next command.
+            self.get_logger().info('Auto-loop idle — waiting for next command.')
+            return
+
+        self._start_next_task()
+
+    # ── Pipeline entry ────────────────────────────────────────────────────────
+
+    def _run_pipeline(self, object_name: str) -> None:
+        """Begin the segmentation → GraspGen → CuRobo → execution pipeline."""
+        object_name = object_name.strip()
+        if not object_name:
+            self.get_logger().warn('Ignoring empty object name.')
+            self._reset_pipeline_state(success=False, reason='empty object name')
             return
         if self._pipeline_busy:
             self.get_logger().warn(
-                f"Pipeline busy with '{self._active_task}'. "
-                f"Ignoring new task '{task}'.")
+                f"Pipeline already busy with '{self._current_task}'. "
+                f"Ignoring new request for '{object_name}'.")
             return
         if not self._segmentation_client.wait_for_service(
                 timeout_sec=self._segmentation_service_wait_sec):
             self.get_logger().warn(
-                f'Segmentation service unavailable: {self._segmentation_service_name} '
-                f'(waited {self._segmentation_service_wait_sec:.1f}s)')
+                f'Segmentation service unavailable: {self._segmentation_service_name}')
+            self._reset_pipeline_state(
+                success=False, reason='segmentation service unavailable')
             return
 
         self._pipeline_busy = True
-        self._active_task = task
-        self._current_task = task
-        self._scan_attempt_idx = 0  # reset retry counter for new task
+        self._current_task = object_name
+        self._scan_attempt_idx = 0
 
         # Wait for TSDF to accumulate enough frames before doing anything.
         if self._enable_motion_execution:
@@ -286,7 +448,8 @@ class PipelineOrchestrator(Node):
                 self.get_logger().error(
                     'CuRobo TSDF not ready within '
                     f'{self._curobo_ready_timeout_sec:.0f}s — aborting pipeline.')
-                self._reset_pipeline_state()
+                self._reset_pipeline_state(
+                    success=False, reason='curobo TSDF not ready')
                 return
 
         # Ensure gripper is open before starting a new pick.
@@ -297,17 +460,15 @@ class PipelineOrchestrator(Node):
         if self._enable_motion_execution:
             self._home_before_capture()
 
-        self._run_segmentation_attempt(task)
+        self._run_segmentation_attempt(object_name)
 
-    def _run_segmentation_attempt(self, task: str) -> None:
-        """Move to the current scan pose (if any) and call the segmentation service.
+    def _run_segmentation_attempt(self, object_name: str) -> None:
+        """Move to current scan pose (if any) and call segmentation service.
 
         Attempt 0 stays at home (wrist camera straight down).
-        Attempts 1..N move to scan_poses[0..N-1] before segmenting.
+        Retries (attempt ≥ 1) move to scan_poses[attempt-1] before segmenting.
         """
-        # Attempt 0 uses the home pose already set by _home_before_capture().
-        # Retries (attempt ≥ 1) move to the corresponding scan pose.
-        scan_idx = self._scan_attempt_idx - 1  # scan_poses is 0-indexed
+        scan_idx = self._scan_attempt_idx - 1
         if scan_idx >= 0 and self._scan_poses and self._arm_client is not None:
             pose = self._scan_poses[scan_idx % len(self._scan_poses)]
             scan_traj = _joint_state_to_trajectory(pose)
@@ -323,18 +484,22 @@ class PipelineOrchestrator(Node):
         if not self._segmentation_client.wait_for_service(
                 timeout_sec=self._segmentation_service_wait_sec):
             self.get_logger().warn('Segmentation service unavailable.')
-            self._reset_pipeline_state()
+            self._reset_pipeline_state(
+                success=False, reason='segmentation service unavailable')
             return
 
+        # Build a rich segmentation prompt including object descriptions.
+        seg_prompt = _build_seg_prompt(object_name)
+
         request = StringString.Request()
-        request.data = task
+        request.data = seg_prompt
         future = self._segmentation_client.call_async(request)
         future.add_done_callback(self._on_segmentation_done)
         self.get_logger().info(
-            f'Started segmentation for task: {task} '
+            f'Started segmentation for "{object_name}" '
             f'(attempt {self._scan_attempt_idx + 1})')
 
-    # ── pipeline callbacks ────────────────────────────────────────────────────
+    # ── Pipeline callbacks ────────────────────────────────────────────────────
 
     def _on_segmentation_done(self, future) -> None:
         try:
@@ -342,24 +507,24 @@ class PipelineOrchestrator(Node):
             payload = json.loads(result.data)
         except Exception as exc:
             self.get_logger().error(f'Segmentation service call failed: {exc}')
-            self._reset_pipeline_state()
+            self._reset_pipeline_state(
+                success=False, reason=f'segmentation call error: {exc}')
             return
 
-        # Check both failure modes: Gemini bbox failure OR insufficient point cloud.
         point_count = int(payload.get('object_point_count', 0))
         seg_failed = not payload.get('success')
-        too_few_points = payload.get('success') and point_count < self._min_object_points
+        too_few_points = (
+            payload.get('success') and point_count < self._min_object_points)
 
         if seg_failed or too_few_points:
-            # ── Special case: Gemini confirmed the object is absent ──────────
-            # Gemini returned an empty detection list (not a model error) →
-            # the object is simply not in the workspace.  Skip remaining scan
-            # poses and give up immediately — retrying won't help.
+            # Special case: Gemini confirmed the object is absent → skip.
             if payload.get('object_not_found'):
                 self.get_logger().warn(
                     f"Object '{self._current_task}' not found in workspace "
                     f"(Gemini returned no detections). Skipping task.")
-                self._reset_pipeline_state()
+                self._reset_pipeline_state(
+                    success=False,
+                    reason=f"'{self._current_task}' not found in workspace")
                 return
 
             reason = (
@@ -367,11 +532,10 @@ class PipelineOrchestrator(Node):
                 if seg_failed
                 else f'point cloud too sparse ({point_count} < {self._min_object_points})'
             )
-            self.get_logger().warn(f'Segmentation attempt {self._scan_attempt_idx + 1} failed: {reason}')
+            self.get_logger().warn(
+                f'Segmentation attempt {self._scan_attempt_idx + 1} failed: {reason}')
             self._scan_attempt_idx += 1
 
-            # Retry from the next scan pose if available.
-            # Total attempts = 1 (home) + len(scan_poses).
             max_attempts = 1 + len(self._scan_poses)
             if self._scan_attempt_idx < max_attempts:
                 self.get_logger().info(
@@ -380,8 +544,9 @@ class PipelineOrchestrator(Node):
                 self._run_segmentation_attempt(self._current_task)
             else:
                 self.get_logger().warn(
-                    f'Segmentation failed after {self._scan_attempt_idx} attempt(s). Giving up.')
-                self._reset_pipeline_state()
+                    f'Segmentation failed after {self._scan_attempt_idx} attempt(s). '
+                    f'Giving up.')
+                self._reset_pipeline_state(success=False, reason=reason)
             return
 
         self._latest_segmentation = payload
@@ -392,14 +557,12 @@ class PipelineOrchestrator(Node):
         if not self._graspgen_client.wait_for_service(
                 timeout_sec=self._graspgen_service_wait_sec):
             self.get_logger().warn(
-                f'GraspGen service unavailable: {self._graspgen_service_name} '
-                f'(waited {self._graspgen_service_wait_sec:.1f}s)')
-            self._reset_pipeline_state()
+                f'GraspGen service unavailable: {self._graspgen_service_name}')
+            self._reset_pipeline_state(
+                success=False, reason='GraspGen service unavailable')
             return
 
         request = StringString.Request()
-        # Token: the segmented cloud's stamp, so GraspGen infers on this run's
-        # cloud (empty string falls back to "use latest").
         request.data = str(self._latest_segmentation.get('cloud_stamp_ns', ''))
         future = self._graspgen_client.call_async(request)
         future.add_done_callback(self._on_graspgen_done)
@@ -410,13 +573,14 @@ class PipelineOrchestrator(Node):
             payload = json.loads(result.data)
         except Exception as exc:
             self.get_logger().error(f'GraspGen service call failed: {exc}')
-            self._reset_pipeline_state()
+            self._reset_pipeline_state(
+                success=False, reason=f'GraspGen call error: {exc}')
             return
 
         if not payload.get('success'):
             self.get_logger().warn(
                 f"GraspGen failed: {payload.get('error', payload)}")
-            self._reset_pipeline_state()
+            self._reset_pipeline_state(success=False, reason='GraspGen failed')
             return
 
         self._latest_graspgen = payload
@@ -424,7 +588,7 @@ class PipelineOrchestrator(Node):
         if not top_grasps:
             self.get_logger().warn(
                 'GraspGen returned success but no ranked grasps.')
-            self._reset_pipeline_state()
+            self._reset_pipeline_state(success=False, reason='no ranked grasps')
             return
 
         self.get_logger().info(
@@ -436,7 +600,8 @@ class PipelineOrchestrator(Node):
         )
 
         if not self._enable_motion_execution:
-            self._reset_pipeline_state()
+            self._reset_pipeline_state(
+                success=True, reason='motion execution disabled')
             return
 
         # Build geometry_msgs/Pose for every ranked grasp candidate.
@@ -449,14 +614,14 @@ class PipelineOrchestrator(Node):
             self.get_logger().warn(
                 'Could not build any valid Pose from GraspGen rows; '
                 'skipping motion execution.')
-            self._reset_pipeline_state()
+            self._reset_pipeline_state(success=False, reason='no valid grasp poses')
             return
 
-        # ── White-sphere gripper centering correction ────────────────────────
-        # segmentation_service detects the gripper's white sphere and the object
+        # ── White-sphere gripper centering correction ─────────────────────────
+        # segmentation_service detects the gripper white sphere and the object
         # centroid in the wrist camera image, back-projects both to world frame,
-        # and returns the lateral offset needed to align the gripper center with
-        # the object center.  Apply it to all grasp candidates before planning.
+        # and returns the lateral offset needed to align the gripper with the
+        # object center.  Apply it to all grasp candidates before planning.
         xy_corr = self._latest_segmentation.get('grasp_xy_correction')
         if xy_corr and len(xy_corr) == 2:
             dx, dy = float(xy_corr[0]), float(xy_corr[1])
@@ -478,12 +643,12 @@ class PipelineOrchestrator(Node):
         if self._latest_joints is None:
             self.get_logger().warn(
                 'No /joint_states received; skipping motion execution.')
-            self._reset_pipeline_state()
+            self._reset_pipeline_state(success=False, reason='no joint states')
             return
         if self._curobo_client is None:
             self.get_logger().warn(
                 'Motion execution enabled but CuRobo service client unavailable.')
-            self._reset_pipeline_state()
+            self._reset_pipeline_state(success=False, reason='no CuRobo client')
             return
 
         self.get_logger().info(
@@ -494,7 +659,7 @@ class PipelineOrchestrator(Node):
                 timeout_sec=self._curobo_service_wait_sec):
             self.get_logger().warn(
                 f'CuRobo service unavailable: {self._curobo_service_name}')
-            self._reset_pipeline_state()
+            self._reset_pipeline_state(success=False, reason='CuRobo unavailable')
             return
 
         request = PlanTrajectory.Request()
@@ -510,7 +675,8 @@ class PipelineOrchestrator(Node):
             result = future.result()
         except Exception as exc:
             self.get_logger().error(f'CuRobo service call failed: {exc}')
-            self._reset_pipeline_state()
+            self._reset_pipeline_state(
+                success=False, reason=f'CuRobo call error: {exc}')
             return
 
         if not result.success:
@@ -526,15 +692,13 @@ class PipelineOrchestrator(Node):
                 self.get_logger().warn(
                     f'Pick planning failed after {self._scan_attempt_idx} attempt(s). '
                     'Giving up.')
-                self._reset_pipeline_state()
+                self._reset_pipeline_state(
+                    success=False, reason='pick planning failed')
             return
 
         self.get_logger().info(result.message)
 
         # 4-phase pick execution: open gripper → approach+grasp → close → lift.
-        # Opening first is essential: the planned grasp pose assumes open
-        # fingers, so a gripper left closed from a prior cycle would collide
-        # with the object during the approach instead of enclosing it.
         try:
             self._send_gripper(closed=False)
             self._send_and_wait(
@@ -548,35 +712,131 @@ class PipelineOrchestrator(Node):
                 self._send_gripper(closed=False)
             except Exception:
                 pass
-            self._reset_pipeline_state()
+            self._reset_pipeline_state(
+                success=False, reason=f'pick execution error: {exc}')
             return
 
-        # Place: transit + release + return home.
+        # Place: transit → optional bookshelf insert → release → optional retract.
+        dest_goal = self._active_destination()
         try:
-            self._plan_and_execute_place(self._place_goal)
+            self._plan_and_execute_place(dest_goal)
         except Exception as exc:
             self.get_logger().error(f'Place execution failed: {exc}')
             try:
                 self._send_gripper(closed=False)
             except Exception:
                 pass
+            # Don't reset here: try returning home first.
 
+        # Return home; TSDF reset follows inside _plan_and_execute_home.
         try:
             self._plan_and_execute_home()
         except Exception as exc:
-            self.get_logger().warn(f'Return-home after place failed (non-fatal): {exc}')
+            self.get_logger().warn(
+                f'Return-home after place failed (non-fatal): {exc}')
 
-        # Auto-loop: restart pipeline for the same task.
-        if self._auto_loop:
-            self.get_logger().info(
-                f"Auto-loop enabled — restarting pipeline for '{self._current_task}'.")
-            self._pipeline_busy = False
-            self._active_task = ''
-            self._run_pipeline(self._current_task)
+        # Post-pick verification via Gemini.
+        if self._gemini_api is not None and self._enable_motion_execution:
+            self._run_post_pick_verification()
         else:
-            self._reset_pipeline_state()
+            # No verification: succeed immediately and start next task.
+            self._reset_pipeline_state(
+                success=True, reason=f'pick-place complete → {dest_goal}')
 
-    # ── execution helpers ─────────────────────────────────────────────────────
+    # ── Post-pick verification ────────────────────────────────────────────────
+
+    def _run_post_pick_verification(self) -> None:
+        """Capture current wrist-camera image and verify object was removed."""
+        if self._active_task_data is None:
+            self._reset_pipeline_state(success=True, reason='pick-place complete')
+            return
+
+        object_name = self._active_task_data.get('object', self._current_task)
+        destination = self._active_task_data.get('destination', 'unspecified')
+        dest_goal = self._active_destination()
+
+        pil_image = self._capture_rgb_as_pil()
+        if pil_image is None:
+            self.get_logger().warn(
+                'Post-pick verification skipped: no RGB image available.')
+            self._reset_pipeline_state(
+                success=True, reason=f'pick-place complete → {dest_goal} (no verify)')
+            return
+
+        try:
+            result = self._gemini_api.verify_object_removed(
+                pil_image,
+                object_name=object_name,
+                destination=destination,
+            )
+        except Exception as exc:
+            self.get_logger().warn(
+                f'verify_object_removed failed ({exc}); assuming success.')
+            self._reset_pipeline_state(
+                success=True, reason=f'pick-place complete → {dest_goal} (verify error)')
+            return
+
+        present = result.get('present_in_source_workspace', False)
+        confidence = result.get('confidence', 0.0)
+        reason_text = result.get('reason', '')
+
+        self.get_logger().info(
+            f'Post-pick verification: present={present} '
+            f'confidence={confidence:.2f} reason="{reason_text}"')
+
+        if not present:
+            # Object is gone → success.
+            self._reset_pipeline_state(
+                success=True,
+                reason=f'pick verified removed → {dest_goal}: {reason_text}')
+        elif self._active_task_retries_left > 0:
+            # Object still visible → retry pick.
+            self._active_task_retries_left -= 1
+            self.get_logger().warn(
+                f"Object '{object_name}' still in workspace after pick "
+                f'({reason_text}). Retrying '
+                f'({self._active_task_retries_left} left)...')
+            self._pipeline_busy = False
+            self._scan_attempt_idx = 0
+            self._restart_active_task()
+        else:
+            # Out of retries → fail.
+            self.get_logger().warn(
+                f"Object '{object_name}' still present after all retries. "
+                'Skipping task.')
+            self._reset_pipeline_state(
+                success=False,
+                reason=f'pick failed after verification retries: {reason_text}')
+
+    def _capture_rgb_as_pil(self):
+        """Convert the latest RGB sensor_msgs/Image to a PIL Image.
+
+        Returns None if no image is available or PIL is not installed.
+        """
+        msg = self._latest_rgb_msg
+        if msg is None:
+            return None
+        try:
+            import numpy as np
+            from PIL import Image as PILImage
+            encoding = getattr(msg, 'encoding', 'rgb8')
+            arr = (
+                np.frombuffer(bytes(msg.data), dtype=np.uint8)
+                .reshape(msg.height, msg.width, -1)
+            )
+            if arr.shape[2] == 3:
+                if 'bgr' in encoding:
+                    arr = arr[:, :, ::-1]  # BGR → RGB
+            elif arr.shape[2] == 4:
+                arr = arr[:, :, :3]
+                if 'bgr' in encoding:
+                    arr = arr[:, :, ::-1]
+            return PILImage.fromarray(arr.copy())
+        except Exception as exc:
+            self.get_logger().warn(f'_capture_rgb_as_pil failed: {exc}')
+            return None
+
+    # ── Execution helpers ─────────────────────────────────────────────────────
 
     def _send_and_wait(
         self,
@@ -648,12 +908,7 @@ class PipelineOrchestrator(Node):
         return future.result()
 
     def _send_gripper(self, closed: bool) -> None:
-        """Send open / close command to the gripper controller and wait.
-
-        For closing, monitors the gripper joint position and stops sending
-        further motion once the joint stalls (contact detected), instead of
-        always driving to the fully-closed position which can push/embed objects.
-        """
+        """Send open / close command to the gripper controller and wait."""
         if self._gripper_client is None:
             self.get_logger().warn(
                 '_send_gripper: gripper action client unavailable; skipping.')
@@ -663,8 +918,6 @@ class PipelineOrchestrator(Node):
         pt = JointTrajectoryPoint()
         target_pos = _GRIPPER_CLOSED if closed else _GRIPPER_OPEN
         pt.positions = [target_pos]
-        # 2 s for close (slow squeeze gives time to detect contact stall).
-        # 1 s for open (no contact concern, just speed).
         duration_sec = 2 if closed else 1
         pt.time_from_start = RosDuration(sec=duration_sec, nanosec=0)
         jt.points.append(pt)
@@ -677,7 +930,7 @@ class PipelineOrchestrator(Node):
             self._log_gripper_contact(target_pos)
 
     def _log_gripper_contact(self, commanded_pos: float) -> None:
-        """Log actual gripper position after closing to detect contact / floor hit."""
+        """Log actual gripper position after closing to detect contact."""
         if self._latest_joints is None:
             return
         try:
@@ -699,7 +952,7 @@ class PipelineOrchestrator(Node):
         except Exception:
             pass
 
-    # ── curobo ready + home/place helpers ────────────────────────────────────
+    # ── CuRobo ready + home/place helpers ─────────────────────────────────────
 
     def _wait_for_curobo_ready(self, timeout_sec: float | None = None) -> bool:
         """Block until /curobo/ready is received (or already received)."""
@@ -711,10 +964,7 @@ class PipelineOrchestrator(Node):
         return self._curobo_ready_event.wait(timeout=t)
 
     def _call_curobo_goal_name(self, goal_name: str):
-        """Call the CuRobo planning service with a named goal (home/place).
-
-        Returns the service response or None on failure.
-        """
+        """Call the CuRobo planning service with a named goal."""
         if self._curobo_client is None:
             self.get_logger().warn(
                 f'_call_curobo_goal_name({goal_name!r}): no CuRobo client.')
@@ -744,14 +994,7 @@ class PipelineOrchestrator(Node):
         return response
 
     def _reset_tsdf_after_move(self) -> None:
-        """Publish /curobo/reset_map so ghost voxels from arm movement are cleared.
-
-        Called after every arm movement that is not part of pick execution.
-        Pick execution uses pause_mapping instead (shorter wait, arm stays still
-        at the grasp pose).  For home/scan/place moves the arm sweeps through
-        space and leaves ghost voxels that the RobotSegmenter may miss on a
-        single frame; a full reset is the safest cure.
-        """
+        """Publish /curobo/reset_map so ghost voxels from arm movement are cleared."""
         self._reset_map_pub.publish(Empty())
         self.get_logger().info(
             'Published /curobo/reset_map — TSDF cleared after arm movement.')
@@ -768,27 +1011,25 @@ class PipelineOrchestrator(Node):
             self._send_and_wait(self._arm_client, response.trajectory, 'home')
             self._reset_tsdf_after_move()
         except Exception as exc:
-            self.get_logger().warn(f'Home-before-capture execution failed (non-fatal): {exc}')
+            self.get_logger().warn(
+                f'Home-before-capture execution failed (non-fatal): {exc}')
 
     def _plan_and_execute_place(self, goal_name: str) -> None:
-        """Transit to place destination, release gripper, and handle bookshelf moves."""
+        """Transit to place destination, release gripper, handle bookshelf moves."""
         self.get_logger().info(f'Planning place trajectory to {goal_name!r}...')
         response = self._call_curobo_goal_name(goal_name)
         if response is None:
             raise RuntimeError(f'Place planning failed for goal_name={goal_name!r}')
 
-        # Transit to the target (safe-Z waypoints).
-        self._send_and_wait(self._arm_client, response.trajectory, f'place_transit_{goal_name}')
+        self._send_and_wait(
+            self._arm_client, response.trajectory, f'place_transit_{goal_name}')
 
-        # Bookshelf insert (push object onto shelf).
         insert_traj = getattr(response, 'insert_trajectory', None)
         if insert_traj and getattr(insert_traj, 'points', None):
             self._send_and_wait(self._arm_client, insert_traj, 'bookshelf_insert')
 
-        # Release the gripper.
         self._send_gripper(closed=False)
 
-        # Bookshelf retract (pull arm back from shelf).
         retract_traj = getattr(response, 'retract_trajectory', None)
         if retract_traj and getattr(retract_traj, 'points', None):
             self._send_and_wait(self._arm_client, retract_traj, 'bookshelf_retract')
@@ -806,10 +1047,8 @@ class PipelineOrchestrator(Node):
         self.get_logger().info('Returned to home pose.')
         self._reset_tsdf_after_move()
 
-    def _reset_pipeline_state(self) -> None:
-        self._pipeline_busy = False
-        self._active_task = ''
 
+# ── Module-level helpers ──────────────────────────────────────────────────────
 
 def _goal_status_succeeded() -> int:
     if GoalStatus is None:
@@ -899,7 +1138,7 @@ _UR5_JOINT_NAMES = [
 
 
 class _ScanPose:
-    """Lightweight stand-in for sensor_msgs/JointState used by _joint_state_to_trajectory."""
+    """Lightweight stand-in for sensor_msgs/JointState."""
 
     __slots__ = ('name', 'position')
 
@@ -912,10 +1151,8 @@ def _load_default_scan_poses() -> list[_ScanPose]:
     """Parse PIPELINE_SCAN_POSES env var into a list of _ScanPose objects.
 
     Format: semicolon-separated poses, each pose is 6 comma-separated rads.
-    Example (one pose):
+    Example:
       PIPELINE_SCAN_POSES=-1.332,-2.402,1.538,-0.863,-1.114,-1.292
-    Example (two poses):
-      PIPELINE_SCAN_POSES=-1.332,-2.402,1.538,-0.863,-1.114,-1.292;0.536,-1.331,0.693,-0.781,-2.042,0.723
     """
     raw = os.environ.get('PIPELINE_SCAN_POSES', '').strip()
     if not raw:
@@ -933,7 +1170,8 @@ def _load_default_scan_poses() -> list[_ScanPose]:
             ) from exc
         if len(angles) != 6:
             raise ValueError(
-                f'PIPELINE_SCAN_POSES pose #{i + 1} must have 6 values, got {len(angles)}: {token!r}'
+                f'PIPELINE_SCAN_POSES pose #{i + 1} must have 6 values, '
+                f'got {len(angles)}: {token!r}'
             )
         poses.append(_ScanPose(angles))
     return poses
@@ -944,9 +1182,6 @@ def main(args=None) -> None:
         raise ImportError('rclpy is required for team_8 runtime.')
     rclpy.init(args=args)
     node = PipelineOrchestrator()
-    # MultiThreadedExecutor: _send_and_wait calls spin_until_future_complete
-    # from inside action-done callbacks, which deadlocks with a single-threaded
-    # executor.
     executor = MultiThreadedExecutor()
     executor.add_node(node)
     try:
