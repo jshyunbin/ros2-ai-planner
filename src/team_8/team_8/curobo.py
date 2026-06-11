@@ -670,6 +670,63 @@ class CuRobo:
             f'CuRobo.plan_trajectory: all attempts exhausted ({last_status})')
         return None
 
+    def plan_home_config(self, joint_config, joint_states):
+        """Plan a collision-aware c-space move to a fixed home joint config.
+
+        ``joint_config`` is six joint angles in JOINT_NAMES order. Planning to a
+        fixed joint goal (not an IK pose) keeps the arm in the same centered,
+        camera-down posture every cycle instead of letting free IK pick a far
+        branch. Returns a ROS ``JointTrajectory`` or ``None`` on failure.
+        """
+        try:
+            with self._cuda_lock:
+                return self._plan_home_config_locked(joint_config, joint_states)
+        except Exception as exc:
+            self._logger.error(f'CuRobo.plan_home_config error: {exc}')
+            return None
+
+    def _plan_home_config_locked(self, joint_config, joint_states):
+        self.update_joint_state(joint_states)
+        self._update_world_from_tsdf()
+        current = self._ros_js_to_curobo(joint_states)
+        goal_pos = torch.tensor(
+            [[float(v) for v in joint_config]],
+            device='cuda', dtype=torch.float32)
+        goal_state = CuRoboJointState.from_position(
+            goal_pos, joint_names=list(JOINT_NAMES))
+        last_status = 'unknown'
+        for world_mode in self._trajectory_world_modes():
+            if world_mode == 'relaxed':
+                # Against a dense TSDF the home config (or the start state) is
+                # often flagged 'Start or End state in collision' — typically the
+                # arm self-fusing into the map at the home posture. Clearing the
+                # collision world lets the return-to-home c-space plan succeed,
+                # exactly the fallback the old pose-home relied on.
+                self._clear_collision_world()
+                self._logger.warn(
+                    'CuRobo.plan_home_config retrying with relaxed collision '
+                    'world; TSDF blocked the home c-space plan.')
+            _reset_planner_seed(self._planner)
+            t_plan = time.perf_counter()
+            result = self._planner.plan_cspace(goal_state, current)
+            torch.cuda.synchronize()
+            self._logger.info(
+                f'CuRobo.plan_home_config: plan_cspace(world={world_mode}) took '
+                f'{time.perf_counter() - t_plan:.2f}s '
+                f'(success={_result_success(result)}).')
+            if _result_success(result):
+                return interp_traj_to_ros(
+                    result.get_interpolated_plan(),
+                    last_tstep=getattr(result, 'interpolated_last_tstep', None),
+                )
+            last_status = getattr(result, 'status', 'unknown')
+            self._logger.warn(
+                'CuRobo.plan_home_config c-space plan failed: '
+                f'world={world_mode} status={last_status}')
+        self._logger.warn(
+            f'CuRobo.plan_home_config: all attempts exhausted ({last_status})')
+        return None
+
     def plan_place(self, place_pose, transit_z, bookshelf=False,
                    insert_depth=0.0, retract_depth=0.0, joint_states=None,
                    floor_z=0.0):

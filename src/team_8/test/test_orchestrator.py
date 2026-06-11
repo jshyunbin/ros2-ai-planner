@@ -911,7 +911,7 @@ def test_plan_pose_inbranch_fails_safely_when_ik_infeasible(monkeypatch):
 def _place_data():
     return {
         "transit_z": 0.80,
-        "home": {"xyz": [0.55, 0.07, 0.90], "quat_xyzw": [1.0, 0.0, 0.0, 0.0]},
+        "home_joint_config": [0.0, -2.2, 1.9, -1.383, -1.57, 0.0],
         "storage_1": {"xyz": [0.0, 0.55, 0.70], "quat_xyzw": [1.0, 0.0, 0.0, 0.0]},
         "bookshelf": {
             "pre_insert": {"xyz": [0.60, -0.30, 0.76],
@@ -921,16 +921,19 @@ def _place_data():
     }
 
 
-def test_route_home_uses_collision_aware_plan_trajectory():
+def test_route_home_uses_collision_aware_joint_config_plan():
     from riro_srvs.srv import PlanTrajectory
     from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
     from team_8.curobo_service import route_place_or_home
     curobo = MagicMock()
     traj = JointTrajectory(); traj.points = [JointTrajectoryPoint()]
-    curobo.plan_trajectory.return_value = traj
+    curobo.plan_home_config.return_value = traj
     resp = route_place_or_home(curobo, _place_data(), "home",
                                MagicMock(), PlanTrajectory.Response())
-    curobo.plan_trajectory.assert_called_once()
+    curobo.plan_home_config.assert_called_once()
+    # home plans to the fixed joint config, not an IK pose or a place transit.
+    assert curobo.plan_home_config.call_args.args[0] == [
+        0.0, -2.2, 1.9, -1.383, -1.57, 0.0]
     curobo.plan_place.assert_not_called()
     assert resp.success is True
     assert resp.trajectory is traj
@@ -1225,9 +1228,11 @@ def test_orchestrator_home_before_capture_skips_without_joints():
 
 def test_orchestrator_run_pipeline_homes_before_segmenting():
     import json
+    import team_8.orchestrator as _orch_mod
     orch = _orchestrator_skeleton()
     orch._pipeline_busy = False
     orch._active_task = ''
+    orch._active_task_data = None
     orch._segmentation_service_name = '/segmentation/segment_prompt'
     orch._segmentation_service_wait_sec = 0.1
     calls = []
@@ -1238,8 +1243,11 @@ def test_orchestrator_run_pipeline_homes_before_segmenting():
     orch._home_before_capture = MagicMock(
         side_effect=lambda: calls.append(('home', None)) or 555)
     orch._on_segmentation_done = MagicMock()
+    mock_stringstring = MagicMock()
+    mock_stringstring.Request.return_value = MagicMock(data='')
 
-    orch._run_pipeline('pick the mug')
+    with patch.object(_orch_mod, 'StringString', mock_stringstring):
+        orch._run_pipeline('pick the mug')
 
     # Home move happens before segmentation is requested.
     assert [c[0] for c in calls] == ['home', 'segment']
@@ -1381,3 +1389,148 @@ def test_curobo_service_check_ready_is_one_shot():
     svc._ready_published = True  # already fired
     svc._check_ready()
     svc._ready_pub.publish.assert_not_called()
+
+
+def test_count_target_in_workspace_returns_count_when_frame_fresh():
+    import numpy as np
+    orch = _orchestrator_skeleton()
+    orch._verification_frame_timeout_sec = 1.0
+    orch._latest_verification_rgb = np.zeros((4, 4, 3), dtype='uint8')
+    orch._latest_verification_rgb_stamp_ns = 200
+    orch._gemini = MagicMock()
+    orch._gemini.count_objects.return_value = {"count": 2, "reason": "two"}
+
+    count = orch._count_target_in_workspace('coke_can', min_stamp_ns=100)
+
+    assert count == 2
+    assert orch._gemini.count_objects.call_args.kwargs['object_name'] == 'coke_can'
+
+
+def test_count_target_in_workspace_returns_none_on_stale_frame():
+    import numpy as np
+    orch = _orchestrator_skeleton()
+    orch._verification_frame_timeout_sec = 0.1
+    orch._latest_verification_rgb = np.zeros((4, 4, 3), dtype='uint8')
+    orch._latest_verification_rgb_stamp_ns = 50  # not newer than min_stamp_ns
+    orch._gemini = MagicMock()
+
+    count = orch._count_target_in_workspace('coke_can', min_stamp_ns=100)
+
+    assert count is None
+    orch._gemini.count_objects.assert_not_called()
+
+
+def test_count_target_in_workspace_returns_none_on_gemini_error():
+    import numpy as np
+    orch = _orchestrator_skeleton()
+    orch._verification_frame_timeout_sec = 1.0
+    orch._latest_verification_rgb = np.zeros((4, 4, 3), dtype='uint8')
+    orch._latest_verification_rgb_stamp_ns = 999
+    orch._gemini = MagicMock()
+    orch._gemini.count_objects.side_effect = RuntimeError('boom')
+
+    # min_stamp_ns == 0 uses the latest frame regardless of stamp.
+    assert orch._count_target_in_workspace('banana', min_stamp_ns=0) is None
+
+
+def test_run_pipeline_captures_before_count_after_home():
+    import json
+    import team_8.orchestrator as _orch_mod
+    orch = _orchestrator_skeleton()
+    orch._pipeline_busy = False
+    orch._active_task = ''
+    orch._active_task_data = {'object': 'coke_can', 'destination': 'storage_1'}
+    orch._segmentation_service_name = '/segmentation/segment_prompt'
+    orch._segmentation_service_wait_sec = 0.1
+    orch._segmentation_client = MagicMock()
+    orch._segmentation_client.wait_for_service.return_value = True
+    orch._segmentation_client.call_async.return_value = MagicMock()
+    orch._home_before_capture = MagicMock(return_value=777)
+    orch._count_target_in_workspace = MagicMock(return_value=2)
+    orch._on_segmentation_done = MagicMock()
+    mock_stringstring = MagicMock()
+    mock_stringstring.Request.return_value = MagicMock(data='')
+
+    with patch.object(_orch_mod, 'StringString', mock_stringstring):
+        orch._run_pipeline('pick the coke can')
+
+    # The before-count uses the target name and the home-arrival stamp, and is
+    # stored on the active task for the post-task comparison.
+    orch._count_target_in_workspace.assert_called_once_with('coke_can', 777)
+    assert orch._active_task_data['_before_count'] == 2
+
+
+def _verification_orch(before_count, after_count):
+    """Orchestrator wired so _run_post_task_verification reaches the decision.
+
+    after_count drives the mocked _gemini.count_objects; a None after_count
+    raises to exercise the count-unavailable branch.
+    """
+    import numpy as np
+    orch = _orchestrator_skeleton()
+    orch._active_task_data = {
+        'object': 'coke_can', 'destination': 'storage_1',
+        '_attempt_count': 1, '_before_count': before_count}
+    orch._max_task_attempts = 2
+    orch._verification_frame_timeout_sec = 1.0
+    orch._verification_reference_stamp_ns = 100
+    orch._latest_verification_rgb = np.zeros((4, 4, 3), dtype='uint8')
+    orch._latest_verification_rgb_stamp_ns = 200  # fresh
+    orch._gemini = MagicMock()
+    if after_count is None:
+        orch._gemini.count_objects.side_effect = RuntimeError('boom')
+    else:
+        orch._gemini.count_objects.return_value = {
+            'count': after_count, 'reason': 'r'}
+    orch._publish_verification_result = MagicMock()
+    orch._save_verification_artifacts = MagicMock()
+    orch._reset_pipeline_state = MagicMock()
+    orch._restart_active_task = MagicMock()
+    return orch
+
+
+def test_post_task_success_when_count_decreased():
+    orch = _verification_orch(before_count=2, after_count=1)
+    orch._run_post_task_verification()
+    orch._reset_pipeline_state.assert_called_once()
+    assert orch._reset_pipeline_state.call_args.kwargs['success'] is True
+    orch._restart_active_task.assert_not_called()
+
+
+def test_post_task_retries_when_count_not_decreased():
+    orch = _verification_orch(before_count=2, after_count=2)  # attempt 1 of 2
+    orch._run_post_task_verification()
+    orch._restart_active_task.assert_called_once()
+    orch._reset_pipeline_state.assert_not_called()
+
+
+def test_post_task_skips_when_count_not_decreased_at_max_attempts():
+    orch = _verification_orch(before_count=2, after_count=2)
+    orch._active_task_data['_attempt_count'] = 2  # == _max_task_attempts
+    orch._run_post_task_verification()
+    orch._reset_pipeline_state.assert_called_once()
+    assert orch._reset_pipeline_state.call_args.kwargs['success'] is False
+    orch._restart_active_task.assert_not_called()
+
+
+def test_post_task_success_no_retry_when_after_count_unavailable():
+    orch = _verification_orch(before_count=2, after_count=None)
+    orch._run_post_task_verification()
+    orch._reset_pipeline_state.assert_called_once()
+    assert orch._reset_pipeline_state.call_args.kwargs['success'] is True
+    orch._restart_active_task.assert_not_called()
+
+
+def test_post_task_success_no_retry_when_before_count_unavailable():
+    orch = _verification_orch(before_count=None, after_count=1)
+    orch._run_post_task_verification()
+    orch._reset_pipeline_state.assert_called_once()
+    assert orch._reset_pipeline_state.call_args.kwargs['success'] is True
+    orch._restart_active_task.assert_not_called()
+
+
+def test_post_task_retries_when_count_increased():
+    orch = _verification_orch(before_count=2, after_count=3)  # attempt 1 of 2
+    orch._run_post_task_verification()
+    orch._restart_active_task.assert_called_once()
+    orch._reset_pipeline_state.assert_not_called()

@@ -26,8 +26,7 @@ except ImportError:
 DESTINATIONS = (
     "storage_1",
     "storage_2",
-    "bookshelf_floor1",
-    "bookshelf_floor2",
+    "bookshelf",
     "unspecified",
 )
 
@@ -58,30 +57,22 @@ TASK_PLAN_SCHEMA = {
     "required": ["tasks"],
 }
 
-TASK_VERIFICATION_SCHEMA = {
+OBJECT_COUNT_SCHEMA = {
     "type": "OBJECT",
     "properties": {
-        "present_in_source_workspace": {
-            "type": "BOOLEAN",
+        "count": {
+            "type": "INTEGER",
             "description": (
-                "True only when the requested object is still visible in the "
-                "original pickup workspace/table area."
+                "How many instances of the target object type are visible in "
+                "the source pickup workspace. 0 if none remain."
             ),
-        },
-        "confidence": {
-            "type": "NUMBER",
-            "description": "Confidence from 0.0 to 1.0.",
         },
         "reason": {
             "type": "STRING",
-            "description": "Brief visual reason for the decision.",
+            "description": "Brief visual reason for the count.",
         },
     },
-    "required": [
-        "present_in_source_workspace",
-        "confidence",
-        "reason",
-    ],
+    "required": ["count", "reason"],
 }
 
 
@@ -148,8 +139,7 @@ Rules:
 5. Use only these destination values:
    - storage_1: left storage or left basket
    - storage_2: right storage or right basket
-   - bookshelf_floor1: first shelf, lower shelf, or unspecified shelf
-   - bookshelf_floor2: second shelf or upper shelf
+   - bookshelf: any shelf of the bookshelf (lower, upper, first, second, or unspecified shelf)
    - unspecified: no destination was stated
 6. Examples:
    - meat can -> meat_can
@@ -170,89 +160,73 @@ Instruction:
         )
         return self._validate_task_plan(payload)
 
-    def verify_object_removed(
+    def count_objects(
         self,
         pil_image: Any,
         *,
         object_name: str,
-        destination: str,
     ) -> dict[str, Any]:
-        """Check whether an object remains in the original pickup workspace.
+        """Count how many instances of object_name remain in the pickup area.
 
-        The image must be captured after the robot has returned home. The
-        destination area is explicitly excluded, so an object correctly placed
-        in a basket or bookshelf is not treated as a failed pick.
+        The image must be captured with the arm at home so the wrist camera sees
+        the source workspace. The prompt instructs Gemini to ignore any
+        destination area (basket/storage/bookshelf) and all non-target objects,
+        so the count reflects only target-type instances still awaiting pickup.
         """
         if not hasattr(pil_image, "size"):
             raise TypeError(
-                "verify_object_removed expects a PIL image with a size attribute."
+                "count_objects expects a PIL image with a size attribute."
             )
 
         normalized_object = _normalize_object_name(object_name)
         if not normalized_object:
-            raise ValueError("Verification object name is empty.")
+            raise ValueError("Count object name is empty.")
 
         display_name = normalized_object.replace("_", " ")
-        destination = str(destination).strip() or "unspecified"
 
         prompt = f"""
-You are verifying the result of a robotic pick-and-place task.
+You are counting objects after a robotic pick-and-place task.
 
-Target object: {display_name}
-Intended destination: {destination}
+Target object type: {display_name}
 
-The image was captured after the robot returned to its home pose.
-Decide whether the target object is STILL PRESENT IN THE ORIGINAL PICKUP
-WORKSPACE, meaning the main table/work area where loose objects are picked up.
+The image was captured with the robot arm at its home pose, looking down at the
+source pickup workspace (the main table/work area where loose objects are
+picked up).
+
+Count how many instances of the target object type are STILL PRESENT IN THE
+SOURCE PICKUP WORKSPACE.
 
 Important rules:
 1. Ignore the robot arm and gripper.
-2. Ignore the target object if it is visible inside the intended destination
-   basket, storage area, or bookshelf. A correctly placed object at the
-   destination means present_in_source_workspace must be false.
-3. Do not report another similar object unless it clearly matches the target.
-4. If the target is still lying in the pickup workspace, return true.
-5. If the target is absent from the pickup workspace, return false.
-6. If visibility is ambiguous, return true so the robot can retry safely.
+2. Do not count instances that are inside the destination basket, storage area,
+   or bookshelf. Count only instances loose in the pickup workspace.
+3. Count only the target object type. Ignore every other kind of object.
+4. If none are visible, return 0.
 
 Return strict JSON with:
-- present_in_source_workspace: boolean
-- confidence: number from 0.0 to 1.0
+- count: integer number of target instances in the pickup workspace (>= 0)
 - reason: one short sentence
 """.strip()
 
         payload = self._generate_json(
             contents=[prompt, pil_image],
-            schema=TASK_VERIFICATION_SCHEMA,
+            schema=OBJECT_COUNT_SCHEMA,
             temperature=0.0,
         )
 
         if not isinstance(payload, dict):
+            raise GeminiAPIError("Object count response must be a JSON object.")
+
+        raw_count = payload.get("count")
+        if isinstance(raw_count, bool) or not isinstance(raw_count, int):
             raise GeminiAPIError(
-                "Task verification response must be a JSON object."
+                f"Count field must be an integer, got {raw_count!r}."
             )
 
-        present = payload.get("present_in_source_workspace")
-        if not isinstance(present, bool):
-            raise GeminiAPIError(
-                "Verification field present_in_source_workspace must be boolean."
-            )
-
-        try:
-            confidence = float(payload.get("confidence", 0.0))
-        except (TypeError, ValueError) as exc:
-            raise GeminiAPIError(
-                f"Invalid verification confidence: {payload.get('confidence')!r}"
-            ) from exc
-
-        confidence = max(0.0, min(1.0, confidence))
+        count = max(0, raw_count)
         reason = str(payload.get("reason", "")).strip()
 
-        return {
-            "present_in_source_workspace": present,
-            "confidence": confidence,
-            "reason": reason,
-        }
+        return {"count": count, "reason": reason}
 
     def _generate_json(
         self,
